@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    # macOS ships /usr/bin/python3 as Python 3.9, the version the hooks and scripts target.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Python
+        run: /usr/bin/python3 --version
+      - name: Run the suite
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.test
+          for t in tests/test_*.py; do
+            echo "== $t"
+            /usr/bin/python3 -I "$t" || exit 1
+          done

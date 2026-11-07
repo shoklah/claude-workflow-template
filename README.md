@@ -1,0 +1,290 @@
+# claude-workflow
+
+An agentic workflow for Claude Code. It sets how a task is routed, which model does each role, how work is reviewed and when a run stops for the owner, meaning you. This repo holds the parts that enforce it: hooks, custom agents, a `CLAUDE.md` section and two scripts. It also has an installer that puts them into `~/.claude`.
+
+It's a template. Read it, change the models, thresholds and wording to fit your setup, then install it one step at a time.
+
+> **Not yet confirmed live.** The parts are built and tested, but a few behaviours can only be checked on a real installation. See [Not yet confirmed live](#not-yet-confirmed-live).
+
+## Goals
+
+- **Reliable, clean, coherent code** comes first. Tokens matter only when usage limits would change which model does the work.
+- **A known path for every task,** named at the start so the owner can correct it.
+- **Fable where it best protects the code,** decided by a fixed rule, not by the point in the week.
+- **Each role on a chosen model and effort,** pinned by configuration wherever configuration can do it.
+- **No real defect carried forward silently.**
+- **Upstream skills stay unedited,** so they can still be updated. `CLAUDE.md` outranks skills, so it redirects them instead.
+
+## The workflow
+
+### Choosing a path
+
+```mermaid
+flowchart TD
+    T([New task]) --> U["Read get_usage:<br/>Fable stage and all-model %"]
+    U --> R{"Touches a risk area?<br/>auth, payments, migrations or deletions,<br/>production infra, concurrency, public API"}
+    R -- yes --> F[Full path]
+    R -- no --> K{What kind of change?}
+    K -- "typo, docs, comment" --> D["Direct:<br/>the edit + automated checks"]
+    K -- "clear request, about 1 to 3 files" --> S["Small:<br/>TDD in the session → simplify →<br/>automated checks → one fresh final-reviewer"]
+    K -- "anything else" --> F
+    S -. "grows past its path" .-> F
+    D -. "grows past its path" .-> S
+```
+
+The first message of every task names the path and why, the Fable stage, and the recommended model. If a task grows past its path, Claude stops, says so, and steps up.
+
+### The Full path
+
+```mermaid
+flowchart TD
+    A["1 · Design and plan<br/>main session · brainstorming, writing-plans"] --> G1{{"Owner approves the design"}}
+    G1 --> B["2 · Plan review<br/>fresh plan-reviewer: spec + plan + repo, no brainstorm<br/>one pass"]
+    B --> G2{{"Owner approves the plan"}}
+    G2 --> C["3 · New implementation session<br/>Opus 5.5 medium · subagent-driven-development<br/>starts from the plan's path only"]
+
+    subgraph TASK ["For each task"]
+        direction TB
+        I["4 · Implementer<br/>implementer, or implementer-copy<br/>when the plan holds the function bodies"] --> CH["5 · Automated checks, run by the session<br/>tests · type checks · build · failing-test check"]
+        CH -- "fail: 3 attempts,<br/>then 1 fresh attempt a tier up" --> I
+        CH -- pass --> TR["6 · Task review<br/>fresh task-reviewer"]
+        TR -- "Critical or Important" --> FX["7 · Fix rounds<br/>max 3"]
+        FX --> TR
+    end
+
+    C --> I
+    TR -- clean --> N{More tasks?}
+    N -- yes --> I
+    N -- no --> SI["8 · simplify over the whole branch<br/>session applies the fixes, then reruns the checks"]
+    SI --> FR["9 · Final review<br/>fresh final-reviewer, sees the ledger and rulings<br/>then one fix wave + one fix-checker re-check"]
+    FR --> FIN{{"10 · Owner chooses merge, PR or keep<br/>and sees every ruling"}}
+
+    CH -. "still failing" .-> STOP(["Stop and ask the owner"])
+    FX -. "real Critical or Important<br/>still open after round 3" .-> STOP
+    FR -. "real Critical or Important<br/>still open after the fix wave" .-> STOP
+```
+
+The dispatch hook refuses `final-reviewer` until `simplify` has run in the session, so step 8 can't be skipped.
+
+### Fix rounds
+
+```mermaid
+flowchart LR
+    F([Finding]) --> M{Severity}
+    M -- Minor --> L[Ledger only,<br/>never enters the loop]
+    M -- "Critical or Important" --> R1["Rounds 1 and 2<br/>original implementer fixes,<br/>fix-checker re-checks only those findings"]
+    R1 -- "comes back unchanged" --> R3
+    R1 -- "still open" --> R3["Round 3<br/>fresh implementer one tier up"]
+    R1 -- fixed --> OK([Done])
+    R3 -- fixed --> OK
+    R3 -- "still open, real defect" --> S([Stop and ask the owner])
+    R3 -- "still open, reviewer may be wrong" --> W["Written ruling<br/>run continues,<br/>final review sees both sides"]
+```
+
+Tiers go `implementer-copy` → `implementer` → `implementer-escalated`. In Fable stage 3 an Opus implementer stays on a fresh `implementer`. Loops run only on mechanical signals, such as failing tests, and always under a cap: a reviewer can always find something.
+
+### Test-driven development and the failing-test check
+
+TDD is the default on the Small and Full paths. After each task the session runs `scripts/failing-test-check.py` on the task's new or changed test files, in temporary copies, so the working tree isn't touched:
+
+1. **Control:** the tests run on the task's final code and must pass. If they don't, the result is `couldnt_run`, reported without blocking, so a broken environment never looks like a failing test.
+2. **Check:** the same test files run on the code from before the task and must fail. If they pass, the tests don't cover the change, and the result is `failed`, which goes back to the implementer.
+
+This doesn't prove the test was written first. It proves the new tests can catch the change. A task with no new behaviour (refactor, docs, config) is marked `**Failing-test check:** exempt: <reason>` in the plan.
+
+```bash
+/usr/bin/python3 -I ~/.claude/scripts/failing-test-check.py --base <task start SHA> [--repo DIR] [--test-file PATH]... [--link node_modules]... [--timeout SECONDS] -- <test command>
+```
+
+Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3.
+
+### Preventing over-engineering
+
+- **While writing:** `karpathy-guidelines` is in every main session through the startup hook, and in implementers and reviewers through agent frontmatter.
+- **After writing:** `simplify` runs once per branch, and on the Small path.
+- **At review:** `plan-reviewer` and `final-reviewer` also list what the spec doesn't require. That list goes to the owner, never into fix rounds.
+
+## Models and effort
+
+| Role | Agent | Model | Effort |
+|---|---|---|---|
+| Design and plan | main session | Fable | `high`, `xhigh` for the hardest architecture |
+| Plan review | `plan-reviewer` | Fable | `high` |
+| Session running implementation | main session | Opus 5.5 | `medium` |
+| Implementer | `implementer` | Opus 5.5 | `high` |
+| Implementer when the plan holds the code | `implementer-copy` | Sonnet 5.5 | `medium` |
+| Round 3 from Opus | `implementer-escalated` | Fable | `high` |
+| Task review | `task-reviewer` | Opus 5.5 | `high` |
+| Re-check of listed findings | `fix-checker` | Sonnet 5.5 | `medium` |
+| Final review, and the Small path's reviewer | `final-reviewer` | Fable | `high`, `xhigh` in risk areas |
+| The four agents `simplify` launches | `general-purpose`, model passed at dispatch | Opus 5.5 | `high` |
+
+### Fable stages
+
+At task start Claude reads `get_usage`, works out the share of the week gone (`100 * (168 - hours_to_reset) / 168`) and compares the weekly Fable % with it.
+
+| Stage | Trigger | Other main sessions | Design and plan | Plan review | Final review |
+|---|---|---|---|---|---|
+| 1 | Up to 15 points ahead of the week | Owner's choice, Fable allowed | Fable | Fable | Fable |
+| 2 | More than 15 points ahead | Opus 5.5 with Fable advisor | Fable | Fable | Fable |
+| 3 | 90% used or more | Opus 5.5, advisor off | Opus 5.5 | Opus 5.5 | Fable |
+| Out | Fable unavailable | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5 at `xhigh` |
+
+The all-model limit is watched too: Claude warns when it is more than 15 points ahead of the week, and at 90% no new Full path run starts without the owner's OK. Nothing silently drops to Sonnet. A stage 3 or Out override is an explicit `model` at dispatch on the named agent.
+
+### The Fable advisor (trial)
+
+The advisor is on in stages 1 and 2 and off from stage 3. Only the owner can switch it (`/advisor fable`, `/advisor off`), so Claude reminds them when the stage changes.
+
+| Role | Consults the advisor |
+|---|---|
+| Implementers | Only when stuck on a recurring failure, or before departing from the plan |
+| Session running implementation, other Opus main sessions | At their own judgment |
+| Reviewers, `fix-checker`, sessions already on Fable | Never |
+
+After each consultation the model writes `Advisor: <what it advised> | changed: yes or no | <what changed>`. The advice itself is encrypted, so this note is the only view of its content. The trial reaches a checkpoint after 5 Full path runs or 3 weeks; it stops early if the advisor takes more than 25% of a week's Fable use.
+
+## How it's enforced
+
+```mermaid
+flowchart LR
+    subgraph CFG ["Configuration: checked by the harness"]
+        AG["Custom agents<br/>model, effort, disallowedTools,<br/>preloaded skills"]
+        DH["Dispatch hook<br/>refuses model-less general-purpose,<br/>refuses final-reviewer before simplify"]
+        SH["Startup hook<br/>loads using-superpowers +<br/>karpathy-guidelines"]
+    end
+    subgraph INS ["Instructions: followed, not checked"]
+        MD["CLAUDE.md section<br/>paths, stages, caps,<br/>stop rule, run record"]
+    end
+    CFG --> W([Every session and subagent])
+    INS --> W
+```
+
+| Piece | File | What it does |
+|---|---|---|
+| Custom agents | `agents/*.md` | Seven agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. Reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N]` line. |
+| Dispatch hook | `hooks/guard-agent-dispatch.py` | PreToolUse on `Agent`. Denies a dispatch with no `model` when the type is missing or `general-purpose`, which would otherwise run silently on the main session's model. Denies `final-reviewer` until the transcript shows `simplify`. Silent on everything else, never answers `allow`, fails open. |
+| Startup hook | `hooks/session-start-superpowers.sh` | On `startup`, `clear` and `compact`, prints `using-superpowers` and `karpathy-guidelines`. A missing file is noted on stderr; the rest still loads. Combined output stays under the 10,000-character cap. |
+| Commit guard | `hooks/guard-main-commit.py` | Optional. Answers `ask` for a commit landing on `main` or `master`, `deny` in bypass mode. |
+| `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 22 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
+| Failing-test check | `scripts/failing-test-check.py` | See above. |
+| Report | `scripts/workflow-report.py` | Read-only. Reads transcripts and the run log; reports advisor calls, tokens and estimated cost by role, missing advisor notes, findings and fix rounds per run, and failing-test check results. |
+
+Still unenforced, by design: choosing the path, reading the stage, the main session's model, the fix-round cap, and whether the guidelines are followed once loaded. Naming the path and stage out loud is what lets the owner catch a wrong call.
+
+## Tracking outcomes
+
+- **Run record:** when a Small or Full path run finishes, the session appends one JSON line to `~/.claude/workflow-log.jsonl`. `workflow-report.py --schema` prints the format.
+- **Weekly view:** `workflow-report.py --brief` prints at most three lines, including any `STOP` or `CHECKPOINT` the owner should see.
+
+```bash
+/usr/bin/python3 -I scripts/workflow-report.py --brief
+```
+
+```bash
+/usr/bin/python3 -I scripts/workflow-report.py --since 2026-11-01
+```
+
+## Layout
+
+```
+agents/          seven custom agents
+claude-md/       the CLAUDE.md section
+hooks/           dispatch hook, startup hook, commit guard
+scripts/         failing-test check, workflow report
+tools/           replay_dispatches.py: replays past dispatches through the dispatch hook
+tests/           unittest suites, run as subprocesses against temp folders
+install.py       the installer
+```
+
+## Requirements
+
+- macOS or Linux, with Python 3.9 or later at `/usr/bin/python3`. Everything is standard library, run as `/usr/bin/python3 -I`.
+- Claude Code, with access to the models named in `agents/*.md`. The `CLAUDE.md` section reads usage with `mcp__ccd_session_mgmt__get_usage` and starts sessions with `start_session`, which are tools of the Claude desktop app's Code tab; elsewhere, adapt those lines. If yours differ, edit the `model:` and `effort:` lines there, the role table in `tests/test_workflow_files.py`, and the stage table in `claude-md/agentic-workflow.md`.
+- The [superpowers](https://github.com/obra/superpowers) skills. The startup hook reads `~/.claude/skills/using-superpowers/SKILL.md`; a plugin install puts the skill elsewhere, so link it there or change the path in `hooks/session-start-superpowers.sh`.
+- The `karpathy-guidelines` skill, from the [andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) plugin marketplace, added as `karpathy-skills` so it sits at `~/.claude/plugins/marketplaces/karpathy-skills/`. If yours lives elsewhere, change the path in the same hook.
+- Weekly usage windows: `scripts/workflow-report.py` counts weeks from Sunday 07:00 UTC (`week_start`). Set it to your own weekly reset.
+- The `simplify` and `code-review` skills that ship with Claude Code.
+
+## Installing
+
+Clone the repo and run the suite first (see [Tests](#tests)):
+
+```bash
+git clone https://github.com/<your-github-user>/claude-workflow.git
+```
+
+```bash
+cd claude-workflow
+```
+
+The installer works one step at a time, so you can check each step before the next. Every write goes through a temp file and a rename. Invalid input stops with exit 2 before anything is written.
+
+Hooks and agents load into running sessions within seconds, so install when no important run is in progress. A new `agents` folder needs a session restart to load.
+
+```bash
+/usr/bin/python3 -I install.py snapshot
+```
+
+```bash
+/usr/bin/python3 -I install.py agents
+```
+
+```bash
+/usr/bin/python3 -I install.py section
+```
+
+```bash
+/usr/bin/python3 -I install.py scripts
+```
+
+```bash
+/usr/bin/python3 -I install.py hooks
+```
+
+The `hooks` step copies all three hooks, but it only adds the dispatch hook to `~/.claude/settings.json`. To use the startup hook and the commit guard, copy their entries from `tests/settings-snippet.json` into `~/.claude/settings.json` yourself.
+
+Before you rely on the dispatch hook, replay past dispatches to see what it would have refused:
+
+```bash
+/usr/bin/python3 -I tools/replay_dispatches.py
+```
+
+## Rolling back
+
+`snapshot` copies `settings.json`, `CLAUDE.md` and `hooks/` into `~/.agents/backups/<YYYY-MM-DD-HHMM>-workflow/` and prints the path. To undo everything, pass that path back:
+
+```bash
+/usr/bin/python3 -I install.py rollback ~/.agents/backups/<snapshot folder>
+```
+
+Rollback restores what the snapshot holds. It removes every file the installer copies that the snapshot doesn't hold. Other files stay.
+
+## Tests
+
+```bash
+for t in tests/test_*.py; do /usr/bin/python3 -I "$t" || break; done
+```
+
+The tests run the real scripts as subprocesses against temp folders whose paths contain spaces. They may read the real `~/.claude` but never write to it. One test runs the startup hook against your real `~/.claude` to check its output stays under Claude Code's 10,000-character cap. It fails if `using-superpowers` or `karpathy-guidelines` isn't installed where the hook looks, and it's skipped on CI. GitHub Actions runs the same loop on macOS on every push and pull request.
+
+## Not yet confirmed live
+
+These can only be confirmed on a real installation:
+
+- Whether agent frontmatter accepts a plugin skill name in `skills:`, and whether it honours `effort`.
+- What `transcript_path` the dispatch hook sees for a dispatch from a nested session.
+- The shape of a real advisor row in a transcript, which `workflow-report.py` reads.
+- Whether advisor calls count against the weekly Fable limit.
+
+## Credits
+
+This workflow builds on other people's work. It points to their skills and doesn't copy them:
+
+- [superpowers](https://github.com/obra/superpowers) by Jesse Vincent (obra): brainstorming, writing-plans, subagent-driven-development, test-driven-development and the using-superpowers rules this workflow redirects.
+- [`karpathy-guidelines`](https://github.com/forrestchang/andrej-karpathy-skills) by forrestchang: guidelines against over-engineering, based on Andrej Karpathy's observations on LLM coding pitfalls.
+- `simplify`: the Claude Code skill that reviews changed code for reuse and simplification.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
