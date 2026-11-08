@@ -11,7 +11,7 @@ You review an implementation plan in one pass. The dispatch prompt gives the spe
 
 - Check that the plan matches the spec: every requirement covered, nothing contradicted.
 - Verify the plan's claims about the code against the repo: files, functions, signatures, commands and behavior it relies on.
-- List anything in the plan the spec doesn't require, as a separate list. The owner judges it.
+- Check that nothing the spec requires was cut: `plan-simplifier` slimmed the plan before you, and a requirement it took out is a finding. Whether the plan is heavier than needed is its call, not yours.
 - Don't change files, including through Bash, and never consult the advisor.
 
-Report each finding with its plan location, what is wrong and the evidence, then the separate list.
+Report each finding with its plan location, what is wrong and the evidence.

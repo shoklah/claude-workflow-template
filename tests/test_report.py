@@ -67,7 +67,8 @@ def run_record(**over):
            'path': 'full', 'risk_area': False, 'stage': '1', 'advisor': True, 'fable_start': 10, 'fable_end': 20,
            'all_start': 10, 'all_end': 20, 'tasks': 1, 'fix_rounds': 0, 'stops': 0,
            'final_findings': {'critical': 0, 'important': 0, 'minor': 0, 'unneeded': 0},
-           'simplify': {'applied': 0, 'skipped': 0}, 'failing_test': []}
+           'simplify': {'ran': 'agents', 'applied': 0, 'skipped': 0}, 'failing_test': [],
+           'fix_growth': {'task_added': 0, 'task_removed': 0, 'fix_added': 0, 'fix_removed': 0, 'unplanned_files': []}}
     rec.update(over)
     return rec
 
@@ -105,14 +106,40 @@ class Report(unittest.TestCase):
     def session(self, rows, project='-Users-me-Work-proj', sid='sess-1'):
         self.write_lines(os.path.join(self.projects, project, sid + '.jsonl'), rows)
 
-    def subagent(self, agent_type, rows, project='-Users-me-Work-proj', sid='sess-1', aid='a1'):
+    def subagent(self, agent_type, rows, project='-Users-me-Work-proj', sid='sess-1', aid='a1', tid='t'):
         d = os.path.join(self.projects, project, sid, 'subagents')
         self.write_lines(os.path.join(d, f'agent-{aid}.jsonl'), rows)
         with open(os.path.join(d, f'agent-{aid}.meta.json'), 'w') as f:
-            json.dump({'agentType': agent_type, 'description': 'd', 'toolUseId': 't', 'spawnDepth': 1}, f)
+            json.dump({'agentType': agent_type, 'description': 'd', 'toolUseId': tid, 'spawnDepth': 1}, f)
 
     def records(self, recs):
         self.write_lines(self.log, recs)
+
+    def repo(self):
+        """A temp git repo and change(name, message, date=None, text=None), which appends text (by default the
+        message) to a file, commits it and returns the commit."""
+        repo = os.path.join(self.root, 'repo with spaces')
+        os.makedirs(repo)
+
+        def git(*args, date=None):
+            env = dict(CLEAN_ENV)
+            if date:
+                env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+            return subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True, text=True,
+                                  env=env).stdout.strip()
+
+        def change(name, message, date=None, text=None):
+            with open(os.path.join(repo, name), 'a') as f:
+                f.write(message + '\n' if text is None else text)
+            git('add', '-A')
+            git('commit', '-q', '-m', message, date=date)
+            return git('rev-parse', 'HEAD')
+
+        git('init', '-q', '-b', 'main')
+        git('config', 'user.email', 't@example.test')
+        git('config', 'user.name', 't')
+        git('config', 'commit.gpgsign', 'false')
+        return repo, change
 
     def run_report(self, *args):
         p = subprocess.run([PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW, *args],
@@ -145,6 +172,11 @@ class Report(unittest.TestCase):
         self.assertIn('FLAG', roles['main on Fable'])
         self.assertNotIn('FLAG', roles['implementer'])
         self.assertNotIn('FLAG', roles['main'])
+
+    def test_plan_simplifier_should_not_consult(self):
+        self.subagent('plan-simplifier', [asst('m_s', iterations=[executor(), ADVISOR])], aid='s1')
+        roles = {line.strip().split(':')[0]: line for line in section(self.run_report(), 'Advisor calls by role:')[1:]}
+        self.assertIn('FLAG', roles['plan-simplifier'])
 
     def test_workflow_subagent_transcripts_are_read_with_their_role(self):
         # <project>/<session>/subagents/workflows/<id>/agent-x.jsonl, with its .meta.json beside it
@@ -257,27 +289,7 @@ class Report(unittest.TestCase):
 
     def test_later_fix_commits_on_the_same_files_within_14_days(self):
         # real temp repo: a fix commit on a run's file at day 3 is listed; one on another file or at day 20 is not
-        repo = os.path.join(self.root, 'repo with spaces')
-        os.makedirs(repo)
-
-        def git(*args, date=None):
-            env = dict(CLEAN_ENV)
-            if date:
-                env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
-            return subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True, text=True,
-                                  env=env).stdout.strip()
-
-        def change(name, message, date):
-            with open(os.path.join(repo, name), 'a') as f:
-                f.write(message + '\n')
-            git('add', '-A')
-            git('commit', '-q', '-m', message, date=date)
-            return git('rev-parse', 'HEAD')
-
-        git('init', '-q', '-b', 'main')
-        git('config', 'user.email', 't@example.test')
-        git('config', 'user.name', 't')
-        git('config', 'commit.gpgsign', 'false')
+        repo, change = self.repo()
         change('other file.txt', 'base other', '2026-09-30T10:00:00Z')
         base = change('run file.txt', 'base', '2026-09-30T11:00:00Z')
         head = change('run file.txt', 'feat: the run', '2026-10-01T10:00:00Z')
@@ -378,6 +390,56 @@ class Report(unittest.TestCase):
         schema = json.loads(self.run_report('--schema'))
         self.assertEqual(sorted(schema), sorted(run_record()))
 
+    def test_schema_lists_simplify_ran_and_fix_growth(self):
+        schema = json.loads(self.run_report('--schema'))
+        for name in ('"ran"', '"agents"', '"inline"', '"no"'):
+            self.assertIn(name, schema['simplify'])
+        for name in ('task_added', 'task_removed', 'fix_added', 'fix_removed', 'unplanned_files'):
+            self.assertIn(name, schema['fix_growth'])
+
+    def test_run_line_shows_simplify_mode_and_fix_growth(self):
+        growth = {'task_added': 40, 'task_removed': 5, 'fix_added': 120, 'fix_removed': 10, 'unplanned_files': []}
+        self.records([run_record(branch='feature/grow', simplify={'ran': 'inline', 'applied': 1, 'skipped': 0},
+                                 fix_growth=growth)])
+        line = [line for line in section(self.run_report(), 'Runs') if 'feature/grow' in line][0]
+        self.assertIn('simplify inline', line)
+        self.assertIn('fix +120/task +40', line)
+
+    def test_brief_warns_when_simplify_did_not_run(self):
+        # one consultation with no note, so the notes line would otherwise be there
+        self.session([asst('m1', iterations=[executor(), ADVISOR])])
+        self.records([run_record(branch='feature/skipped', simplify=RAN_NO),
+                      run_record(branch='feature/last-week', date='2026-10-30T12:00:00Z',
+                                 simplify=RAN_NO)])
+        brief = self.run_report('--brief').splitlines()
+        self.assertLessEqual(len(brief), 3)
+        # the one more is this run's own "no session transcript found"; last week's run is not counted
+        self.assertEqual(brief[2], 'WARN: simplify did not run on feature/skipped (2026-11-05) (+1 more, run --health)')
+        self.assertNotIn('Consultations with no note', '\n'.join(brief))
+        self.assertIn('missing=1', section(self.run_report(), 'Advisor notes:')[0])
+
+    def test_brief_counts_further_warnings(self):
+        no = RAN_NO
+        self.records([run_record(branch='one', simplify=no), run_record(branch='two', simplify=no),
+                      run_record(branch='three', simplify=no)])
+        brief = self.run_report('--brief').splitlines()
+        self.assertEqual(len(brief), 3)
+        # the 2 other simplify warnings, then the 3 runs' "no session transcript found"
+        self.assertEqual(brief[2], 'WARN: simplify did not run on one (2026-11-05) (+5 more, run --health)')
+
+    def test_old_records_are_unknown_not_flagged(self):
+        old = run_record(branch='feature/old', simplify={'applied': 0, 'skipped': 0})
+        del old['fix_growth']
+        self.records([old])
+        # its only warning is the missing transcript, not "simplify did not run"
+        self.assertEqual(self.run_report('--brief').splitlines()[2],
+                         'WARN: feature/old (2026-11-05): no session transcript found')
+        out = self.run_report()
+        self.assertNotIn('WARN', out)
+        line = [line for line in section(out, 'Runs') if 'feature/old' in line][0]
+        self.assertIn('simplify unknown', line)
+        self.assertNotIn('fix +', line)
+
     def test_missing_inputs_give_an_empty_report(self):
         shutil.rmtree(self.projects)
         out = self.run_report()
@@ -391,6 +453,454 @@ class Report(unittest.TestCase):
         self.assertNotIn('STOP', brief[0])
         self.assertIn('runs 0/5, weeks 0/3', brief[1])
         self.assertIn('Consultations with no note: 0', brief[2])
+
+
+STARTUP = '<karpathy-guidelines-session-start>guidelines</karpathy-guidelines-session-start>'
+NOT_FOUND = "Agent type 'final-reviewer' not found. Available agents: general-purpose, Explore"
+NO_RAN_KEY = {'applied': 0, 'skipped': 0}  # an old record, from before simplify.ran
+RAN_NO = {'ran': 'no', 'applied': 0, 'skipped': 0}
+
+
+class HealthCheck(Report):
+    """--health reads transcripts: rows get increasing timestamps, and each run ends at its record-writing Bash row."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = 0
+
+    def ts(self):
+        self.clock += 1
+        return f'2026-11-05T10:{self.clock // 60:02d}:{self.clock % 60:02d}.000Z'
+
+    def startup(self):
+        return {'type': 'attachment', 'timestamp': self.ts(),
+                'attachment': {'type': 'hook_success', 'hookName': 'SessionStart:startup', 'stdout': STARTUP}}
+
+    def simplify(self):
+        return asst('simplify-' + str(self.clock), content=[tool_use('s' + str(self.clock), 'Skill', {'skill': 'simplify'})],
+                    ts=self.ts())
+
+    def agent(self, tid, error=None, **inp):
+        """An Agent dispatch and its tool_result: an error when error is given, else a launched agent's report."""
+        result = {'type': 'tool_result', 'tool_use_id': tid, 'content': error or 'report'}
+        if error:
+            result['is_error'] = True
+        return [asst('m-' + tid, content=[tool_use(tid, 'Agent', dict(inp, prompt='p'))], ts=self.ts()),
+                user([result], ts=self.ts())]
+
+    def record_write(self, head, base='0000aaaa'):
+        command = f'echo \'{{"base": "{base}", "head": "{head}"}}\' >> "$HOME/.claude/workflow-log.jsonl"'
+        return asst('w-' + head, content=[tool_use('w' + head, 'Bash', {'command': command})], ts=self.ts())
+
+    def health(self, *args):
+        """The problem lines of --health. Information lines are checked by the tests about them."""
+        return [line for line in self.run_report('--health', *args).splitlines() if line.startswith(('WARN', 'Health'))]
+
+    def reviewed(self, tid, report, handback=None, **inp):
+        """A launched dispatch whose subagent transcript ends with report as its last text, then a SubagentHandback
+        whose message is handback when one is given."""
+        rows = [asst('r-' + tid, content=[{'type': 'text', 'text': report}], ts=self.ts())]
+        if handback is not None:
+            rows.append(asst('h-' + tid, content=[tool_use('hb' + tid, 'SubagentHandback', {'message': handback})],
+                             ts=self.ts()))
+        self.subagent(inp.get('subagent_type') or 'general-purpose', rows, project='proj', aid=tid, tid=tid)
+        return self.agent(tid, **inp)
+
+    def silent_case(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.agent('fr', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        for family in 'BCDEF':
+            rows += self.agent('gp' + family, subagent_type='general-purpose', model='fable',
+                               description=f'Final review of family {family} diff')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(branch='migration/x', head='c0ffee01', simplify=NO_RAN_KEY)])
+
+    def test_the_known_silent_case_is_flagged(self):
+        self.silent_case()
+        out = self.health()
+        prefix = 'WARN: migration/x (2026-11-05): '
+        self.assertTrue(all(line.startswith(prefix) for line in out), out)
+        unsimplified = [line for line in out if 'final review without simplify' in line]
+        self.assertEqual(unsimplified, [prefix + f'final review without simplify: Final review of family {f} diff'
+                                        for f in 'CDEF'])
+        self.assertEqual(len([line for line in out if 'not found' in line]), 1)
+        self.assertEqual(len([line for line in out if 'named role by general-purpose' in line]), 5)
+        self.assertEqual(len(out), 10, out)
+
+    def test_two_runs_in_one_session_are_kept_apart(self):
+        rows = [self.startup()]
+        rows += self.agent('fr1', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('aaaa1111'))
+        rows += self.agent('fr2', subagent_type='final-reviewer', description='Final review of the second run')
+        rows.append(self.record_write('bbbb2222'))
+        self.session(rows, project='proj')
+        self.records([run_record(branch='one', head='aaaa1111', simplify=NO_RAN_KEY),
+                      run_record(branch='two', head='bbbb2222', simplify=NO_RAN_KEY)])
+        self.assertEqual(self.health(), [
+            "WARN: one (2026-11-05): agent type 'final-reviewer' not found",
+            'WARN: two (2026-11-05): final review without simplify: Final review of the second run',
+        ])
+
+    def test_a_run_ends_where_its_head_is_written_not_where_it_is_the_next_base(self):
+        # run two's session sorts first, and its record names run one's head as its base
+        first = [self.startup()] + self.agent('im1', subagent_type='implementer', description='Implement Task 1')
+        first += self.agent('fr1', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        first.append(self.record_write('aaaa1111'))
+        self.session(first, project='proj', sid='sess-b')
+        second = [self.startup()] + self.agent('fr2', subagent_type='final-reviewer',
+                                               description='Final review of the second run')
+        second.append(self.record_write('bbbb2222', base='aaaa1111'))
+        self.session(second, project='proj', sid='sess-a')
+        self.records([run_record(branch='one', head='aaaa1111', simplify=NO_RAN_KEY),
+                      run_record(branch='two', head='bbbb2222', simplify=NO_RAN_KEY)])
+        self.assertEqual(self.health(), [
+            "WARN: one (2026-11-05): agent type 'final-reviewer' not found",
+            'WARN: two (2026-11-05): final review without simplify: Final review of the second run',
+        ])
+
+    def test_next_record_naming_the_head_as_its_base_does_not_take_the_run(self):
+        rows = [self.startup()]
+        rows += self.agent('fr1', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('aaaa1111'))
+        rows.append(self.record_write('bbbb2222', base='aaaa1111'))
+        self.session(rows, project='proj')
+        self.records([run_record(branch='one', head='aaaa1111', simplify=NO_RAN_KEY),
+                      run_record(branch='two', head='bbbb2222', base='aaaa1111', simplify=NO_RAN_KEY)])
+        self.assertEqual(self.health(), ["WARN: one (2026-11-05): agent type 'final-reviewer' not found"])
+
+    def two_runs_with_an_error_in_the_first(self, first_date, second_date):
+        rows = [self.startup()]
+        rows += self.agent('fr1', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('aaaa1111'))
+        rows.append(self.record_write('bbbb2222', base='aaaa1111'))
+        self.session(rows, project='proj')
+        self.records([run_record(branch='one', head='aaaa1111', date=first_date, simplify=NO_RAN_KEY),
+                      run_record(branch='two', head='bbbb2222', base='aaaa1111', date=second_date, simplify=NO_RAN_KEY)])
+
+    def test_a_previous_run_before_since_still_ends_at_its_record_write(self):
+        self.two_runs_with_an_error_in_the_first('2026-11-06T12:00:00Z', '2026-11-07T10:00:00Z')
+        self.assertEqual(self.health('--since', '2026-11-07'), ['Health: no problems'])
+
+    def test_a_previous_run_last_week_still_ends_at_its_record_write(self):
+        self.two_runs_with_an_error_in_the_first('2026-10-30T12:00:00Z', '2026-11-05T12:00:00Z')
+        self.assertEqual(self.run_report('--brief').splitlines()[2], 'Consultations with no note: 0')
+
+    def test_clean_run_has_no_problems(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_command_reading_the_log_and_naming_the_head_does_not_start_the_run(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        command = 'echo "fix wave c0ffee01" >> notes.md; tail -1 "$HOME/.claude/workflow-log.jsonl"'
+        rows.append(asst('read', content=[tool_use('read', 'Bash', {'command': command})], ts=self.ts()))
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_not_found_text_in_another_tools_error_is_not_flagged(self):
+        rows = [self.startup(), self.simplify()]
+        rows.append(asst('grep', content=[tool_use('grep', 'Bash', {'command': 'grep -n "not found" plan.md'})],
+                         ts=self.ts()))
+        rows.append(user([{'type': 'tool_result', 'tool_use_id': 'grep', 'is_error': True, 'content': NOT_FOUND}],
+                         ts=self.ts()))
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_record_says_ran_but_transcript_has_no_simplify(self):
+        self.session([self.startup(), self.record_write('c0ffee01')], project='proj')
+        self.records([run_record(head='c0ffee01', simplify={'ran': 'inline', 'applied': 1, 'skipped': 0})])
+        self.assertEqual(self.health(), [
+            'WARN: b (2026-11-05): record says simplify ran (inline) but the transcript has no simplify call'])
+
+    def test_record_says_no_but_transcript_has_simplify(self):
+        self.session([self.startup(), self.simplify(), self.record_write('c0ffee01')], project='proj')
+        self.records([run_record(head='c0ffee01', simplify=RAN_NO)])
+        self.assertEqual(self.health(), [
+            'WARN: simplify did not run on b (2026-11-05)',
+            'WARN: b (2026-11-05): record says simplify did not run but the transcript has a simplify call'])
+
+    def test_ran_no_is_warned_once(self):
+        rows = [self.startup()]
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', simplify=RAN_NO)])
+        self.assertEqual(self.health(), ['WARN: simplify did not run on b (2026-11-05)'])
+        self.assertEqual(self.run_report('--brief').splitlines()[2], 'WARN: simplify did not run on b (2026-11-05)')
+
+    def test_missing_startup_guidelines_is_flagged(self):
+        self.session([self.simplify(), self.record_write('c0ffee01')], project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): startup guidelines missing from the session'])
+
+    def test_modelless_general_purpose_dispatch_that_launched_is_flagged(self):
+        rows = [self.startup()]
+        rows += self.agent('gp', subagent_type='general-purpose', description='Explore the code')
+        rows += self.agent('untyped', error='denied by hook', description='Look around')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', simplify=NO_RAN_KEY)])
+        self.assertEqual(self.health(), [
+            'WARN: b (2026-11-05): model-less general-purpose dispatch launched: Explore the code'])
+
+    def test_sdd_template_descriptions_count_as_named_roles(self):
+        launched = ['Implement Task 2: x', 'Review Task 2 (spec + quality)', 'Re-review Task 2 fix round 1',
+                    'Spec review Task 1', 'Code quality review Task 1']
+        main = [self.startup()]
+        for i, description in enumerate(launched[:3]):
+            main += self.agent(f'gp{i}', subagent_type='general-purpose', model='opus', description=description)
+        main += self.agent('denied', error='denied by hook', subagent_type='general-purpose', model='opus',
+                           description='Implement Task 3: y')
+        # one from a subagent and one from a workflow subagent, both inside the run's span
+        self.subagent('implementer', self.agent('gp3', subagent_type='general-purpose', model='opus',
+                                                description=launched[3]), project='proj')
+        self.write_lines(os.path.join(self.projects, 'proj', 'sess-1', 'subagents', 'workflows', 'w1', 'agent-w.jsonl'),
+                         self.agent('gp4', subagent_type='general-purpose', model='opus', description=launched[4]))
+        main.append(self.record_write('c0ffee01'))
+        self.session(main, project='proj')
+        self.records([run_record(head='c0ffee01', simplify=NO_RAN_KEY)])
+        self.assertEqual(sorted(self.health()),
+                         sorted(f'WARN: b (2026-11-05): named role by general-purpose: {d}' for d in launched))
+
+    def test_run_with_no_record_write_warns(self):
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): no session transcript found'])
+
+    def test_brief_shows_first_warning_and_count(self):
+        self.silent_case()
+        # last week's run shows in --health but is not counted in this week's brief
+        self.records([run_record(branch='old', head='dead0001', date='2026-10-30T12:00:00Z')])
+        health = self.health()
+        self.assertEqual(len(health), 11)
+        self.assertIn('WARN: old (2026-10-30): no session transcript found', health)
+        brief = self.run_report('--brief').splitlines()
+        self.assertEqual(len(brief), 3)
+        self.assertEqual(brief[2], health[0] + ' (+9 more, run --health)')
+
+
+    def test_review_without_findings_line_is_flagged(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.reviewed('tr1', 'Looks fine. The Findings: line comes later.', subagent_type='task-reviewer',
+                              description='Review Task 1')
+        rows += self.reviewed('tr2', 'Done.\n`Findings: critical=0 important=0 minor=1`', subagent_type='task-reviewer',
+                              description='Review Task 2')
+        rows += self.reviewed('gp', 'All good.', subagent_type='general-purpose', model='opus',
+                              description='Re-review Task 2 fix round 1')
+        # not reviews: their reports need no Findings: line
+        rows += self.reviewed('im', 'Implemented.', subagent_type='implementer', description='Implement Task 3')
+        rows += self.reviewed('fc', 'Finding 1: fixed.', subagent_type='fix-checker', description='Fix-check Task 2')
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', subagent_type='final-reviewer',
+                              description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), [
+            'WARN: b (2026-11-05): review report has no Findings: line: Review Task 1',
+            'WARN: b (2026-11-05): review report has no Findings: line: Re-review Task 2 fix round 1',
+            'WARN: b (2026-11-05): named role by general-purpose: Re-review Task 2 fix round 1',
+        ])
+
+    def test_findings_line_is_read_from_the_handback_message(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                              handback='Report.\nFindings: critical=0 important=1 minor=2 unneeded=0',
+                              subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), [
+            "WARN: b (2026-11-05): record's final_findings critical=0 important=0 minor=0 unneeded=0 differ from the "
+            "final review's critical=0 important=1 minor=2 unneeded=0"])
+
+    def test_record_findings_must_match_the_final_reviewers_line(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.reviewed('fr1', 'Findings: critical=0 important=2 minor=0 unneeded=0', subagent_type='final-reviewer',
+                              description='Final review')
+        rows.append(self.simplify())
+        rows += self.reviewed('fr2', 'Findings: critical=0 important=0 minor=1 unneeded=1', subagent_type='final-reviewer',
+                              description='Final review after the fix wave')
+        rows += self.reviewed('fc', 'Finding 1: fixed.\nFindings: critical=0 important=5 minor=0 unneeded=0',
+                              subagent_type='general-purpose', model='opus', description='Fix-check final review findings')
+        rows.append(self.record_write('c0ffee01'))
+        # the second run's record matches its final review
+        rows.append(self.simplify())
+        rows += self.reviewed('fr3', 'Findings: critical=1 important=0 minor=0 unneeded=0', subagent_type='final-reviewer',
+                              description='Final review')
+        rows.append(self.record_write('c0ffee02'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', final_findings={'critical': 0, 'important': 2, 'minor': 0, 'unneeded': 0}),
+                      run_record(branch='two', head='c0ffee02',
+                                 final_findings={'critical': 1, 'important': 0, 'minor': 0, 'unneeded': 0})])
+        self.assertEqual(self.health(), [
+            "WARN: b (2026-11-05): record's final_findings critical=0 important=2 minor=0 unneeded=0 differ from the "
+            "final review's critical=0 important=0 minor=1 unneeded=1",
+            'WARN: b (2026-11-05): named role by general-purpose: Fix-check final review findings'])
+
+    def test_not_proportionate_verdicts_are_counted_not_flagged(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.reviewed('fc1', 'Finding 1: fixed, not proportionate: a parallel function.\nFinding 2: fixed.',
+                              subagent_type='fix-checker', description='Fix-check Task 1')
+        rows += self.reviewed('fc2', 'Finding 1: Fixed, not proportionate, a test-only parameter.',
+                              subagent_type='fix-checker', description='Fix-check Task 1 round 2')
+        rows += self.reviewed('tr', 'fixed, not proportionate\nFindings: critical=0 important=0 minor=0',
+                              subagent_type='task-reviewer', description='Review Task 1')
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', subagent_type='final-reviewer',
+                              description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', fix_growth=None)])
+        self.assertEqual(self.run_report('--health').splitlines(),
+                         ['Health: no problems', 'b (2026-11-05): fixed, not proportionate: 2'])
+        self.assertEqual(self.run_report('--brief').splitlines()[2], 'Consultations with no note: 0')
+
+    def run_on_repo(self, repo, runs):
+        """One session holding the runs, each a (record, final review report): simplify, the final review, then the
+        record write."""
+        rows = [self.startup()]
+        for i, (rec, report) in enumerate(runs):
+            rows.append(self.simplify())
+            rows += self.reviewed(f'fr{i}', report, subagent_type='final-reviewer', description='Final review')
+            rows.append(self.record_write(rec['head'], base=rec['base']))
+        self.session(rows, project='proj')
+        self.records([dict(rec, project=repo) for rec, _ in runs])
+
+    def test_conventions_counted_and_flagged_only_after_an_open_finding(self):
+        repo, change = self.repo()
+        # the heading sits more than git's 3 lines of context above the added entries
+        base = change('CLAUDE.md', 'base', text='# Project\n\n## Code conventions\n\n- rule 1\n- rule 2\n- rule 3\n- rule 4\n')
+        added = change('CLAUDE.md', 'feat: record two conventions', text='- new rule\n\n- second new rule\n')
+        elsewhere = change('CLAUDE.md', 'feat: a note elsewhere', text='\n## Notes\n\n- a note\n')
+        none = change('code.txt', 'feat: code only')
+        open_finding = ('### Important\n\n1. The new helper is a convention: record it under `## Code conventions`.\n\n'
+                        'Findings: critical=0 important=1 minor=0 unneeded=0')
+        minor_only = ('### Important\n\n1. A bug in code.txt.\n\n### Minor\n\n1. Maybe note it under '
+                      '`## Code conventions`.\n\nFindings: critical=0 important=1 minor=1 unneeded=0')
+        found = {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0}
+        self.run_on_repo(repo, [
+            (run_record(branch='added', base=base, head=added, final_findings=found), open_finding),
+            (run_record(branch='elsewhere', base=added, head=elsewhere, final_findings=found), open_finding),
+            (run_record(branch='minor', base=elsewhere, head=none, final_findings=dict(found, minor=1)), minor_only),
+        ])
+        self.assertEqual(self.health(), [
+            'WARN: elsewhere (2026-11-05): final review asked for a ## Code conventions entry but the branch added none'])
+
+    def test_fix_growth_mismatch_is_flagged(self):
+        repo, change = self.repo()
+
+        def lines(n):
+            return ''.join(f'line {i}\n' for i in range(n))
+
+        base = change('a.txt', 'base')
+        change('a.txt', 'feat: task one', text=lines(10))
+        change('a.txt', 'fix: something else', text=lines(5))
+        first = change('a.txt', 'fix: address review findings: round 1', text=lines(40))
+        change('a.txt', 'fix: address review findings: round 1', text=lines(100))
+        second = change('a.txt', 'feat: task two', text=lines(3))
+        third = change('a.txt', 'feat: task three', text=lines(7))
+        growth = {'task_added': 15, 'task_removed': 0, 'fix_added': 10, 'fix_removed': 0, 'unplanned_files': []}
+        report = 'Findings: critical=0 important=0 minor=0 unneeded=0'
+        self.run_on_repo(repo, [
+            # git says fix_added=40: 10 is off by 30 lines and 75%
+            (run_record(branch='off', base=base, head=first, fix_growth=growth), report),
+            # git says 100: 70 is off by 30 lines but only 30%
+            (run_record(branch='near', base=first, head=second, fix_growth=dict(growth, fix_added=70)), report),
+            # git says 0: 15 is off by 100% but only 15 lines
+            (run_record(branch='small', base=second, head=third, fix_growth=dict(growth, fix_added=15)), report),
+        ])
+        self.assertEqual(self.health(), ["WARN: off (2026-11-05): record's fix_added 10 differs from git's 40"])
+
+    def test_unusable_git_is_skipped_without_warn(self):
+        # the default project /p is not there; the second project is a folder but not a repo
+        self.session([self.startup(), self.simplify(), self.record_write('y'), self.simplify(),
+                      self.record_write('z', base='y')], project='proj')
+        self.records([run_record(), run_record(branch='two', project=self.root, base='y', head='z')])
+        self.assertEqual(self.run_report('--health').splitlines(),
+                         ['Health: no problems', 'Git evidence unavailable for 2 runs'])
+        self.assertEqual(self.run_report('--brief').splitlines()[2], 'Consultations with no note: 0')
+
+    def test_session_with_workflow_agents_but_no_record_is_flagged(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01'))
+        rows += self.agent('im', subagent_type='implementer', description='Implement Task 1')
+        self.session(rows, project='proj', sid='sess-1')
+        self.session(self.agent('gp', subagent_type='general-purpose', model='opus', description='Implement Task 2: x'),
+                     project='proj', sid='sess-2')
+        # none of these: a dispatch that names no workflow role, a denied one, and one last week
+        quiet = self.agent('ex', subagent_type='general-purpose', model='opus', description='Explore the code')
+        quiet += self.agent('den', error='denied by hook', subagent_type='implementer', description='Implement Task 3')
+        quiet += [asst('m-old', content=[tool_use('old', 'Agent', {'subagent_type': 'implementer', 'prompt': 'p'})],
+                       ts='2026-10-30T10:00:00.000Z'),
+                  user([{'type': 'tool_result', 'tool_use_id': 'old', 'content': 'report'}], ts='2026-10-30T10:00:01.000Z')]
+        self.session(quiet, project='proj', sid='sess-3')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), [
+            'WARN: session sess-1.jsonl ran workflow agents but wrote no run record',
+            'WARN: session sess-2.jsonl ran workflow agents but wrote no run record'])
+        self.assertEqual(self.run_report('--brief').splitlines()[2],
+                         'WARN: session sess-1.jsonl ran workflow agents but wrote no run record (+1 more, run --health)')
+
+    def test_planning_session_without_record_is_not_flagged(self):
+        # a planning session dispatches a plan reviewer and writes no run record, by design
+        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.agent('pr', subagent_type='general-purpose', model='opus', description='Plan review of the plan')
+        self.session(rows, project='proj', sid='sess-1')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_plan_review_without_plan_simplifier_is_flagged(self):
+        self.session(self.agent('pr', subagent_type='plan-reviewer', description='Plan review'), project='proj')
+        self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
+
+    def test_a_check_that_mentions_plan_simplifier_does_not_count(self):
+        rows = self.agent('ck', subagent_type='general-purpose', model='opus',
+                          description='Builder check on plan-simplifier spec')
+        rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
+        self.session(rows, project='proj')
+        self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
+
+    def test_plan_simplifier_before_plan_review_is_clean(self):
+        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
+        self.session(rows, project='proj')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_each_plan_review_needs_its_own_plan_simplifier(self):
+        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.agent('pr1', subagent_type='plan-reviewer', description='Plan review')
+        rows += self.agent('pr2', subagent_type='plan-reviewer', description='Plan re-review')
+        self.session(rows, project='proj')
+        self.assertEqual(self.health(),
+                         ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan re-review'])
+
+    def test_a_denied_plan_review_is_not_flagged(self):
+        self.session(self.agent('pr', error='denied by hook', subagent_type='plan-reviewer', description='Plan review'),
+                     project='proj')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_plan_review_last_week_is_not_flagged(self):
+        self.session([asst('m-old', content=[tool_use('old', 'Agent', {'subagent_type': 'plan-reviewer',
+                                                                       'description': 'Plan review', 'prompt': 'p'})],
+                           ts='2026-10-30T10:00:00.000Z'),
+                      user([{'type': 'tool_result', 'tool_use_id': 'old', 'content': 'report'}],
+                           ts='2026-10-30T10:00:01.000Z')], project='proj')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_plan_simplifier_that_was_not_found_does_not_count(self):
+        rows = self.agent('ps', error="Agent type 'plan-simplifier' not found", subagent_type='plan-simplifier',
+                          description='Plan simplify')
+        rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
+        self.session(rows, project='proj')
+        self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
 
 if __name__ == '__main__':

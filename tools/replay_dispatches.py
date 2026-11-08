@@ -1,6 +1,8 @@
 """Replay every past Agent dispatch through the real dispatch hook and print what it would have refused.
 
-Reads transcripts under ~/.claude/projects, or --projects DIR, and never writes to them.
+Reads transcripts under ~/.claude/projects, or --projects DIR, and never writes to them. Each dispatch is judged by a
+temporary copy of its transcript cut just after that dispatch, so later rows don't change the answer. A subagent's
+session transcript is linked in whole, not cut.
 
 Run with: /usr/bin/python3 -I tools/replay_dispatches.py [--projects DIR]
 """
@@ -10,12 +12,14 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(HERE, '..', 'hooks', 'guard-agent-dispatch.py')
 PYTHON = '/usr/bin/python3'
 MISSING_TYPE = '(missing)'
 MAX_DESCRIPTIONS = 20
+SUBAGENT_FOLDER = '/subagents/'  # As in the hook, which finds a subagent's session transcript by this folder.
 
 
 def transcripts(root):
@@ -44,26 +48,45 @@ def hook_decision(tool_input, path):
     return json.loads(p.stdout)['hookSpecificOutput']['permissionDecision'] if p.stdout.strip() else None
 
 
+def cut_copy_path(path, folder):
+    """Where in folder to write path's cut copy, laid out so the hook still finds a subagent's session transcript."""
+    if SUBAGENT_FOLDER not in path:
+        return os.path.join(folder, 'session.jsonl')
+    session, own = path.rsplit(SUBAGENT_FOLDER, 1)
+    os.symlink(session + '.jsonl', os.path.join(folder, 'session.jsonl'))
+    copy = os.path.join(folder, 'session', 'subagents', own)
+    os.makedirs(os.path.dirname(copy))
+    return copy
+
+
 def unique_dispatches(root, skipped):
-    """Yield (tool_input, transcript path) once per call. skipped[0] counts what could not be read."""
+    """Yield (tool_input, cut copy path) once per call; the copy ends with that call's row.
+
+    skipped[0] counts what could not be read.
+    """
     seen = set()  # Forks, resumed sessions and streaming log the same call more than once.
     for path in transcripts(root):
-        try:
-            with open(path, 'rb') as transcript:
-                for line in transcript:
-                    if b'"Agent"' not in line:  # This cheap test is what makes a 935 MB tree practical.
-                        continue
-                    try:
-                        blocks = dispatches_in(line)
-                        new = [b for b in blocks if not b.get('id') or b['id'] not in seen]
-                        seen.update(b['id'] for b in new if b.get('id'))
-                    except (ValueError, AttributeError, TypeError):
-                        skipped[0] += 1
-                        continue
-                    for block in new:
-                        yield block.get('input'), path
-        except OSError:
-            skipped[0] += 1
+        with tempfile.TemporaryDirectory(prefix='replay-dispatches-') as folder:
+            try:
+                copy = cut_copy_path(path, folder)
+                with open(path, 'rb') as transcript, open(copy, 'wb') as cut:
+                    for line in transcript:
+                        cut.write(line)
+                        if b'"Agent"' not in line:  # This cheap test is what makes a 935 MB tree practical.
+                            continue
+                        try:
+                            blocks = dispatches_in(line)
+                            new = [b for b in blocks if not b.get('id') or b['id'] not in seen]
+                            seen.update(b['id'] for b in new if b.get('id'))
+                        except (ValueError, AttributeError, TypeError):
+                            skipped[0] += 1
+                            continue
+                        if new:  # The copy now ends with this row.
+                            cut.flush()
+                        for block in new:
+                            yield block.get('input'), copy
+            except OSError:
+                skipped[0] += 1
 
 
 def replay(root):
@@ -95,7 +118,8 @@ def main():
     if not os.path.isdir(args.projects):
         parser.error(f'no such folder: {args.projects}')
 
-    counts, descriptions, denied_with_model, hook_failures, skipped = replay(args.projects)
+    # Absolute, so the link to a subagent's session transcript doesn't dangle.
+    counts, descriptions, denied_with_model, hook_failures, skipped = replay(os.path.abspath(args.projects))
 
     denied = sum(c['denied'] for c in counts.values())
     silent = sum(c['silent'] for c in counts.values())

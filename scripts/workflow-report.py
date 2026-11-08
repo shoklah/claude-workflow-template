@@ -1,12 +1,17 @@
 #!/usr/bin/python3 -I
 """Read-only report over Claude Code transcripts and the workflow run log.
 
-Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--brief | --schema] [--now ISO]
+Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--brief | --health | --schema] [--now ISO]
 
   --projects  transcript tree (default ~/.claude/projects)
   --log       run log, one JSON run record per line (default ~/.claude/workflow-log.jsonl)
   --since     ignore transcript rows and run records before this date (UTC)
-  --brief     at most 3 lines: this week's advisor share of Fable use, the trial's progress, notes missing
+  --brief     at most 3 lines: this week's advisor share of Fable use, the trial's progress, then this week's
+              first WARN line with a count of the rest, or else the consultations with no note
+  --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
+              this week's sessions with no run record, and for this week's plan reviews with no plan-simplifier
+              since the previous plan review, or "Health: no problems"; then information lines: the
+              "fixed, not proportionate" counts and the runs whose git evidence is unavailable
   --schema    print the run record schema and exit
   --now       ISO time to use as "now", for tests (default: the current time)
 
@@ -15,7 +20,9 @@ Weeks run from Sunday 07:00 UTC. Costs are list-price estimates at Fable prices.
 """
 import argparse
 import datetime
+import functools
 import glob
+import heapq
 import json
 import os
 import re
@@ -40,8 +47,11 @@ SCHEMA = {
     'fix_rounds': 'int',
     'stops': 'int, stops for the owner',
     'final_findings': '{"critical": N, "important": N, "minor": N, "unneeded": N} from the final review',
-    'simplify': '{"applied": N, "skipped": N} fixes from simplify',
+    'simplify': '{"ran": "agents"|"inline"|"no", "applied": N, "skipped": N}: how simplify ran ("inline" only under '
+                'about 100 changed lines) and its fixes',
     'failing_test': 'list of {"task": N, "result": "passed"|"failed"|"no_tests"|"couldnt_run"|"exempt"}',
+    'fix_growth': '{"task_added": N, "task_removed": N, "fix_added": N, "fix_removed": N, "unplanned_files": [paths]}: '
+                  'lines from the tasks\' own commits and from fix-round commits, and new files the plan did not name',
 }
 
 # Fable list prices, dollars per million tokens.
@@ -58,13 +68,42 @@ STOP_SHARE = 25.0
 TRIAL_RUNS = 5
 TRIAL_WEEKS = 3
 FIX_WINDOW_DAYS = 14
-NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'fix-checker')
+NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
 TEST_RESULTS = ('passed', 'failed', 'no_tests', 'couldnt_run', 'exempt')
+SIMPLIFY_RAN = ('agents', 'inline', 'no')
 NOTE_RE = re.compile(r'^Advisor: .+ \| changed: (yes|no) \| .*$', re.M)
 SCRIPT_RE = re.compile(r'([^/\s"\']+\.(?:py|sh))')
 WRAP_UP = 'mcp__ccd_turn__wrap_up'
 GIT_TIMEOUT = 30
+
+# Copied from hooks/guard-agent-dispatch.py, since scripts can't import each other: keep them the same.
+UNNAMED_TYPES = {None, '', 'general-purpose'}
+SIMPLIFY_COMMAND = re.compile(r'\s*(<command-message>.*?</command-message>\s*)?<command-name>/simplify</command-name>', re.S)
+# A general-purpose or untyped dispatch is a final review when its description says so, and is not a fix wave or a
+# fix-check of one.
+FINAL_REVIEW_DESCRIPTION = re.compile(r'final[ -]review', re.I)
+NOT_FINAL_REVIEW = re.compile(r'fix|check', re.I)
+# The same for plan reviews and plan simplifies, which NOT_FINAL_REVIEW also excludes: a check that only mentions
+# plan-simplifier is not a plan simplify.
+PLAN_REVIEW_DESCRIPTION = re.compile(r'plan[ -](re-?)?review', re.I)
+PLAN_SIMPLIFY_DESCRIPTION = re.compile(r'plan[ -]simplif', re.I)
+# Health check: a general-purpose dispatch with one of these descriptions did a named agent's job.
+TASK_REVIEW = re.compile(r're-?review|review task|task \d+ review|(spec|quality|code quality) review', re.I)
+NAMED_ROLE = re.compile(r'implement|plan review|fix-?check|final[ -]review|' + TASK_REVIEW.pattern, re.I)
+WORKFLOW_TYPES = ('implementer', 'implementer-copy', 'implementer-escalated', 'final-reviewer')
+FINDINGS_LINE = re.compile(r'^[`*\s]*Findings:(.*)$', re.M)
+SEVERITY = re.compile(r'[#*_\s\d.)-]*(critical|important|minor)\b', re.I)
+NOT_PROPORTIONATE = 'fixed, not proportionate'
+CONVENTIONS = '## Code conventions'
+FIX_ROUND_SUBJECT = 'fix: address review findings'
+FIX_GROWTH_SLACK = 20  # lines; a recorded fix_added is off when it misses git's by more than this and by over 50%
+NOT_FOUND = re.compile(r"Agent type '([^']*)' not found")
+STARTUP_TAG = b'<karpathy-guidelines-session-start>'
+RUN_LOG = 'workflow-log.jsonl'
+# Only lines matching this can hold a dispatch, a simplify call, a record write, the startup block or an error.
+HEALTH_NEEDLES = (b'"Agent"', b'simplify', b'workflow-log.jsonl', b'karpathy-guidelines-session-start',
+                  b'"is_error":true', b'"is_error": true')
 
 
 def parse_time(value):
@@ -289,33 +328,29 @@ class Transcripts:
 
 def read_transcripts(root, since, stats):
     tr = Transcripts(since)
-    if not os.path.isdir(root):
-        return tr
-    base = glob.escape(root)
-    for path in sorted(glob.glob(os.path.join(base, '*', '*.jsonl'))):
+    for path in main_transcripts(root):
         tr.read_file(path, None, stats)
-    # Agent subagents sit in <session>/subagents; workflow subagents in <session>/subagents/workflows/<id>.
-    subagents = glob.glob(os.path.join(base, '*', '*', 'subagents', '*.jsonl'))
-    subagents += glob.glob(os.path.join(base, '*', '*', 'subagents', 'workflows', '*', '*.jsonl'))
-    for path in sorted(subagents):
-        role = 'subagent'
-        try:
-            with open(path[:-len('.jsonl')] + '.meta.json') as f:
-                meta = json.load(f)
-            if isinstance(meta, dict) and isinstance(meta.get('agentType'), str) and meta['agentType']:
-                role = meta['agentType']
-        except (OSError, ValueError):
-            pass
-        tr.read_file(path, role, stats)
+    # Agent subagents sit in <session>/subagents, workflow subagents deeper, as subagent_transcripts finds them.
+    pattern = os.path.join(glob.escape(root), '*', '*', 'subagents', '**', '*.jsonl')
+    for path in sorted(glob.glob(pattern, recursive=True)):
+        tr.read_file(path, field(subagent_meta(path), 'agentType', str, '') or 'subagent', stats)
     return tr
 
 
-def read_runs(log, since, stats):
+def subagent_meta(path):
+    """The .meta.json beside a subagent transcript, or {}."""
+    try:
+        with open(path[:-len('.jsonl')] + '.meta.json') as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def read_runs(log, stats):
     runs = []
     for rec in read_jsonl(log, stats):
         t = parse_time(rec.get('date'))
-        if since is not None and t is not None and t < since:
-            continue
         # Clean each record once, so the report lines below read plain fields.
         rec['_time'] = t
         rec['advisor'] = rec.get('advisor') is True
@@ -323,6 +358,10 @@ def read_runs(log, since, stats):
         rec['final_findings'] = {k: num(findings.get(k)) for k in FINDINGS}
         rec['failing_test'] = [item for item in field(rec, 'failing_test', list, [])
                                if isinstance(item, dict) and item.get('result') in TEST_RESULTS]
+        # A record without "ran" (written before it existed) is unknown, never "no".
+        simplify = field(rec, 'simplify', dict, {})
+        rec['simplify'] = dict(simplify, ran=simplify.get('ran') if simplify.get('ran') in SIMPLIFY_RAN else None)
+        rec['fix_growth'] = field(rec, 'fix_growth', dict, None)
         runs.append(rec)
     return runs
 
@@ -349,6 +388,426 @@ def later_fixes(run):
     except (OSError, subprocess.SubprocessError):
         return []
     return [line.split('\t', 2) for line in out.splitlines() if line.count('\t') >= 2]
+
+
+def git_range(project, base, head, command, *args):
+    """Output of git command base..head *args in the project, or None when the folder, the range or git is unusable."""
+    if (not all(isinstance(v, str) and v for v in (project, base, head)) or not os.path.isdir(project)
+            or base.startswith('-') or head.startswith('-')):
+        return None
+    try:
+        return git(project, command, f'{base}..{head}', *args)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def conventions_added(project, base, head):
+    """Non-blank lines added under ## Code conventions in the project's root CLAUDE.md over base..head, or None."""
+    # Whole-file context, so the heading above each added line is in the diff.
+    out = git_range(project, base, head, 'diff', '--no-color', '--no-ext-diff', '--unified=1000000', '--', 'CLAUDE.md')
+    if out is None:
+        return None
+    heading, added, body = None, 0, False
+    for line in out.splitlines():
+        body = body or line.startswith('@@')
+        if not body or line[:1] not in ('+', ' '):
+            continue
+        text = line[1:].rstrip()
+        if re.match(r'#{1,2} ', text):
+            heading = text
+        elif heading == CONVENTIONS and line[0] == '+' and text:
+            added += 1
+    return added
+
+
+def recompute_fix_growth(project, base, head):
+    """Lines added and removed over base..head by fix-round commits and by the other commits, or None."""
+    out = git_range(project, base, head, 'log', '--no-color', '--numstat', '--format=%x00%s')
+    if out is None:
+        return None
+    growth = dict.fromkeys(('task_added', 'task_removed', 'fix_added', 'fix_removed'), 0)
+    kind = 'task'
+    for line in out.splitlines():
+        if line.startswith('\0'):
+            kind = 'fix' if line[1:].startswith(FIX_ROUND_SUBJECT) else 'task'
+        elif line.count('\t') >= 2:
+            added, removed, _ = line.split('\t', 2)
+            growth[kind + '_added'] += int(added) if added.isdigit() else 0
+            growth[kind + '_removed'] += int(removed) if removed.isdigit() else 0
+    return growth
+
+
+def is_final_review(tool_input):
+    subagent_type = tool_input.get('subagent_type')
+    if subagent_type == 'final-reviewer':
+        return True
+    description = tool_input.get('description')
+    return (subagent_type in UNNAMED_TYPES and isinstance(description, str)
+            and bool(FINAL_REVIEW_DESCRIPTION.search(description)) and not NOT_FINAL_REVIEW.search(description))
+
+
+def is_plan_review(tool_input):
+    subagent_type = tool_input.get('subagent_type')
+    if subagent_type == 'plan-reviewer':
+        return True
+    description = tool_input.get('description')
+    return (subagent_type in UNNAMED_TYPES and isinstance(description, str)
+            and bool(PLAN_REVIEW_DESCRIPTION.search(description)) and not NOT_FINAL_REVIEW.search(description))
+
+
+def is_plan_simplify(tool_input):
+    subagent_type = tool_input.get('subagent_type')
+    if subagent_type == 'plan-simplifier':
+        return True
+    description = tool_input.get('description')
+    return (subagent_type in UNNAMED_TYPES and bool(tool_input.get('model')) and isinstance(description, str)
+            and bool(PLAN_SIMPLIFY_DESCRIPTION.search(description)) and not NOT_FINAL_REVIEW.search(description))
+
+
+def row_calls_simplify(row):
+    content = row.get('message', {}).get('content')
+    if row.get('type') == 'user':
+        if isinstance(content, str):
+            return bool(SIMPLIFY_COMMAND.match(content))
+        return any(block.get('type') == 'text' and SIMPLIFY_COMMAND.match(block.get('text', '')) for block in content or [])
+    if row.get('type') == 'assistant':
+        return any(block.get('type') == 'tool_use' and block.get('name') == 'Skill'
+                   and block.get('input', {}).get('skill') == 'simplify' for block in content or [])
+    return False
+
+
+def launched_ids(row, ids):
+    """The ids, among ids, that this row reports as launched: their tool_result is not an error.
+
+    Only is_error decides this, never the result's text, which may be a review that says "not found" or "denied".
+    """
+    content = row.get('message', {}).get('content')
+    if row.get('type') != 'user' or not isinstance(content, list):
+        return []
+    return [block['tool_use_id'] for block in content
+            if block.get('type') == 'tool_result' and block.get('tool_use_id') in ids and block.get('is_error') is not True]
+
+
+def result_text(block):
+    content = block.get('content')
+    if isinstance(content, list):
+        return ' '.join(c.get('text', '') for c in content if isinstance(c, dict) and isinstance(c.get('text'), str))
+    return content if isinstance(content, str) else ''
+
+
+@functools.lru_cache(maxsize=None)
+def transcript_events(path):
+    """Read a transcript once and return (events, launched ids, has the startup block).
+
+    Events are (timestamp, kind, value) in file order: ('simplify', None), ('agent', (id, input)), ('not_found',
+    agent type) and ('write', Bash command naming the run log). A row with no timestamp takes the previous row's.
+    Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of dispatches still waiting for one.
+    """
+    events, launched, startup, timestamp = [], set(), False, ''
+    pending = {}  # tool_use id -> its bytes, for Agent dispatches with no result yet
+    try:
+        f = open(path, 'rb')
+    except OSError:
+        return events, launched, startup
+    with f:
+        for line in f:
+            if not any(n in line for n in HEALTH_NEEDLES) and not any(needle in line for needle in pending.values()):
+                continue
+            try:
+                row = json.loads(line)
+                if isinstance(row.get('timestamp'), str):
+                    timestamp = row['timestamp']
+                kind, content = row.get('type'), row.get('message', {}).get('content')
+                # Prompts and briefs can quote the tag; only the hook's attachment row shows the block was injected.
+                startup = startup or (kind == 'attachment' and STARTUP_TAG in line)
+                if row_calls_simplify(row):
+                    events.append((timestamp, 'simplify', None))
+                if kind == 'assistant':
+                    for block in content or []:
+                        inp = block.get('input')
+                        if block.get('type') != 'tool_use' or not isinstance(inp, dict):
+                            continue
+                        if block.get('name') == 'Agent' and isinstance(block.get('id'), str):
+                            pending[block['id']] = block['id'].encode()
+                            kept = {k: inp.get(k) for k in ('subagent_type', 'model', 'description')}
+                            events.append((timestamp, 'agent', (block['id'], kept)))
+                        elif block.get('name') == 'Bash' and RUN_LOG in str(inp.get('command')):
+                            events.append((timestamp, 'write', inp['command']))
+                elif kind == 'user' and isinstance(content, list):
+                    launched.update(launched_ids(row, pending))
+                    for block in content:
+                        if block.get('type') != 'tool_result':
+                            continue
+                        # Only an Agent call's own error says its agent type was not found.
+                        dispatch = pending.pop(block.get('tool_use_id'), None)
+                        errored = dispatch is not None and block.get('is_error') is True
+                        found = NOT_FOUND.search(result_text(block)) if errored else None
+                        if found:
+                            events.append((timestamp, 'not_found', found.group(1)))
+            except (ValueError, AttributeError, TypeError, RecursionError):  # A torn or odd line says nothing.
+                continue
+    return events, launched, startup
+
+
+def main_transcripts(projects_root):
+    return sorted(glob.glob(os.path.join(glob.escape(projects_root), '*', '*.jsonl')))
+
+
+def run_spans(projects_root, records):
+    """Map each record's index in records, the whole run log, to (transcript_path, start, end), as timestamps.
+
+    end is the main-transcript Bash row that wrote the run's record: the first whose "head" value is the run's head,
+    since the next run's record names that head again as its base, perhaps in another session. start is the previous
+    record-writing row in that transcript, one whose "head" value is any record's head, or None for the transcript's
+    start. So a run a report leaves out still ends where its record was written, and a command that mentions the log
+    without a record's "head" value ends nothing. A run whose record write isn't found has no span.
+    """
+    heads = [(i, re.compile(r'"head"\s*:\s*"' + re.escape(r['head'])))
+             for i, r in enumerate(records) if isinstance(r.get('head'), str) and r['head']]
+    spans = {}
+    if not heads:
+        return spans
+    for path in main_transcripts(projects_root):
+        start = None
+        for timestamp, kind, command in transcript_events(path)[0]:
+            owners = [i for i, written in heads if kind == 'write' and written.search(command)]
+            for i in owners:
+                spans.setdefault(i, (path, start, timestamp))
+            if owners:
+                start = timestamp
+    return spans
+
+
+def subagent_transcripts(path):
+    """The subagent transcripts of the main transcript path, workflow subagents included."""
+    folder = glob.escape(path[:-len('.jsonl')])
+    return sorted(glob.glob(os.path.join(folder, 'subagents', '**', '*.jsonl'), recursive=True))
+
+
+@functools.lru_cache(maxsize=None)
+def span_events(path, start, end):
+    """(events, launched ids) of the rows timed in (start, end] of the main transcript path and its subagents."""
+    launched, per_file = set(), []
+    for p in [path] + subagent_transcripts(path):
+        events, file_launched, _ = transcript_events(p)
+        launched |= file_launched
+        per_file.append([e for e in events if (start is None or e[0] > start) and e[0] <= end])
+    # Rows from several transcripts merge by timestamp, as in the dispatch hook.
+    return list(heapq.merge(*per_file, key=lambda e: e[0])), launched
+
+
+@functools.lru_cache(maxsize=None)
+def review_report(subagent_path):
+    """The input.message of the transcript's last SubagentHandback tool_use, or failing that its last assistant text."""
+    handback, text = None, ''
+    for row in read_jsonl(subagent_path, {'skipped': 0}):
+        msg = row.get('message')
+        if row.get('type') != 'assistant' or not isinstance(msg, dict):
+            continue
+        for block in field(msg, 'content', list, []):
+            if not isinstance(block, dict):
+                continue
+            message = field(block, 'input', dict, {}).get('message')
+            if block.get('type') == 'tool_use' and block.get('name') == 'SubagentHandback' and isinstance(message, str):
+                handback = message
+            elif block.get('type') == 'text' and isinstance(block.get('text'), str):
+                text = block['text']
+    return text if handback is None else handback
+
+
+@functools.lru_cache(maxsize=None)
+def span_reports(path, start, end):
+    """(dispatch input, report) for each review or fix-checker launched in the span whose subagent transcript is
+    there, in order."""
+    events, launched = span_events(path, start, end)
+    files = {}
+    for p in subagent_transcripts(path):
+        tid = subagent_meta(p).get('toolUseId')
+        if isinstance(tid, str):
+            files[tid] = p
+    reports = []
+    for _, kind, value in events:
+        if (kind == 'agent' and value[0] in launched and value[0] in files
+                and (is_review(value[1]) or value[1].get('subagent_type') == 'fix-checker')):
+            reports.append((value[1], review_report(files[value[0]])))
+    return reports
+
+
+def is_review(tool_input):
+    """A task or final review, whose report ends with a Findings: line."""
+    subagent_type, description = tool_input.get('subagent_type'), tool_input.get('description')
+    return (subagent_type == 'task-reviewer' or is_final_review(tool_input)
+            or subagent_type in UNNAMED_TYPES and isinstance(description, str) and bool(TASK_REVIEW.search(description)))
+
+
+def findings_line(report):
+    """The counts on the report's last Findings: line, or None when it has none."""
+    lines = FINDINGS_LINE.findall(report)
+    if not lines:
+        return None
+    counts = {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', lines[-1])}
+    return {k: counts.get(k, 0) for k in FINDINGS}
+
+
+def findings_text(counts):
+    return ' '.join(f'{k}={v}' for k, v in counts.items())
+
+
+def asks_for_conventions(report):
+    """Whether the report has an Important finding that mentions ## Code conventions: on a line starting with
+    Important, or under an Important heading up to the next severity or heading."""
+    severity = None
+    for line in report.splitlines():
+        m = SEVERITY.match(line)
+        if m or line.startswith('#'):
+            severity = m.group(1).lower() if m else None
+        if severity == 'important' and CONVENTIONS in line:
+            return True
+    return False
+
+
+def count_not_proportionate(path, start, end):
+    """"fixed, not proportionate" verdicts in the span's fix-checker reports."""
+    return sum(report.lower().count(NOT_PROPORTIONATE) for inp, report in span_reports(path, start, end)
+               if inp.get('subagent_type') == 'fix-checker')
+
+
+def check_run(path, start, end, run):
+    """Problems shown by the rows timed in (start, end] of the main transcript path and its subagent transcripts."""
+    events, launched = span_events(path, start, end)
+    agents = [value[1] for _, kind, value in events if kind == 'agent' and value[0] in launched]
+    ran = run['simplify']['ran']
+    problems, since, simplified = [], False, False
+    for _, kind, value in events:
+        if kind == 'simplify':
+            since = simplified = True
+        elif kind == 'agent' and value[0] in launched and is_final_review(value[1]):
+            # When the record says simplify did not run, its own warning covers these.
+            if not since and ran != 'no':
+                problems.append(f"final review without simplify: {value[1].get('description')}")
+            since = False
+    if ran == 'no' and simplified:
+        problems.append('record says simplify did not run but the transcript has a simplify call')
+    elif ran in ('agents', 'inline') and not simplified:
+        problems.append(f'record says simplify ran ({ran}) but the transcript has no simplify call')
+    problems += [f"agent type '{value}' not found" for _, kind, value in events if kind == 'not_found']
+    reports = span_reports(path, start, end)
+    problems += [f"review report has no Findings: line: {inp.get('description')}" for inp, report in reports
+                 if is_review(inp) and findings_line(report) is None]
+    finals = [findings_line(report) for inp, report in reports if is_final_review(inp)]
+    if finals and finals[-1] is not None and finals[-1] != run['final_findings']:
+        problems.append(f"record's final_findings {findings_text(run['final_findings'])} differ from the final "
+                        f"review's {findings_text(finals[-1])}")
+    unnamed = [inp for inp in agents if inp.get('subagent_type') in UNNAMED_TYPES]
+    problems += [f"named role by general-purpose: {inp.get('description')}" for inp in unnamed
+                 if isinstance(inp.get('description'), str) and NAMED_ROLE.search(inp['description'])]
+    problems += [f"model-less general-purpose dispatch launched: {inp.get('description')}" for inp in unnamed
+                 if not inp.get('model')]
+    if not transcript_events(path)[2]:
+        problems.append('startup guidelines missing from the session')
+    return problems
+
+
+def run_date(run):
+    return run['_time'].date().isoformat() if run['_time'] is not None else 'no date'
+
+
+def check_git(run, final_report):
+    """Problems git shows in the run, and False when a check needed git and git was unusable."""
+    project, base, head = run.get('project'), run.get('base'), run.get('head')
+    problems, usable = [], True
+    if run['fix_growth'] is not None:
+        growth = recompute_fix_growth(project, base, head)
+        usable = growth is not None
+        if usable:
+            recorded = num(run['fix_growth'].get('fix_added'))
+            off = abs(recorded - growth['fix_added'])
+            if off > growth['fix_added'] / 2 and off > FIX_GROWTH_SLACK:
+                problems.append(f"record's fix_added {recorded} differs from git's {growth['fix_added']}")
+    if asks_for_conventions(final_report):
+        added = conventions_added(project, base, head)
+        usable = usable and added is not None
+        if added == 0:
+            problems.append(f'final review asked for a {CONVENTIONS} entry but the branch added none')
+    return problems, usable
+
+
+def is_workflow_agent(tool_input):
+    """An implementer or a final review, named or general-purpose: the session that dispatches one writes a record."""
+    description = tool_input.get('description')
+    return (tool_input.get('subagent_type') in WORKFLOW_TYPES or is_final_review(tool_input)
+            or tool_input.get('subagent_type') in UNNAMED_TYPES and isinstance(description, str)
+            and 'implement' in description.lower())
+
+
+def unrecorded_sessions(projects_root, spans, now):
+    """A WARN line for each main transcript that launched a workflow agent this week outside every run's span."""
+    week = week_start(now)
+    covered = {}
+    for path, start, end in spans.values():
+        covered.setdefault(path, []).append((start, end))
+    out = []
+    for path in main_transcripts(projects_root):
+        events, launched, _ = transcript_events(path)
+        own = covered.get(path, [])
+        for timestamp, kind, value in events:
+            t = parse_time(timestamp)
+            if (kind == 'agent' and value[0] in launched and is_workflow_agent(value[1]) and t is not None and t >= week
+                    and not any((start is None or timestamp > start) and timestamp <= end for start, end in own)):
+                out.append(f'WARN: session {os.path.basename(path)} ran workflow agents but wrote no run record')
+                break
+    return out
+
+
+def unsimplified_plan_reviews(projects_root, now):
+    """A WARN line for each plan review a main transcript launched this week with no launched plan simplify since
+    the previous launched plan review."""
+    week = week_start(now)
+    out = []
+    for path in main_transcripts(projects_root):
+        events, launched, _ = transcript_events(path)
+        simplified = False
+        for timestamp, kind, value in events:
+            if kind != 'agent' or value[0] not in launched:
+                continue
+            simplified = simplified or is_plan_simplify(value[1])
+            if is_plan_review(value[1]):
+                t = parse_time(timestamp)
+                if not simplified and t is not None and t >= week:
+                    out.append(f"WARN: session {os.path.basename(path)}: plan review without plan-simplifier: "
+                               f"{value[1].get('description')}")
+                simplified = False
+    return out
+
+
+def health(projects_root, runs, now, records):
+    """WARN lines for the problems the transcripts and git show in each run, for this week's sessions with no run
+    record and for this week's plan reviews with no plan simplify, then the information lines; records is the whole
+    run log."""
+    spans = run_spans(projects_root, records)
+    span_of = {id(r): spans.get(i) for i, r in enumerate(records)}
+    warns, info, unavailable = [], [], 0
+    for r in runs:
+        label = f"{r.get('branch')} ({run_date(r)})"
+        span = span_of.get(id(r))
+        problems = check_run(*span, r) if span else ['no session transcript found']
+        finals = [report for inp, report in span_reports(*span) if is_final_review(inp)] if span else []
+        git_problems, usable = check_git(r, finals[-1] if finals else '')
+        unavailable += not usable
+        warns.extend(f'WARN: {label}: {problem}' for problem in problems + git_problems)
+        count = count_not_proportionate(*span) if span else 0
+        if count:
+            info.append(f'{label}: {NOT_PROPORTIONATE}: {count}')
+    if unavailable:
+        info.append(f'Git evidence unavailable for {unavailable} runs')
+    return warns + unrecorded_sessions(projects_root, spans, now) + unsimplified_plan_reviews(projects_root, now), info
+
+
+def run_warnings(projects_root, runs, now, records):
+    """WARN lines for these runs (simplify recorded as not run, then the health lines) and the information lines."""
+    warns, info = health(projects_root, runs, now, records)
+    return [f"WARN: simplify did not run on {r.get('branch')} ({run_date(r)})" for r in runs
+            if r['simplify']['ran'] == 'no'] + warns, info
 
 
 def share_text(advisor, fable):
@@ -384,9 +843,11 @@ def group_line(name, group):
 
 
 def run_line(r):
-    found = ' '.join(f'{k}={v}' for k, v in r['final_findings'].items())
+    growth = r['fix_growth']
+    found = findings_text(r['final_findings'])
     return (f"    {r.get('date')} {r.get('project')} {r.get('branch')} path={r.get('path')} {found} "
-            f"fix_rounds={num(r.get('fix_rounds'))} stops={num(r.get('stops'))}")
+            f"fix_rounds={num(r.get('fix_rounds'))} stops={num(r.get('stops'))} simplify {r['simplify']['ran'] or 'unknown'}"
+            + (f" fix +{num(growth.get('fix_added'))}/task +{num(growth.get('task_added'))}" if growth else ''))
 
 
 def rate(count, calls):
@@ -432,13 +893,24 @@ def full_report(tr, runs, stats, since, now):
     return '\n'.join(out)
 
 
-def brief_report(tr, runs, now):
+def warnings(projects_root, runs, now, records):
+    """This week's WARN lines."""
     week = week_start(now)
+    return run_warnings(projects_root, [r for r in runs if r['_time'] is not None and r['_time'] >= week], now, records)[0]
+
+
+def brief_report(tr, runs, now, records, projects_root):
+    week = week_start(now)
+    warns = warnings(projects_root, runs, now, records)
+    if warns:
+        last = warns[0] + (f' (+{len(warns) - 1} more, run --health)' if len(warns) > 1 else '')
+    else:
+        last = f'Consultations with no note: {tr.missing}'
     return '\n'.join([
         "Advisor share of this week's Fable use: " + share_text(tr.week_advisor.get(week, 0.0),
                                                                tr.week_fable.get(week, 0.0)),
         f'Trial: {trial(runs, now)}',
-        f'Consultations with no note: {tr.missing}',
+        last,
     ])
 
 
@@ -451,6 +923,7 @@ def main():
     ap.add_argument('--now', help='ISO time to use as now (for tests)')
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument('--brief', action='store_true')
+    mode.add_argument('--health', action='store_true')
     mode.add_argument('--schema', action='store_true')
     args = ap.parse_args()
     if args.schema:
@@ -463,9 +936,14 @@ def main():
     if now is None:
         ap.error('--now must be an ISO 8601 time')
     stats = {'skipped': 0}
+    records = read_runs(args.log, stats)
+    runs = [r for r in records if since is None or r['_time'] is None or r['_time'] >= since]
+    if args.health:
+        warns, info = run_warnings(args.projects, runs, now, records)
+        print('\n'.join((warns or ['Health: no problems']) + info))
+        return 0
     tr = read_transcripts(args.projects, since, stats)
-    runs = read_runs(args.log, since, stats)
-    print(brief_report(tr, runs, now) if args.brief else full_report(tr, runs, stats, since, now))
+    print(brief_report(tr, runs, now, records, args.projects) if args.brief else full_report(tr, runs, stats, since, now))
     return 0
 
 

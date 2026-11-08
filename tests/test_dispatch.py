@@ -25,6 +25,13 @@ SILENT = [
     {'subagent_type': 'implementer'}, {'subagent_type': 'Explore'}, {'subagent_type': 'fork'},
 ]
 FINAL = {'subagent_type': 'final-reviewer'}
+GP_FINAL = {'subagent_type': 'general-purpose', 'model': 'fable', 'description': 'Final review of family B diff'}
+SIMPLIFY_REASON = ('No simplify since the last final review in this session\'s transcript. Run the simplify skill, '
+                   'then dispatch the final review again.')
+PLAN_REVIEW = {'subagent_type': 'plan-reviewer'}
+PLAN_SIMPLIFY = {'subagent_type': 'plan-simplifier'}
+PLAN_SIMPLIFY_REASON = ("No plan-simplifier since the last plan review in this session's transcript. Dispatch "
+                        'plan-simplifier, apply its findings, then dispatch the plan review again.')
 OUTPUT_KEYS = ['hookEventName', 'permissionDecision', 'permissionDecisionReason']
 
 
@@ -46,6 +53,21 @@ def skill_call(skill, **extra):
 
 def user_text(text):
     return {'type': 'user', 'message': {'role': 'user', 'content': text}}
+
+
+def tool_result(call_id, text='Review done.', is_error=False):
+    block = {'type': 'tool_result', 'tool_use_id': call_id, 'content': text}
+    if is_error:
+        block['is_error'] = True
+    return {'type': 'user', 'message': {'role': 'user', 'content': [block]}}
+
+
+def at(row, time_of_day):
+    return dict(row, timestamp=f'2026-11-07T{time_of_day}:00.000Z')
+
+
+def launched_review(call_id='toolu_prev', tool_input=FINAL):
+    return [tool_call('Agent', tool_input, call_id=call_id), tool_result(call_id)]
 
 
 def write_rows(path, rows):
@@ -113,8 +135,8 @@ class UnnamedDispatches(HookFixture):
 
     def test_the_refusal_names_the_agents_to_use(self):
         reason = self.reason(DENY[0])
-        for name in ['implementer', 'implementer-copy', 'implementer-escalated', 'plan-reviewer', 'task-reviewer',
-                     'fix-checker', 'final-reviewer']:
+        for name in ['implementer', 'implementer-copy', 'implementer-escalated', 'plan-reviewer', 'plan-simplifier',
+                     'task-reviewer', 'fix-checker', 'final-reviewer']:
             self.assertIn(name, reason)
 
     def test_everything_else_stays_silent(self):
@@ -221,12 +243,15 @@ class FinalReviewNeedsSimplify(HookFixture):
 
     def test_a_50_megabyte_transcript_is_scanned_in_under_2_seconds(self):
         path = f'{self.projects}/huge.jsonl'
-        filler = json.dumps(assistant_text('x' * 1000), separators=(',', ':')).encode() + b'\n'
+        # simplify, then a launched final review, so both passes run: the review's id has to be looked up.
+        write_rows(path, [skill_call('simplify')] + launched_review())
+        fillers = [json.dumps(row, separators=(',', ':')).encode() + b'\n'
+                   for row in [assistant_text('x' * 1000), tool_result('toolu_filler', 'x' * 1000)]]
         mention = json.dumps(assistant_text('simplify ' + 'x' * 1000), separators=(',', ':')).encode() + b'\n'
-        with open(path, 'wb') as f:
+        with open(path, 'ab') as f:
             count = 0
             while f.tell() < 50 * 1024 * 1024:
-                f.write(mention if count % 100 == 0 else filler)
+                f.write(mention if count % 100 == 0 else fillers[count % 2])
                 count += 1
         self.assertGreaterEqual(os.path.getsize(path), 50 * 1024 * 1024)
 
@@ -239,6 +264,133 @@ class FinalReviewNeedsSimplify(HookFixture):
         start = time.monotonic()
         self.assertIsNone(self.decision(FINAL, path=path))
         self.assertLess(time.monotonic() - start, 2)
+
+
+class OneSimplifyPerFinalReview(HookFixture):
+    def test_general_purpose_final_review_without_simplify_is_refused(self):
+        self.assertEqual(self.reason(GP_FINAL, transcript=[]), SIMPLIFY_REASON)
+        self.assertEqual(self.reason({'model': 'fable', 'description': 'final-review pass'}, transcript=[]), SIMPLIFY_REASON)
+        self.assertEqual(self.reason(FINAL, transcript=[]), SIMPLIFY_REASON)
+        self.assertIsNone(self.decision(GP_FINAL, transcript=[skill_call('simplify')]))
+
+    def test_modelless_general_purpose_final_review_gets_the_unnamed_reason(self):
+        tool_input = {'subagent_type': 'general-purpose', 'description': 'Final review of family B diff'}
+        self.assertRegex(self.reason(tool_input, transcript=[]), 'named agent.*model')
+        self.assertRegex(self.reason(tool_input, transcript=[skill_call('simplify')]), 'named agent.*model')
+
+    def test_description_must_say_final_review(self):
+        for tool_input in [{'subagent_type': 'general-purpose', 'model': 'fable', 'description': 'Review the plan wording'},
+                           {'subagent_type': 'general-purpose', 'model': 'fable'},
+                           {'subagent_type': 'general-purpose', 'model': 'fable', 'description': 5},
+                           {'subagent_type': 'task-reviewer', 'description': 'Final review of family B diff'}]:
+            self.assertIsNone(self.decision(tool_input, transcript=[]), tool_input)
+
+    def test_fix_waves_and_rechecks_are_not_final_reviews(self):
+        transcript = [skill_call('simplify')] + launched_review()
+        for description in ['Final review fix wave', 'Fix-check final review findings']:
+            tool_input = {'subagent_type': 'general-purpose', 'model': 'fable', 'description': description}
+            self.assertIsNone(self.decision(tool_input, transcript=transcript), description)
+        self.assertEqual(self.decision(GP_FINAL, transcript=transcript), 'deny')
+
+    def test_second_final_review_needs_a_new_simplify(self):
+        for previous in [FINAL, GP_FINAL]:
+            transcript = [skill_call('simplify')] + launched_review(tool_input=previous)
+            self.assertEqual(self.decision(FINAL, transcript=transcript), 'deny', previous)
+            self.assertEqual(self.reason(GP_FINAL, transcript=transcript), SIMPLIFY_REASON, previous)
+
+    def test_simplify_after_the_last_final_review_allows_the_next(self):
+        transcript = [skill_call('simplify')] + launched_review() + [user_text('<command-name>/simplify</command-name>')]
+        self.assertIsNone(self.decision(FINAL, transcript=transcript))
+        self.assertIsNone(self.decision(GP_FINAL, transcript=transcript))
+
+    def test_the_dispatch_being_judged_is_not_its_own_previous_review(self):
+        transcript = [skill_call('simplify'), tool_call('Agent', FINAL, call_id='toolu_now')]
+        self.assertIsNone(self.decision(FINAL, transcript=transcript))
+
+    def test_a_failed_previous_final_review_does_not_count(self):
+        for text in ["Agent type 'final-reviewer' not found", SIMPLIFY_REASON]:
+            transcript = [skill_call('simplify'), tool_call('Agent', FINAL, call_id='toolu_prev'),
+                          tool_result('toolu_prev', text, is_error=True)]
+            self.assertIsNone(self.decision(FINAL, transcript=transcript), text)
+
+    def test_report_text_saying_not_found_still_counts_as_launched(self):
+        report = 'Final review: the old helper was not found in the diff, and the denied path is untested.'
+        transcript = [skill_call('simplify'), tool_call('Agent', FINAL, call_id='toolu_prev'),
+                      tool_result('toolu_prev', report)]
+        self.assertEqual(self.decision(FINAL, transcript=transcript), 'deny')
+
+    def test_order_across_parent_and_subagent_uses_timestamps(self):
+        review = [at(row, '09:00') for row in launched_review()]
+        self.assertIsNone(self.decision_in_subagent(FINAL, parent=[at(skill_call('simplify'), '10:00')], own=review))
+        review = [at(row, '10:00') for row in launched_review()]
+        self.assertEqual(self.decision_in_subagent(FINAL, parent=[at(skill_call('simplify'), '09:00')], own=review), 'deny')
+
+    def test_a_row_without_a_timestamp_takes_the_previous_rows(self):
+        own = [at(tool_call('Agent', {'subagent_type': 'Explore'}, call_id='toolu_x'), '10:00')] + launched_review()
+        self.assertEqual(self.decision_in_subagent(FINAL, parent=[at(skill_call('simplify'), '09:00')], own=own), 'deny')
+
+
+class PlanReviewNeedsPlanSimplify(HookFixture):
+    def gp(self, description, model='fable'):
+        return {'subagent_type': 'general-purpose', 'model': model, 'description': description}
+
+    def test_plan_review_without_plan_simplify_is_refused(self):
+        self.assertEqual(self.reason(PLAN_REVIEW, transcript=[]), PLAN_SIMPLIFY_REASON)
+
+    def test_launched_plan_simplifier_allows_the_plan_review(self):
+        transcript = launched_review('toolu_simplify', PLAN_SIMPLIFY)
+        self.assertIsNone(self.decision(PLAN_REVIEW, transcript=transcript))
+
+    def test_general_purpose_plan_simplify_with_a_model_counts(self):
+        transcript = launched_review('toolu_simplify', self.gp('Plan simplify of the build plan', model='opus'))
+        self.assertIsNone(self.decision(PLAN_REVIEW, transcript=transcript))
+
+    def test_a_check_that_mentions_plan_simplifier_is_not_a_plan_simplify(self):
+        transcript = launched_review('toolu_check', self.gp('Builder check on plan-simplifier spec', model='opus'))
+        self.assertEqual(self.reason(PLAN_REVIEW, transcript=transcript), PLAN_SIMPLIFY_REASON)
+
+    def test_general_purpose_plan_review_with_a_model_is_gated(self):
+        self.assertEqual(self.reason(self.gp('Plan review of the build plan'), transcript=[]), PLAN_SIMPLIFY_REASON)
+
+    def test_second_plan_review_needs_a_new_plan_simplify(self):
+        transcript = launched_review('toolu_simplify', PLAN_SIMPLIFY) + launched_review('toolu_prev', PLAN_REVIEW)
+        self.assertEqual(self.reason(PLAN_REVIEW, transcript=transcript), PLAN_SIMPLIFY_REASON)
+
+    def test_a_failed_previous_plan_review_does_not_count(self):
+        for text in ["Agent type 'plan-reviewer' not found", PLAN_SIMPLIFY_REASON]:
+            transcript = launched_review('toolu_simplify', PLAN_SIMPLIFY) + [
+                tool_call('Agent', PLAN_REVIEW, call_id='toolu_prev'), tool_result('toolu_prev', text, is_error=True)]
+            self.assertIsNone(self.decision(PLAN_REVIEW, transcript=transcript), text)
+
+    def test_a_plan_simplifier_that_was_not_found_does_not_unlock(self):
+        transcript = [tool_call('Agent', PLAN_SIMPLIFY, call_id='toolu_simplify'),
+                      tool_result('toolu_simplify', "Agent type 'plan-simplifier' not found", is_error=True)]
+        self.assertEqual(self.decision(PLAN_REVIEW, transcript=transcript), 'deny')
+
+    def test_simplify_skill_agents_are_not_plan_simplifies(self):
+        transcript = launched_review('toolu_angle', self.gp('Simplify: reuse angle', model='opus'))
+        self.assertEqual(self.decision(PLAN_REVIEW, transcript=transcript), 'deny')
+
+    def test_plan_review_fix_wording_is_not_a_plan_review(self):
+        for description in ['Plan review fix', 'Fix-check plan review findings']:
+            self.assertIsNone(self.decision(self.gp(description), transcript=[]), description)
+
+    def test_plan_simplify_in_the_parent_counts_for_a_subagent(self):
+        review = [at(row, '09:00') for row in launched_review('toolu_prev', PLAN_REVIEW)]
+        simplify = [at(row, '10:00') for row in launched_review('toolu_simplify', PLAN_SIMPLIFY)]
+        self.assertIsNone(self.decision_in_subagent(PLAN_REVIEW, parent=simplify, own=review))
+        review = [at(row, '10:00') for row in launched_review('toolu_prev', PLAN_REVIEW)]
+        simplify = [at(row, '09:00') for row in launched_review('toolu_simplify', PLAN_SIMPLIFY)]
+        self.assertEqual(self.decision_in_subagent(PLAN_REVIEW, parent=simplify, own=review), 'deny')
+
+    def test_the_gates_do_not_unlock_each_other(self):
+        self.assertEqual(self.reason(PLAN_REVIEW, transcript=[skill_call('simplify')]), PLAN_SIMPLIFY_REASON)
+        transcript = launched_review('toolu_simplify', PLAN_SIMPLIFY)
+        self.assertEqual(self.reason(FINAL, transcript=transcript), SIMPLIFY_REASON)
+
+    def test_a_general_purpose_plan_review_re_review_is_gated(self):
+        for description in ['Plan re-review of the build plan', 'plan-rereview']:
+            self.assertEqual(self.reason(self.gp(description), transcript=[]), PLAN_SIMPLIFY_REASON, description)
 
 
 class NeverBlocksOnBadInput(HookFixture):
@@ -348,6 +500,21 @@ class ReplayTool(TempFolder):
                             'nested progress']:
             self.assertNotIn(description, p.stdout)
 
+    def test_each_dispatch_is_judged_by_the_transcript_up_to_it(self):
+        write_rows(f'{self.projects}/p/s.jsonl', [
+            skill_call('simplify'),
+            self.dispatch('toolu_a', subagent_type='final-reviewer', description='final review A'),
+            tool_result('toolu_a'),
+            self.dispatch('toolu_b', subagent_type='general-purpose', model='fable', description='final review B'),
+        ])
+
+        p = self.replay()
+
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertRegex(p.stdout, r'(?m)^Dispatches: 2, denied 1, silent 1$')
+        self.assertRegex(p.stdout, r'(?m)^final-reviewer +0 +1$')
+        self.assertRegex(p.stdout, r'(?m)^general-purpose +1 +0$')
+
     def test_lists_at_most_20_denied_descriptions(self):
         write_rows(f'{self.projects}/p/s.jsonl', [
             self.dispatch(f'toolu_{n}', description=f'denied number {n}.') for n in range(25)
@@ -382,6 +549,20 @@ class ReplayTool(TempFolder):
         self.assertEqual(p.returncode, 1)
         self.assertRegex(p.stdout, r'(?m)^Hook failures: 1$')
         self.assertRegex(p.stdout, r'(?m)^Dispatches: 0, denied 0, silent 0$')
+
+    def test_a_relative_projects_folder_still_finds_a_subagents_session(self):
+        # The hook stays silent when it cannot read the session, so a dangling link would hide this denial.
+        session = f'{self.projects}/p/s'
+        write_rows(f'{session}.jsonl', [user_text('start')])
+        write_rows(f'{session}/subagents/agent-x.jsonl', [
+            self.dispatch('toolu_1', subagent_type='final-reviewer', description='review without simplify'),
+        ])
+
+        p = subprocess.run([PYTHON, '-I', REPLAY, '--projects', 'Application Support/projects'], capture_output=True,
+                           text=True, timeout=60, env=CLEAN_ENV, cwd=self.root)
+
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertRegex(p.stdout, r'(?m)^Dispatches: 1, denied 1, silent 0$')
 
     def test_a_projects_folder_that_does_not_exist_is_an_error(self):
         p = self.replay(projects=f'{self.projects}/nope')

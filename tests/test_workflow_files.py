@@ -19,6 +19,7 @@ ROLES = {
     'implementer-copy': ('sonnet', 'medium', 'Agent', [GUIDELINES, TDD]),
     'implementer-escalated': ('fable', 'high', 'Agent', [GUIDELINES, TDD]),
     'plan-reviewer': ('fable', 'high', REVIEWER_TOOLS, [GUIDELINES]),
+    'plan-simplifier': ('opus', 'high', REVIEWER_TOOLS, [GUIDELINES]),
     'task-reviewer': ('opus', 'high', REVIEWER_TOOLS, [GUIDELINES]),
     'fix-checker': ('sonnet', 'medium', REVIEWER_TOOLS, None),
     'final-reviewer': ('fable', 'high', REVIEWER_TOOLS, [GUIDELINES]),
@@ -94,6 +95,47 @@ class AgentFiles(unittest.TestCase):
         text = read('claude-md/agentic-workflow.md')
         self.assertIn('/usr/bin/python3 -I ~/.claude/scripts/failing-test-check.py', text)
         self.assertEqual(text.count('~/.claude/scripts/'), text.count('/usr/bin/python3 -I ~/.claude/scripts/'))
+
+    def test_implementers_carry_the_five_rules(self):
+        for name in ('implementer', 'implementer-copy', 'implementer-escalated'):
+            _, body = frontmatter(read(os.path.join('agents', name + '.md')))
+            for must in ('Simplest first', 'Reuse before writing', 'Match the codebase', 'No pattern yet',
+                         '## Code conventions', 'parallel', 'fix: address review findings'):
+                with self.subTest(agent=name, must=must):
+                    self.assertIn(must, body)
+
+    def test_reviewers_carry_the_finding_bar_and_reuse_rule(self):
+        for name in ('task-reviewer', 'final-reviewer'):
+            _, body = frontmatter(read(os.path.join('agents', name + '.md')))
+            for must in ('shown path', 'risk area', 'Important', 'existing helper', '## Code conventions'):
+                with self.subTest(agent=name, must=must):
+                    self.assertIn(must, body)
+
+    def test_fix_checker_judges_proportion_without_new_findings(self):
+        _, body = frontmatter(read('agents/fix-checker.md'))
+        for must in ('fixed, not proportionate', "Don't review anything else", 'parallel', 'only the tests'):
+            self.assertIn(must, body)
+
+    def test_plan_simplifier_checks_the_four_angles_without_cutting_requirements(self):
+        _, body = frontmatter(read('agents/plan-simplifier.md'))
+        for must in ('reuse', '## Code conventions', 'traces to', 'altitude', 'test proportion', 'risk area',
+                     'spec requires', 'question for the owner', 'one pass', 'never consult the advisor'):
+            with self.subTest(must=must):
+                self.assertIn(must, body)
+
+    def test_plan_reviewer_checks_nothing_required_was_cut_and_leaves_weight_to_the_simplifier(self):
+        _, body = frontmatter(read('agents/plan-reviewer.md'))
+        self.assertIn('nothing the spec requires was cut', body)
+        self.assertNotIn('## Code conventions', body)
+        self.assertNotIn("doesn't require, as a separate list", body)
+
+    def test_section_holds_the_rules_and_monitoring_contract(self):
+        text = read('claude-md/agentic-workflow.md')
+        for must in ('Simplest first', 'Reuse before writing', 'Match the codebase', 'No pattern yet',
+                     '## Code conventions', 'fixed, not proportionate', 'not found', 'restart',
+                     'simplify.ran', 'fix_growth', 'WARN', 'workflow-report.py --health', 'plan-simplifier'):
+            with self.subTest(must=must):
+                self.assertIn(must, text)
 
 
 if __name__ == '__main__':

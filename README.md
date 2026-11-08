@@ -39,7 +39,8 @@ The first message of every task names the path and why, the Fable stage, and the
 ```mermaid
 flowchart TD
     A["1 · Design and plan<br/>main session · brainstorming, writing-plans"] --> G1{{"Owner approves the design"}}
-    G1 --> B["2 · Plan review<br/>fresh plan-reviewer: spec + plan + repo, no brainstorm<br/>one pass"]
+    G1 --> PS["1b · Plan simplify<br/>fresh plan-simplifier: spec + plan + repo, one pass<br/>planning session applies its findings"]
+    PS --> B["2 · Plan review<br/>fresh plan-reviewer: spec + plan + repo, no brainstorm<br/>one pass"]
     B --> G2{{"Owner approves the plan"}}
     G2 --> C["3 · New implementation session<br/>Opus 5.5 medium · subagent-driven-development<br/>starts from the plan's path only"]
 
@@ -64,7 +65,7 @@ flowchart TD
     FR -. "real Critical or Important<br/>still open after the fix wave" .-> STOP
 ```
 
-The dispatch hook refuses `final-reviewer` until `simplify` has run in the session, so step 8 can't be skipped.
+The dispatch hook refuses a final review until `simplify` has run since the previous launched final review, so step 8 can't be skipped. A `general-purpose` final review is matched by its description.
 
 ### Fix rounds
 
@@ -100,15 +101,19 @@ Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3
 
 ### Preventing over-engineering
 
+- **The five rules,** for plans, code and fixes, outranking the skills' templates: **Simplest first** (the smallest direct change), **Reuse before writing** (use or extend what exists, never a parallel version), **Match the codebase** (its style and abstractions, no new structure), **No pattern yet** (take the simplest way and suggest any alternative to the owner) and **Decisions live in the project's `CLAUDE.md`** (one line each under `## Code conventions`).
+- **Before writing:** on the Full path, `plan-simplifier` checks the plan for excess before plan review: reuse, what doesn't trace to the spec, altitude and test proportion. The planning session cuts what the spec doesn't require, and the owner sees each cut, each declined finding and any spec flags at plan approval.
 - **While writing:** `karpathy-guidelines` is in every main session through the startup hook, and in implementers and reviewers through agent frontmatter.
-- **After writing:** `simplify` runs once per branch, and on the Small path.
-- **At review:** `plan-reviewer` and `final-reviewer` also list what the spec doesn't require. That list goes to the owner, never into fix rounds.
+- **After writing:** `simplify` runs once per final review, and on the Small path.
+- **At review:** `final-reviewer` also lists what the spec doesn't require. That list goes to the owner, never into fix rounds.
+- **The finding bar:** outside risk areas, a "this can break" finding is Critical or Important only with a shown path in this code; inside one, plausibility is enough, judged per finding. A finding naming the existing helper or pattern a change duplicates or departs from is Important, and so is a missing or contradicted `## Code conventions` entry. `fix-checker` reports a fix that closes its finding with a parallel function, a test-only parameter or more change than needed as "fixed, not proportionate", which counts as still open.
 
 ## Models and effort
 
 | Role | Agent | Model | Effort |
 |---|---|---|---|
 | Design and plan | main session | Fable | `high`, `xhigh` for the hardest architecture |
+| Plan simplify | `plan-simplifier` | Opus 5.5 | `high` |
 | Plan review | `plan-reviewer` | Fable | `high` |
 | Session running implementation | main session | Opus 5.5 | `medium` |
 | Implementer | `implementer` | Opus 5.5 | `high` |
@@ -130,7 +135,7 @@ At task start Claude reads `get_usage`, works out the share of the week gone (`1
 | 3 | 90% used or more | Opus 5.5, advisor off | Opus 5.5 | Opus 5.5 | Fable |
 | Out | Fable unavailable | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5 at `xhigh` |
 
-The all-model limit is watched too: Claude warns when it is more than 15 points ahead of the week, and at 90% no new Full path run starts without the owner's OK. Nothing silently drops to Sonnet. A stage 3 or Out override is an explicit `model` at dispatch on the named agent.
+The all-model limit is watched too: Claude warns when it is more than 15 points ahead of the week, and at 90% no new Full path run starts without the owner's OK. Nothing silently drops to Sonnet. A stage 3 or Out override is an explicit `model` at dispatch on the named agent. `plan-simplifier` isn't in the table: it is pinned to Opus 5.5 at `high` in every stage.
 
 ### The Fable advisor (trial)
 
@@ -150,7 +155,7 @@ After each consultation the model writes `Advisor: <what it advised> | changed: 
 flowchart LR
     subgraph CFG ["Configuration: checked by the harness"]
         AG["Custom agents<br/>model, effort, disallowedTools,<br/>preloaded skills"]
-        DH["Dispatch hook<br/>refuses model-less general-purpose,<br/>refuses final-reviewer before simplify"]
+        DH["Dispatch hook<br/>refuses model-less general-purpose,<br/>refuses final-reviewer before simplify,<br/>refuses plan-reviewer before plan-simplifier"]
         SH["Startup hook<br/>loads using-superpowers +<br/>karpathy-guidelines"]
     end
     subgraph INS ["Instructions: followed, not checked"]
@@ -162,12 +167,13 @@ flowchart LR
 
 | Piece | File | What it does |
 |---|---|---|
-| Custom agents | `agents/*.md` | Seven agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. Reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N]` line. |
-| Dispatch hook | `hooks/guard-agent-dispatch.py` | PreToolUse on `Agent`. Denies a dispatch with no `model` when the type is missing or `general-purpose`, which would otherwise run silently on the main session's model. Denies `final-reviewer` until the transcript shows `simplify`. Silent on everything else, never answers `allow`, fails open. |
+| Custom agents | `agents/*.md` | Eight agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. Task and final reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N]` line. |
+| Dispatch hook | `hooks/guard-agent-dispatch.py` | PreToolUse on `Agent`. Denies a dispatch with no `model` when the type is missing or `general-purpose`, which would otherwise run silently on the main session's model. Denies a final review, `final-reviewer` or a `general-purpose` one matched by description, until the transcript shows `simplify` since the previous launched final review. Denies a plan review, `plan-reviewer` or a `general-purpose` one matched by description, until the transcript shows a launched plan simplify since the previous launched plan review. Silent on everything else, never answers `allow`, fails open. |
 | Startup hook | `hooks/session-start-superpowers.sh` | On `startup`, `clear` and `compact`, prints `using-superpowers` and `karpathy-guidelines`. A missing file is noted on stderr; the rest still loads. Combined output stays under the 10,000-character cap. |
 | Commit guard | `hooks/guard-main-commit.py` | Optional. Answers `ask` for a commit landing on `main` or `master`, `deny` in bypass mode. |
-| `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 22 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
+| `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 24 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
 | Failing-test check | `scripts/failing-test-check.py` | See above. |
+| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, and sessions that wrote no run record. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one. Each problem becomes a `WARN` line in `--brief`. |
 | Report | `scripts/workflow-report.py` | Read-only. Reads transcripts and the run log; reports advisor calls, tokens and estimated cost by role, missing advisor notes, findings and fix rounds per run, and failing-test check results. |
 
 Still unenforced, by design: choosing the path, reading the stage, the main session's model, the fix-round cap, and whether the guidelines are followed once loaded. Naming the path and stage out loud is what lets the owner catch a wrong call.
@@ -175,7 +181,8 @@ Still unenforced, by design: choosing the path, reading the stage, the main sess
 ## Tracking outcomes
 
 - **Run record:** when a Small or Full path run finishes, the session appends one JSON line to `~/.claude/workflow-log.jsonl`. `workflow-report.py --schema` prints the format.
-- **Weekly view:** `workflow-report.py --brief` prints at most three lines, including any `STOP` or `CHECKPOINT` the owner should see.
+- **Weekly view:** `workflow-report.py --brief` prints at most three lines, including any `STOP` or `CHECKPOINT` the owner should see, and any `WARN` from the health check.
+- **Health check:** `workflow-report.py --health` runs the same checks on demand and at the trial checkpoint.
 
 ```bash
 /usr/bin/python3 -I scripts/workflow-report.py --brief
@@ -188,7 +195,7 @@ Still unenforced, by design: choosing the path, reading the stage, the main sess
 ## Layout
 
 ```
-agents/          seven custom agents
+agents/          eight custom agents
 claude-md/       the CLAUDE.md section
 hooks/           dispatch hook, startup hook, commit guard
 scripts/         failing-test check, workflow report
@@ -272,7 +279,7 @@ The tests run the real scripts as subprocesses against temp folders whose paths 
 
 These can only be confirmed on a real installation:
 
-- Whether agent frontmatter accepts a plugin skill name in `skills:`, and whether it honours `effort`.
+- Whether agent frontmatter honours `effort`. A plugin skill name in `skills:` does load: the skill's text is in the agent's context.
 - What `transcript_path` the dispatch hook sees for a dispatch from a nested session.
 - The shape of a real advisor row in a transcript, which `workflow-report.py` reads.
 - Whether advisor calls count against the weekly Fable limit.
