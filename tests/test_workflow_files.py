@@ -107,7 +107,7 @@ class AgentFiles(unittest.TestCase):
     def test_reviewers_carry_the_finding_bar_and_reuse_rule(self):
         for name in ('task-reviewer', 'final-reviewer'):
             _, body = frontmatter(read(os.path.join('agents', name + '.md')))
-            for must in ('shown path', 'risk area', 'Important', 'existing helper', '## Code conventions'):
+            for must in ('shown path', 'risk area', 'at least Important', 'existing helper', '## Code conventions'):
                 with self.subTest(agent=name, must=must):
                     self.assertIn(must, body)
 
@@ -133,7 +133,8 @@ class AgentFiles(unittest.TestCase):
         text = read('claude-md/agentic-workflow.md')
         for must in ('Simplest first', 'Reuse before writing', 'Match the codebase', 'No pattern yet',
                      '## Code conventions', 'fixed, not proportionate', 'not found', 'restart',
-                     'simplify.ran', 'fix_growth', 'WARN', 'workflow-report.py --health', 'plan-simplifier'):
+                     'simplify.ran', 'fix_growth', 'WARN', 'workflow-report.py --health', 'plan-simplifier',
+                     'at least Important'):
             with self.subTest(must=must):
                 self.assertIn(must, text)
 

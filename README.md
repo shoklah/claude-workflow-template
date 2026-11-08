@@ -106,7 +106,7 @@ Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3
 - **While writing:** `karpathy-guidelines` is in every main session through the startup hook, and in implementers and reviewers through agent frontmatter.
 - **After writing:** `simplify` runs once per final review, and on the Small path.
 - **At review:** `final-reviewer` also lists what the spec doesn't require. That list goes to the owner, never into fix rounds.
-- **The finding bar:** outside risk areas, a "this can break" finding is Critical or Important only with a shown path in this code; inside one, plausibility is enough, judged per finding. A finding naming the existing helper or pattern a change duplicates or departs from is Important, and so is a missing or contradicted `## Code conventions` entry. `fix-checker` reports a fix that closes its finding with a parallel function, a test-only parameter or more change than needed as "fixed, not proportionate", which counts as still open.
+- **The finding bar:** outside risk areas, a "this can break" finding is Critical or Important only with a shown path in this code; inside one, plausibility is enough, and a shown path makes it at least Important, even if it looks rare or benign, judged per finding. A finding naming the existing helper or pattern a change duplicates or departs from is Important, and so is a missing or contradicted `## Code conventions` entry. `fix-checker` reports a fix that closes its finding with a parallel function, a test-only parameter or more change than needed as "fixed, not proportionate", which counts as still open.
 
 ## Models and effort
 
