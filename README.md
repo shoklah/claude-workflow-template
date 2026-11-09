@@ -1,6 +1,6 @@
 # claude-workflow
 
-An agentic workflow for Claude Code. It sets how a task is routed, which model does each role, how work is reviewed and when a run stops for the owner, meaning you. This repo holds the parts that enforce it: hooks, custom agents, a `CLAUDE.md` section and two scripts. It also has an installer that puts them into `~/.claude`.
+An agentic workflow for Claude Code. It sets how a task is routed, which model does each role, how work is reviewed and when a run stops for the owner, meaning you. This repo holds the parts that enforce it: hooks, custom agents, a `CLAUDE.md` section and three scripts. It also has an installer that puts them into `~/.claude`.
 
 It's a template. Read it, change the models, thresholds and wording to fit your setup, then install it one step at a time.
 
@@ -66,6 +66,8 @@ flowchart TD
 ```
 
 The dispatch hook refuses a final review until `simplify` has run since the previous launched final review, so step 8 can't be skipped. A `general-purpose` final review is matched by its description.
+
+A plan can mark consecutive tasks `**Wave:** A`, at most 3 to a wave, when they change no same part of a file, use nothing a sibling adds and have tests independent of their siblings; `plan-reviewer` checks each wave. The session then runs the wave's tasks at the same time: `scripts/wave.py start` gives each task its own worktree and branch from the wave's base, and every per-task step, from the implementer to the task review and its fix rounds, runs as before in that worktree. When all are complete, `wave.py merge` merges the task branches in plan order, the session folds the implementers' `Conventions:` lines into `## Code conventions`, and `wave.py finish` removes the worktrees. One `task-reviewer` then checks the wave's whole diff for what the single-task reviews couldn't see, such as duplicate helpers or diverging patterns, as the wave check, and its findings get a task's fix rounds.
 
 ### Fix rounds
 
@@ -167,22 +169,26 @@ flowchart LR
 
 | Piece | File | What it does |
 |---|---|---|
-| Custom agents | `agents/*.md` | Eight agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. Task and final reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N]` line. |
+| Custom agents | `agents/*.md` | Eight agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. Task and final reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N]` line, `fix-checker` with `Verdicts: fixed=N not_proportionate=N open=N`, `plan-simplifier` with `Findings: cuts=N flags=N` and `plan-reviewer` with `Findings: findings=N`. |
 | Dispatch hook | `hooks/guard-agent-dispatch.py` | PreToolUse on `Agent`. Denies a dispatch with no `model` when the type is missing or `general-purpose`, which would otherwise run silently on the main session's model. Denies a final review, `final-reviewer` or a `general-purpose` one matched by description, until the transcript shows `simplify` since the previous launched final review. Denies a plan review, `plan-reviewer` or a `general-purpose` one matched by description, until the transcript shows a launched plan simplify since the previous launched plan review. Silent on everything else, never answers `allow`, fails open. |
 | Startup hook | `hooks/session-start-superpowers.sh` | On `startup`, `clear` and `compact`, prints `using-superpowers` and `karpathy-guidelines`. A missing file is noted on stderr; the rest still loads. Combined output stays under the 10,000-character cap. |
 | Commit guard | `hooks/guard-main-commit.py` | Optional. Answers `ask` for a commit landing on `main` or `master`, `deny` in bypass mode. |
-| `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 24 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
+| `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 26 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
 | Failing-test check | `scripts/failing-test-check.py` | See above. |
-| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, and sessions that wrote no run record. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one. Each problem becomes a `WARN` line in `--brief`. |
-| Report | `scripts/workflow-report.py` | Read-only. Reads transcripts and the run log; reports advisor calls, tokens and estimated cost by role, missing advisor notes, findings and fix rounds per run, and failing-test check results. |
+| Wave script | `scripts/wave.py` | `start` makes a worktree per task from the wave's base and keeps the linked folders out of git, `merge` merges the task branches in plan order and stops at the first conflict, `finish` removes the worktrees and branches once all are merged and clean, refusing otherwise. |
+| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, sessions that wrote no run record and, for schema 2 records, each step, count line, finding total, agent pin and required skill, a risk area on the Small path and a wave with no wave check, and for schema 3 plan records a required offer with no entry. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one, and a typed trigger whose skill never loaded. Each problem becomes a `WARN` line in `--brief`. |
+| Report | `scripts/workflow-report.py` | Read-only. Reads transcripts and the run log; reports advisor calls, tokens and estimated cost by role, missing advisor notes, findings and fix rounds per run, and failing-test check results. `--json` prints the same data as one JSON object; `--html` writes it as one self-contained page. |
 
 Still unenforced, by design: choosing the path, reading the stage, the main session's model, the fix-round cap, and whether the guidelines are followed once loaded. Naming the path and stage out loud is what lets the owner catch a wrong call.
 
 ## Tracking outcomes
 
-- **Run record:** when a Small or Full path run finishes, the session appends one JSON line to `~/.claude/workflow-log.jsonl`. `workflow-report.py --schema` prints the format.
+- **Run record:** when a Small or Full path run finishes, the session appends one JSON line to `~/.claude/workflow-log.jsonl`. `workflow-report.py --schema` prints the format. Schema 2 records add `schema`, `started`, `plan`, `archive` and `steps`: each step that ran, with its agent, model, effort, count line and findings, each finding with its outcome (`fixed`, `applied`, `declined`, `deferred`, `ruled`, `open` or `to_owner`). Schema 3 records add `offers`: each skill offered during the run, with its outcome. A planning session appends a `path: "plan"` record right after the owner approves the plan. Older records stay as written and are still read.
+- **Ledger and archive:** every run keeps a ledger from its first message, with a `Started:` line and one numbered line per finding (`F1`, `F2`…), updated by number when its outcome changes; the record is filled from it. A Full run uses the SDD ledger and copies it to `~/.claude/workflow-archive/<date>-<branch>.md` before the workspace is deleted. A Small run keeps its ledger there from the start, and a planning session in `<date>-<branch>-plan.md`. `/` in the branch is replaced, a suffix is added when the name is taken, and the session creates the folder with `mkdir -p` on first use. The archive is local and private, and `--health` notes a recorded archive that is missing or has another `Started:` time.
 - **Weekly view:** `workflow-report.py --brief` prints at most three lines, including any `STOP` or `CHECKPOINT` the owner should see, and any `WARN` from the health check.
 - **Health check:** `workflow-report.py --health` runs the same checks on demand and at the trial checkpoint.
+- **JSON:** `workflow-report.py --json` prints every run in range, its steps and findings, and the totals as one JSON object with a `version`. It holds personal data: print it, never write it into a repo.
+- **Page:** `workflow-report.py --html [FILE]` writes the same data as one self-contained HTML page, by default `~/.claude/workflow-dashboard.html`, outside every repo. It opens from disk and stays private. `/workflow-dashboard` rebuilds it and publishes it as a private artifact, updating the same link each time; running the command is the owner's yes, and nothing else publishes it.
 
 ```bash
 /usr/bin/python3 -I scripts/workflow-report.py --brief
@@ -192,13 +198,31 @@ Still unenforced, by design: choosing the path, reading the stage, the main sess
 /usr/bin/python3 -I scripts/workflow-report.py --since 2026-11-01
 ```
 
+```bash
+/usr/bin/python3 -I scripts/workflow-report.py --json --since 2026-11-01
+```
+
+```bash
+/usr/bin/python3 -I scripts/workflow-report.py --html
+```
+
+### Offered skills and commands
+
+A skill or command the owner triggers is offered at a fixed moment, or never. The session asks one yes/skip question and runs it only on yes; a skip means "not now", and the offer comes back at its next moment.
+
+| Skill or command | When it's offered |
+|---|---|
+| `grill-me` | On every Full design, once, right before the owner approves it. |
+| `workflow-dashboard` | Never offered: the owner runs `/workflow-dashboard` when they want the page, and its link stays the same, so nothing is lost by waiting. |
+
 ## Layout
 
 ```
 agents/          eight custom agents
 claude-md/       the CLAUDE.md section
 hooks/           dispatch hook, startup hook, commit guard
-scripts/         failing-test check, workflow report
+scripts/         failing-test check, workflow report, wave.py
+skills/          workflow-dashboard: the /workflow-dashboard command
 tools/           replay_dispatches.py: replays past dispatches through the dispatch hook
 tests/           unittest suites, run as subprocesses against temp folders
 install.py       the installer
@@ -246,6 +270,10 @@ Hooks and agents load into running sessions within seconds, so install when no i
 ```
 
 ```bash
+/usr/bin/python3 -I install.py skills
+```
+
+```bash
 /usr/bin/python3 -I install.py hooks
 ```
 
@@ -283,6 +311,10 @@ These can only be confirmed on a real installation:
 - What `transcript_path` the dispatch hook sees for a dispatch from a nested session.
 - The shape of a real advisor row in a transcript, which `workflow-report.py` reads.
 - Whether advisor calls count against the weekly Fable limit.
+- Whether an implementer whose working directory is a task worktree can write its report into the session's workspace, a sibling path. If not, the report goes in the task worktree's own workspace and the session reads it there.
+- Whether an implementer follows its dispatch's "every command starts in the task worktree" when each of its Bash calls starts in the session's working directory; `git -C` and the SDD scripts' `-C` are the fallback.
+- Whether git's locking handles `wave.py start` and a concurrent `failing-test-check.py` adding worktrees to the same `.git`.
+- What the wave check finds over the first few runs: if nothing, it can go; if a lot, the rule on shared files is too loose.
 
 ## Credits
 

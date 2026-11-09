@@ -20,7 +20,8 @@ TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 
 AGENTS = ['final-reviewer.md', 'fix-checker.md', 'implementer-copy.md', 'implementer-escalated.md',
           'implementer.md', 'plan-reviewer.md', 'plan-simplifier.md', 'task-reviewer.md']
-SCRIPTS = ['failing-test-check.py', 'workflow-report.py']
+SCRIPTS = ['failing-test-check.py', 'wave.py', 'workflow-report.py']
+SKILLS = ['workflow-dashboard']
 HOOK_FILES = ['guard-agent-dispatch.py', 'guard-main-commit.py', 'session-start-superpowers.sh']
 HOOK_TESTS = ['settings-snippet.json', 'test_dispatch.py', 'test_hooks.py']
 START = '<!-- agentic-workflow:start -->'
@@ -101,7 +102,7 @@ class HomeFixture(unittest.TestCase):
         return p
 
     def install_everything(self):
-        for command in ('agents', 'section', 'scripts', 'hooks'):
+        for command in ('agents', 'section', 'scripts', 'skills', 'hooks'):
             self.ok(command)
 
     def path(self, *parts):
@@ -255,6 +256,17 @@ class AgentsAndScripts(HomeFixture):
                 self.assertEqual(read(self.path('scripts', name), 'rb'), read(source, 'rb'))
                 self.assertEqual(mode_of(self.path('scripts', name)), mode_of(source))
 
+    def test_skills_copy_into_place(self):
+        write(self.path('skills', 'another-skill', 'SKILL.md'), 'theirs\n')
+        self.ok('skills')
+        self.assertEqual(sorted(os.listdir(self.path('skills'))), sorted(SKILLS + ['another-skill']))
+        self.assertEqual(read(self.path('skills', 'another-skill', 'SKILL.md')), 'theirs\n')
+        for name in SKILLS:
+            with self.subTest(name=name):
+                self.assertEqual(os.listdir(self.path('skills', name)), ['SKILL.md'])
+                self.assertEqual(read(self.path('skills', name, 'SKILL.md'), 'rb'),
+                                 read(os.path.join(ROOT, 'skills', name, 'SKILL.md'), 'rb'))
+
     def test_usage_errors_exit_2(self):
         for args in ((), ('nonsense',), ('rollback',), ('agents', 'extra'), ('rollback', 'a', 'b')):
             with self.subTest(args=args):
@@ -321,6 +333,7 @@ class SnapshotAndRollback(HomeFixture):
         self.assertEqual(tree(self.claude), before)
         self.assertEqual(os.listdir(self.path('agents')), ['another-agent.md'])
         self.assertEqual(os.listdir(self.path('scripts')), [])
+        self.assertFalse(os.path.exists(self.path('skills', 'workflow-dashboard', 'SKILL.md')))
         self.assertIn('settings.json', p.stdout)
 
     def test_rollback_removes_settings_and_claude_md_install_created(self):

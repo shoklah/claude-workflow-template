@@ -1,6 +1,6 @@
 """Installs this repo's workflow files into $HOME/.claude, one step at a time, and rolls them back.
 
-Usage: /usr/bin/python3 -I install.py {snapshot|agents|section|scripts|hooks|rollback SNAPSHOT_DIR}
+Usage: /usr/bin/python3 -I install.py {snapshot|agents|section|scripts|skills|hooks|rollback SNAPSHOT_DIR}
 
   snapshot   Copies settings.json, CLAUDE.md and hooks/ from ~/.claude into a new folder,
              ~/.agents/backups/<YYYY-MM-DD-HHMM>-workflow/, and prints its path. Missing files are
@@ -10,6 +10,7 @@ Usage: /usr/bin/python3 -I install.py {snapshot|agents|section|scripts|hooks|rol
   section    Puts claude-md/agentic-workflow.md between the agentic-workflow markers in
              ~/.claude/CLAUDE.md, appending the markers at the end when they are absent.
   scripts    Copies scripts/*.py into ~/.claude/scripts/.
+  skills     Copies skills/<name>/SKILL.md into ~/.claude/skills/<name>/.
   hooks      Copies hooks/* into ~/.claude/hooks/ and the hook tests into ~/.claude/hooks/tests/,
              then adds the Agent dispatch hook to ~/.claude/settings.json once.
   rollback   Restores what the snapshot holds, removes settings.json or CLAUDE.md if the snapshot
@@ -35,17 +36,18 @@ DISPATCH_GROUP = {'matcher': 'Agent', 'hooks': [{'type': 'command', 'command': D
 HOOK_TESTS = ['test_hooks.py', 'test_dispatch.py', 'settings-snippet.json']
 SNAPSHOT_MARK = 'snapshot.json'
 SNAPSHOT_ITEMS = ['settings.json', 'CLAUDE.md', 'hooks']
-USAGE = 'usage: install.py {snapshot|agents|section|scripts|hooks|rollback SNAPSHOT_DIR}'
+USAGE = 'usage: install.py {snapshot|agents|section|scripts|skills|hooks|rollback SNAPSHOT_DIR}'
 
 
 class Stop(Exception):
     """Invalid input: report it and exit 2 without writing anything."""
 
 
-def repo_files(folder, suffix=''):
+def repo_files(folder, suffix='', dirs=False):
     path = os.path.join(REPO, folder)
+    kind = os.path.isdir if dirs else os.path.isfile
     return sorted(f for f in os.listdir(path)
-                  if f.endswith(suffix) and not f.startswith('.') and os.path.isfile(os.path.join(path, f)))
+                  if f.endswith(suffix) and not f.startswith('.') and kind(os.path.join(path, f)))
 
 
 def install_plan():
@@ -55,6 +57,7 @@ def install_plan():
     return {
         'agents': pairs('agents', repo_files('agents', '.md'), 'agents'),
         'scripts': pairs('scripts', repo_files('scripts', '.py'), 'scripts'),
+        'skills': pairs('skills', [os.path.join(n, 'SKILL.md') for n in repo_files('skills', dirs=True)], 'skills'),
         'hooks': (pairs('hooks', repo_files('hooks'), 'hooks')
                   + pairs('tests', HOOK_TESTS, os.path.join('hooks', 'tests'))),
     }
@@ -221,7 +224,7 @@ def rollback(claude, folder):
 
 
 def main(argv):
-    commands = {'snapshot': 0, 'agents': 0, 'section': 0, 'scripts': 0, 'hooks': 0, 'rollback': 1}
+    commands = {'snapshot': 0, 'agents': 0, 'section': 0, 'scripts': 0, 'skills': 0, 'hooks': 0, 'rollback': 1}
     if not argv or argv[0] not in commands or len(argv) != 1 + commands[argv[0]]:
         print(USAGE, file=sys.stderr)
         return 2
@@ -234,7 +237,7 @@ def main(argv):
     try:
         if command == 'snapshot':
             snapshot(home, claude)
-        elif command in ('agents', 'scripts'):
+        elif command in ('agents', 'scripts', 'skills'):
             copy_into(claude, command)
         elif command == 'section':
             section(claude)

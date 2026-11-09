@@ -2,6 +2,7 @@
 
 Run with: /usr/bin/python3 -I tests/test_report.py
 """
+import datetime
 import json
 import os
 import re
@@ -34,11 +35,14 @@ def executor(input_tokens=10, output_tokens=10):
     return dict(usage(None, input_tokens, output_tokens), type='message')
 
 
-def asst(mid, content=None, model='claude-opus-5-5', iterations=None, ts='2026-11-05T10:00:00.000Z', u=None):
-    return {'type': 'assistant', 'timestamp': ts,
-            'message': {'id': mid, 'model': model, 'role': 'assistant',
-                        'content': content if content is not None else [{'type': 'text', 'text': 'ok'}],
-                        'usage': u or usage(iterations)}}
+def asst(mid, content=None, model='claude-opus-5-5', iterations=None, ts='2026-11-05T10:00:00.000Z', u=None, effort=None):
+    row = {'type': 'assistant', 'timestamp': ts,
+           'message': {'id': mid, 'model': model, 'role': 'assistant',
+                       'content': content if content is not None else [{'type': 'text', 'text': 'ok'}],
+                       'usage': u or usage(iterations)}}
+    if effort is not None:
+        row['effort'] = effort
+    return row
 
 
 def user(content, ts='2026-11-05T10:00:00.000Z', **extra):
@@ -57,6 +61,12 @@ def hook_row(command, stdout, ts='2026-11-05T10:00:00.000Z'):
                            'stdout': stdout, 'command': command, 'exitCode': 0}}
 
 
+def startup_row(ts='2026-11-05T10:00:00.000Z'):
+    """The SessionStart hook's row that injects the startup guidelines."""
+    return {'type': 'attachment', 'timestamp': ts,
+            'attachment': {'type': 'hook_success', 'hookName': 'SessionStart:startup', 'stdout': STARTUP}}
+
+
 def decision(dec, reason):
     return json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': dec,
                                               'permissionDecisionReason': reason}}) + '\n'
@@ -71,6 +81,12 @@ def run_record(**over):
            'fix_growth': {'task_added': 0, 'task_removed': 0, 'fix_added': 0, 'fix_removed': 0, 'unplanned_files': []}}
     rec.update(over)
     return rec
+
+
+def plan_record(**over):
+    """A schema 2 plan record, which leaves out the fields a plan record has no use for."""
+    return {k: v for k, v in run_record(path='plan', schema=2, steps=[], **over).items()
+            if k not in ('tasks', 'fix_rounds', 'failing_test', 'fix_growth', 'simplify', 'base', 'head')}
 
 
 def section(out, title):
@@ -141,12 +157,24 @@ class Report(unittest.TestCase):
         git('config', 'commit.gpgsign', 'false')
         return repo, change
 
-    def run_report(self, *args):
-        p = subprocess.run([PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW, *args],
-                           capture_output=True, text=True, env=CLEAN_ENV, timeout=60)
+    def run_report(self, *args, env=CLEAN_ENV):
+        # No test reads the real ~/.claude/agents or export stamp; a test's own option comes later and wins.
+        p = subprocess.run([PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW,
+                            '--agents', os.path.join(self.root, 'no agents'),
+                            '--export-stamp', os.path.join(self.root, 'no stamp'), *args],
+                           capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stderr, '')
         return p.stdout
+
+    def json(self, *args):
+        return json.loads(self.run_report('--json', *args))
+
+    def html(self):
+        page = os.path.join(self.root, 'page.html')
+        self.run_report('--html', page)
+        with open(page, encoding='utf-8') as f:
+            return f.read()
 
     def test_advisor_calls_counted_once_per_message_with_fable_cost(self):
         # the same message id appears on two rows
@@ -204,7 +232,7 @@ class Report(unittest.TestCase):
     def test_notes_counted_and_missing_notes_reported(self):
         # 2 calls, 1 note with changed: yes: 'notes=1 changed=1 missing=1'
         note = 'Done.\nAdvisor: check the cache path | changed: yes | moved the lookup\nMore.'
-        self.session([asst('m1', iterations=[executor(), ADVISOR]),
+        self.session([startup_row(), asst('m1', iterations=[executor(), ADVISOR]),
                       asst('m2', iterations=[executor(), ADVISOR]),
                       asst('m3', content=[{'type': 'text', 'text': note}]),
                       asst('m4', content=[{'type': 'text', 'text': 'Advisor: no pipe format here'}])])
@@ -218,6 +246,20 @@ class Report(unittest.TestCase):
         self.session([asst('m1', iterations=[executor(), ADVISOR]), asst('m2', iterations=[executor(), ADVISOR]),
                       row, row, asst('m4', content=note)])
         self.assertIn('notes=2 changed=0 missing=0', section(self.run_report(), 'Advisor notes:')[0])
+
+    def test_cost_is_priced_by_model_and_cache_ttl(self):
+        one_h = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0,
+                 'cache_creation_input_tokens': 1000000,
+                 'cache_creation': {'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 1000000}}
+        self.session([asst('m1', model='claude-fable-5-1', u=dict(one_h, iterations=[dict(one_h, type='message')]))])
+        self.assertIn('of $20.00)', section(self.run_report(), 'Weeks from Sunday')[1])
+
+    def test_a_split_message_counts_once_from_its_fullest_row(self):
+        partial = executor(input_tokens=1000000, output_tokens=1)
+        full = executor(input_tokens=1000000, output_tokens=1000000)
+        self.session([asst('same', model='claude-fable-5-1', u=dict(partial, iterations=[partial])),
+                      asst('same', model='claude-fable-5-1', u=dict(full, iterations=[full]))])
+        self.assertIn('of $60.00)', section(self.run_report(), 'Weeks from Sunday')[1])
 
     def test_week_share_and_stop_flag_at_25_percent(self):
         # week starts Sunday 07:00 UTC; advisor $30 of $100 Fable: '30%' and 'STOP' in --brief
@@ -386,9 +428,44 @@ class Report(unittest.TestCase):
         self.assertIn('calls=1', section(out, 'Advisor calls:')[0])
         self.assertIn('runs=1', [line for line in section(out, 'Runs') if 'advisor=on' in line][0])
 
+    def test_now_drops_later_records_and_rows(self):
+        self.session([user('typed early', ts='2026-11-05T10:00:00.000Z'),
+                      user('typed late', ts='2026-11-08T10:00:00.000Z')])
+        self.records([run_record(date='2026-11-08T09:00:00Z', branch='later')])
+        out = self.run_report()  # NOW is 2026-11-07T12:00Z
+        self.assertNotIn('later', out)
+        self.assertIn('typed=1 ', out)
+
     def test_schema_lists_every_run_record_field(self):
         schema = json.loads(self.run_report('--schema'))
-        self.assertEqual(sorted(schema), sorted(run_record()))
+        self.assertLessEqual(set(run_record()), set(schema))
+        self.assertEqual(sorted(set(schema) - set(run_record())),
+                         ['archive', 'offers', 'plan', 'schema', 'started', 'steps', 'waves'])
+
+    def test_schema_lists_the_schema_2_fields_and_outcomes(self):
+        schema = json.loads(self.run_report('--schema'))
+        for key in ('schema', 'started', 'plan', 'archive', 'steps'):
+            self.assertIn(key, schema)
+        for outcome in ('fixed', 'applied', 'declined', 'deferred', 'ruled', 'open', 'to_owner'):
+            self.assertIn(outcome, schema['steps'])
+        self.assertIn('"plan"', schema['path'])
+
+    def test_schema_1_and_2_records_and_a_plan_record_are_all_read(self):
+        step = {'step': 'final_review', 'agent': 'final-reviewer', 'model': 'fable', 'effort': 'high',
+                'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
+                'findings': [{'id': 'F1', 'severity': 'important', 'summary': 's', 'outcome': 'fixed'}]}
+        plan = plan_record(started='2026-11-05T09:00:00+01:00')
+        self.records([run_record(branch='old'), run_record(branch='new', schema=2, steps=[step]), plan])
+        out = self.run_report()
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith('    2026-11-05')]), 3)
+        self.assertIn('path=plan', out)
+        self.assertIn('runs 2/5', self.run_report('--brief'))  # the two Full runs count, the plan record doesn't
+
+    def test_malformed_steps_are_dropped_not_fatal(self):
+        steps = ['not a dict', {'step': 'nope'}, {'step': 'task_review', 'task': 1, 'round': 0,
+                 'counts': {'critical': '1'}, 'findings': 'not a list'}]
+        self.records([run_record(schema=2, steps=steps)])
+        self.assertIn('path=full', self.run_report())
 
     def test_schema_lists_simplify_ran_and_fix_growth(self):
         schema = json.loads(self.run_report('--schema'))
@@ -407,7 +484,7 @@ class Report(unittest.TestCase):
 
     def test_brief_warns_when_simplify_did_not_run(self):
         # one consultation with no note, so the notes line would otherwise be there
-        self.session([asst('m1', iterations=[executor(), ADVISOR])])
+        self.session([startup_row(), asst('m1', iterations=[executor(), ADVISOR])])
         self.records([run_record(branch='feature/skipped', simplify=RAN_NO),
                       run_record(branch='feature/last-week', date='2026-10-30T12:00:00Z',
                                  simplify=RAN_NO)])
@@ -427,6 +504,44 @@ class Report(unittest.TestCase):
         # the 2 other simplify warnings, then the 3 runs' "no session transcript found"
         self.assertEqual(brief[2], 'WARN: simplify did not run on one (2026-11-05) (+5 more, run --health)')
 
+    def stamp(self, text):
+        path = os.path.join(self.root, 'stamp.json')
+        with open(path, 'w') as f:
+            f.write(text)
+        return path
+
+    def test_brief_notes_commits_since_the_last_export(self):
+        repo, change = self.repo()
+        exported = change('a.txt', 'one')
+        change('a.txt', 'two')
+        head = change('a.txt', 'three')
+        subprocess.run(['git', '-C', repo, 'update-ref', 'refs/remotes/origin/main', head], check=True, env=CLEAN_ENV)
+        stamp = self.stamp(json.dumps({'repo': repo, 'sha': exported, 'date': '2026-11-08T17:44:28Z'}))
+        brief = self.run_report('--brief', '--export-stamp', stamp).splitlines()
+        self.assertEqual(len(brief), 3)
+        self.assertTrue(brief[2].endswith(
+            '; Template: 2 commits on main since the last export (2026-11-08T17:44:28Z), run /workflow-export'),
+            brief[2])
+
+    def test_brief_is_silent_without_a_usable_stamp(self):
+        repo, change = self.repo()
+        head = change('a.txt', 'one')
+        subprocess.run(['git', '-C', repo, 'update-ref', 'refs/remotes/origin/main', head], check=True, env=CLEAN_ENV)
+        date = '2026-11-08T17:44:28Z'
+        cases = {
+            'no stamp file': None,
+            'not JSON': '{not json',
+            'missing repo': json.dumps({'repo': os.path.join(self.root, 'gone'), 'sha': head, 'date': date}),
+            'unknown sha': json.dumps({'repo': repo, 'sha': '0' * 40, 'date': date}),
+            'template current': json.dumps({'repo': repo, 'sha': head, 'date': date}),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                path = os.path.join(self.root, 'missing.json') if text is None else self.stamp(text)
+                brief = self.run_report('--brief', '--export-stamp', path).splitlines()
+                self.assertEqual(len(brief), 3)
+                self.assertNotIn('Template:', brief[2])
+
     def test_old_records_are_unknown_not_flagged(self):
         old = run_record(branch='feature/old', simplify={'applied': 0, 'skipped': 0})
         del old['fix_growth']
@@ -439,6 +554,83 @@ class Report(unittest.TestCase):
         line = [line for line in section(out, 'Runs') if 'feature/old' in line][0]
         self.assertIn('simplify unknown', line)
         self.assertNotIn('fix +', line)
+
+    def test_json_has_its_version_and_top_level_keys(self):
+        data = self.json()
+        self.assertEqual(data['version'], 1)
+        self.assertEqual(sorted(data), ['generated', 'now', 'runs', 'sessions', 'since', 'totals', 'version'])
+        self.assertEqual(sorted(data['totals']),
+                         ['advisor', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills', 'weeks'])
+        self.assertEqual(data['now'], '2026-11-07T12:00:00+00:00')
+        self.assertIsNone(data['since'])
+
+    def test_html_page_is_self_contained_and_escaped(self):
+        step = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
+                'findings': [{'id': 'F1', 'severity': 'important', 'summary': '<b>x</b> & "y"', 'outcome': 'declined',
+                              'reason': 'r'}]}
+        self.records([run_record(branch='old'), run_record(branch='a&b', schema=2, steps=[step])])
+        page = os.path.join(self.root, 'page.html')
+        self.assertIn('Wrote ' + page, self.run_report('--html', page))
+        with open(page, encoding='utf-8') as f:
+            html = f.read()
+        self.assertTrue(html.startswith('<!DOCTYPE html>'))
+        self.assertIn('<title>Workflow dashboard</title>', html)
+        self.assertNotIn('<script', html)
+        self.assertIsNone(re.search(r'\b(src|href)\s*=', html))
+        self.assertIn('&lt;b&gt;x&lt;/b&gt; &amp; &quot;y&quot;', html)
+        self.assertIn('a&amp;b', html)
+        self.assertIn('before steps', html)
+        self.assertEqual(html.count('<details class="run"'), 2)
+        titles = ('Rules and steps', 'Whole workflow', 'Skills', 'Models', 'Advisor', 'Runs', 'Health')
+        positions = [html.index(f'<h2>{title}</h2>') for title in titles]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_run_time_compares_full_runs_with_and_without_waves(self):
+        wave = [{'wave': 'A', 'tasks': [1, 2], 'conflicts': 0}]
+        self.records([run_record(schema=2, started='2026-11-05T10:00:00Z', waves=wave, steps=[]),
+                      run_record(schema=2, started='2026-11-05T11:00:00Z', steps=[]),
+                      run_record(schema=2, started='2026-11-05T11:30:00Z', steps=[]),
+                      run_record(schema=2, steps=[]),
+                      run_record(schema=2, started='2026-11-05T08:00:00Z', path='small', steps=[])])
+        self.assertEqual(self.json()['totals']['run_time'],
+                         {'with_waves': {'runs': 1, 'timed': 1, 'median_minutes': 120.0},
+                          'without_waves': {'runs': 3, 'timed': 2, 'median_minutes': 45.0}})
+        html = self.html()
+        self.assertIn('<tr><td>with waves</td><td>1</td><td>1</td><td>120</td></tr>', html)
+        self.assertIn('<tr><td>without waves</td><td>3</td><td>2</td><td>45</td></tr>', html)
+
+    def test_a_run_across_the_weekly_reset_has_unknown_points(self):
+        self.records([run_record(),
+                      run_record(fable_start=90, fable_end=5, all_start=80, all_end=6),
+                      run_record(started='2026-11-01T06:00:00Z', date='2026-11-01T09:00:00Z',
+                                 fable_start=30, fable_end=35, all_start=30, all_end=35)])
+        data = self.json()
+        self.assertEqual([(run['fable_points'], run['all_points']) for run in data['runs']],
+                         [(None, None), (10, 10), (None, None)])
+        weeks = data['totals']['weeks']
+        self.assertEqual([(w['week'], w['fable_points'], w['all_points']) for w in weeks],
+                         [('2026-11-01', 10, 10)])
+        self.assertIn('Points: Fable 10, all models 10.', self.html())
+
+    def test_html_defaults_to_the_home_dashboard_path(self):
+        os.makedirs(os.path.join(self.root, '.claude'))
+        page = os.path.join(self.root, '.claude', 'workflow-dashboard.html')
+        self.assertEqual(self.run_report('--html', env=dict(CLEAN_ENV, HOME=self.root)), f'Wrote {page}\n')
+        with open(page, encoding='utf-8') as f:
+            self.assertTrue(f.read().startswith('<!DOCTYPE html>'))
+
+    def test_html_shows_a_schema_1_runs_cleaned_totals(self):
+        # A count given as a string reads as 0, on the run as on the scoreboard.
+        self.records([run_record(final_findings={'critical': '2', 'important': 1},
+                                 simplify={'ran': 'agents', 'applied': '3', 'skipped': 1})])
+        run = self.json()['runs'][0]
+        self.assertEqual(run['final_findings'], {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0})
+        self.assertEqual(run['simplify'], {'ran': 'agents', 'applied': 0, 'skipped': 1})
+        html = self.html()
+        self.assertIn('<td>critical=0 important=1 minor=0 unneeded=0</td>', html)
+        self.assertIn('<td>ran=agents applied=0 skipped=1</td>', html)
+        self.assertNotIn('critical=2', html)
+        self.assertNotIn('applied=3', html)
 
     def test_missing_inputs_give_an_empty_report(self):
         shutil.rmtree(self.projects)
@@ -454,11 +646,36 @@ class Report(unittest.TestCase):
         self.assertIn('runs 0/5, weeks 0/3', brief[1])
         self.assertIn('Consultations with no note: 0', brief[2])
 
+    def test_simplify_spend_is_unknown_not_zero(self):
+        # simplify's agents are no step kind, so no dispatch feeds its row
+        self.records([run_record()])
+        board = self.json()['totals']['scoreboard']
+        self.assertEqual(board['simplify']['ran'], 1)
+        self.assertIsNone(board['simplify']['tokens'])
+        self.assertIsNone(board['simplify']['cost'])
+        row = re.search(r'<tr><td>simplify</td><td>1</td>.*?</tr>', self.html()).group(0)
+        self.assertTrue(row.endswith('<td>–</td><td>–</td></tr>'), row)
+
+    def test_json_into_a_reader_that_stops_early_exits_cleanly(self):
+        self.records([run_record(branch=f'b{i}') for i in range(400)])
+        p = subprocess.Popen([PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW,
+                              '--agents', os.path.join(self.root, 'no agents'), '--json'],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=CLEAN_ENV)
+        self.assertEqual(len(p.stdout.read(300)), 300)
+        p.stdout.close()
+        stderr = p.stderr.read()
+        p.stderr.close()
+        self.assertEqual(p.wait(timeout=60), 0, stderr)
+        self.assertEqual(stderr, b'')
+
 
 STARTUP = '<karpathy-guidelines-session-start>guidelines</karpathy-guidelines-session-start>'
 NOT_FOUND = "Agent type 'final-reviewer' not found. Available agents: general-purpose, Explore"
 NO_RAN_KEY = {'applied': 0, 'skipped': 0}  # an old record, from before simplify.ran
 RAN_NO = {'ran': 'no', 'applied': 0, 'skipped': 0}
+SIMPLIFY_STEP = {'step': 'simplify', 'counts': {'applied': 0, 'skipped': 0}, 'findings': []}
+FINAL_STEP = {'step': 'final_review', 'counts': {'critical': 0, 'important': 0, 'minor': 0, 'unneeded': 0},
+              'findings': []}
 
 
 class HealthCheck(Report):
@@ -473,8 +690,7 @@ class HealthCheck(Report):
         return f'2026-11-05T10:{self.clock // 60:02d}:{self.clock % 60:02d}.000Z'
 
     def startup(self):
-        return {'type': 'attachment', 'timestamp': self.ts(),
-                'attachment': {'type': 'hook_success', 'hookName': 'SessionStart:startup', 'stdout': STARTUP}}
+        return startup_row(self.ts())
 
     def simplify(self):
         return asst('simplify-' + str(self.clock), content=[tool_use('s' + str(self.clock), 'Skill', {'skill': 'simplify'})],
@@ -488,21 +704,28 @@ class HealthCheck(Report):
         return [asst('m-' + tid, content=[tool_use(tid, 'Agent', dict(inp, prompt='p'))], ts=self.ts()),
                 user([result], ts=self.ts())]
 
-    def record_write(self, head, base='0000aaaa'):
-        command = f'echo \'{{"base": "{base}", "head": "{head}"}}\' >> "$HOME/.claude/workflow-log.jsonl"'
+    def record_write(self, head, base='0000aaaa', started=None):
+        fields = f'"base": "{base}", "head": "{head}"' + (f', "started": "{started}"' if started else '')
+        command = f'echo \'{{{fields}}}\' >> "$HOME/.claude/workflow-log.jsonl"'
         return asst('w-' + head, content=[tool_use('w' + head, 'Bash', {'command': command})], ts=self.ts())
+
+    def loaded(self, name):
+        """The row a skill load writes."""
+        return user([{'type': 'text', 'text': f'Base directory for this skill: /x/skills/{name}\n\n# {name}'}],
+                    ts=self.ts(), isMeta=True)
 
     def health(self, *args):
         """The problem lines of --health. Information lines are checked by the tests about them."""
         return [line for line in self.run_report('--health', *args).splitlines() if line.startswith(('WARN', 'Health'))]
 
-    def reviewed(self, tid, report, handback=None, **inp):
+    def reviewed(self, tid, report, handback=None, sub_model=None, sub_effort=None, **inp):
         """A launched dispatch whose subagent transcript ends with report as its last text, then a SubagentHandback
-        whose message is handback when one is given."""
-        rows = [asst('r-' + tid, content=[{'type': 'text', 'text': report}], ts=self.ts())]
+        whose message is handback when one is given. Its rows run on sub_model and sub_effort when given."""
+        ran = dict({'model': sub_model} if sub_model else {}, effort=sub_effort)
+        rows = [asst('r-' + tid, content=[{'type': 'text', 'text': report}], ts=self.ts(), **ran)]
         if handback is not None:
             rows.append(asst('h-' + tid, content=[tool_use('hb' + tid, 'SubagentHandback', {'message': handback})],
-                             ts=self.ts()))
+                             ts=self.ts(), **ran))
         self.subagent(inp.get('subagent_type') or 'general-purpose', rows, project='proj', aid=tid, tid=tid)
         return self.agent(tid, **inp)
 
@@ -515,6 +738,17 @@ class HealthCheck(Report):
         rows.append(self.record_write('c0ffee01'))
         self.session(rows, project='proj')
         self.records([run_record(branch='migration/x', head='c0ffee01', simplify=NO_RAN_KEY)])
+
+    def test_guard_refusals_are_counted_in_hook_decisions(self):
+        reason = 'No simplify since the last final review in this session\'s transcript. Run the simplify skill.'
+        rows = self.agent('fr', error=reason, subagent_type='final-reviewer', description='Final review')
+        rows += self.agent('gp', error='This dispatch has no model and no named agent, so it would run',
+                           subagent_type='general-purpose', description='x')
+        self.session(rows, project='proj')
+        hooks = section(self.run_report(), 'Hook decisions:')
+        self.assertIn('  guard-agent-dispatch.py deny x1: no_simplify', hooks)
+        self.assertIn('  guard-agent-dispatch.py deny x1: no_model', hooks)
+        self.assertEqual(section(self.run_report('--since', '2026-11-06'), 'Hook decisions:'), ['Hook decisions:'])
 
     def test_the_known_silent_case_is_flagged(self):
         self.silent_case()
@@ -585,6 +819,48 @@ class HealthCheck(Report):
     def test_a_previous_run_last_week_still_ends_at_its_record_write(self):
         self.two_runs_with_an_error_in_the_first('2026-10-30T12:00:00Z', '2026-11-05T12:00:00Z')
         self.assertEqual(self.run_report('--brief').splitlines()[2], 'Consultations with no note: 0')
+
+    def probe_then_run(self, started=None):
+        """A not-found probe at 10:00:03Z, then from 10:00:31Z a simplify, a final review and the record write."""
+        rows = [self.startup()]
+        rows += self.agent('probe', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        self.clock = 30
+        rows += [self.simplify()] + self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01', started=started))
+        self.session(rows, project='proj')
+
+    def test_a_schema_2_run_starts_at_started_not_at_the_session_start(self):
+        started = '2026-11-05T11:00:30+01:00'  # 10:00:30Z, after the probe's rows
+        self.probe_then_run(started)
+        final = FINAL_STEP
+        simplify = SIMPLIFY_STEP
+        self.records([run_record(head='c0ffee01', path='small', schema=2, started=started, steps=[simplify, final])])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_schema_1_run_still_starts_at_the_session_start(self):
+        # The same rows without "started": the probe is inside the run, as today.
+        self.probe_then_run()
+        self.records([run_record(head='c0ffee01')])
+        self.assertTrue(any('not found' in line for line in self.health()))
+
+    def test_a_plan_record_and_a_small_run_in_one_session_keep_their_own_rows(self):
+        plan_started, small_started = '2026-11-05T10:00:01Z', '2026-11-05T10:00:40Z'
+        rows = [self.startup(), self.loaded('brainstorming'), self.loaded('writing-plans')]
+        self.clock = 19
+        rows.append(self.record_write('', started=plan_started))  # 10:00:20Z
+        # A simplify between the two windows belongs to neither run.
+        self.clock = 24
+        rows.append(self.simplify())
+        self.clock = 40
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('sma11001', started=small_started))
+        self.session(rows, project='proj')
+        plan = plan_record(branch='plan-rec', started=plan_started)
+        final = FINAL_STEP
+        small = run_record(branch='small-run', head='sma11001', path='small', schema=2, started=small_started,
+                           simplify=NO_RAN_KEY, steps=[final])
+        self.records([plan, small])
+        self.assertEqual(self.health(), ['WARN: small-run (2026-11-05): final review without simplify: Final review'])
 
     def test_clean_run_has_no_problems(self):
         rows = [self.startup(), self.simplify()]
@@ -834,10 +1110,11 @@ class HealthCheck(Report):
         rows.append(self.record_write('c0ffee01'))
         rows += self.agent('im', subagent_type='implementer', description='Implement Task 1')
         self.session(rows, project='proj', sid='sess-1')
-        self.session(self.agent('gp', subagent_type='general-purpose', model='opus', description='Implement Task 2: x'),
-                     project='proj', sid='sess-2')
+        self.session([self.startup()] + self.agent('gp', subagent_type='general-purpose', model='opus',
+                                                   description='Implement Task 2: x'), project='proj', sid='sess-2')
         # none of these: a dispatch that names no workflow role, a denied one, and one last week
-        quiet = self.agent('ex', subagent_type='general-purpose', model='opus', description='Explore the code')
+        quiet = [self.startup()] + self.agent('ex', subagent_type='general-purpose', model='opus',
+                                              description='Explore the code')
         quiet += self.agent('den', error='denied by hook', subagent_type='implementer', description='Implement Task 3')
         quiet += [asst('m-old', content=[tool_use('old', 'Agent', {'subagent_type': 'implementer', 'prompt': 'p'})],
                        ts='2026-10-30T10:00:00.000Z'),
@@ -852,30 +1129,31 @@ class HealthCheck(Report):
 
     def test_planning_session_without_record_is_not_flagged(self):
         # a planning session dispatches a plan reviewer and writes no run record, by design
-        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows = [self.startup()] + self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
         rows += self.agent('pr', subagent_type='general-purpose', model='opus', description='Plan review of the plan')
         self.session(rows, project='proj', sid='sess-1')
         self.assertEqual(self.health(), ['Health: no problems'])
 
     def test_plan_review_without_plan_simplifier_is_flagged(self):
-        self.session(self.agent('pr', subagent_type='plan-reviewer', description='Plan review'), project='proj')
+        self.session([self.startup()] + self.agent('pr', subagent_type='plan-reviewer', description='Plan review'),
+                     project='proj')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
     def test_a_check_that_mentions_plan_simplifier_does_not_count(self):
-        rows = self.agent('ck', subagent_type='general-purpose', model='opus',
-                          description='Builder check on plan-simplifier spec')
+        rows = [self.startup()] + self.agent('ck', subagent_type='general-purpose', model='opus',
+                                             description='Builder check on plan-simplifier spec')
         rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
         self.session(rows, project='proj')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
     def test_plan_simplifier_before_plan_review_is_clean(self):
-        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows = [self.startup()] + self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
         rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
         self.session(rows, project='proj')
         self.assertEqual(self.health(), ['Health: no problems'])
 
     def test_each_plan_review_needs_its_own_plan_simplifier(self):
-        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows = [self.startup()] + self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
         rows += self.agent('pr1', subagent_type='plan-reviewer', description='Plan review')
         rows += self.agent('pr2', subagent_type='plan-reviewer', description='Plan re-review')
         self.session(rows, project='proj')
@@ -883,8 +1161,8 @@ class HealthCheck(Report):
                          ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan re-review'])
 
     def test_a_denied_plan_review_is_not_flagged(self):
-        self.session(self.agent('pr', error='denied by hook', subagent_type='plan-reviewer', description='Plan review'),
-                     project='proj')
+        self.session([self.startup()] + self.agent('pr', error='denied by hook', subagent_type='plan-reviewer',
+                                                   description='Plan review'), project='proj')
         self.assertEqual(self.health(), ['Health: no problems'])
 
     def test_plan_review_last_week_is_not_flagged(self):
@@ -893,15 +1171,584 @@ class HealthCheck(Report):
                            ts='2026-10-30T10:00:00.000Z'),
                       user([{'type': 'tool_result', 'tool_use_id': 'old', 'content': 'report'}],
                            ts='2026-10-30T10:00:01.000Z')], project='proj')
+        old = datetime.datetime(2026, 10, 30, 10, tzinfo=datetime.timezone.utc).timestamp()
+        os.utime(os.path.join(self.projects, 'proj', 'sess-1.jsonl'), (old, old))
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_window_ends_at_now(self):
+        # NOW is 2026-11-07T12:00Z: the probe at 12:30Z is after it, so outside the run's window
+        started = '2026-11-05T10:00:00Z'
+        rows = [self.startup(), self.simplify()] + self.agent('fr', subagent_type='final-reviewer',
+                                                             description='Final review')
+        late = self.agent('probe', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        late.append(self.record_write('c0ffee01', started=started))
+        for row in late:
+            row['timestamp'] = '2026-11-07T12:30:00.000Z'
+        self.session(rows + late, project='proj')
+        final = FINAL_STEP
+        simplify = SIMPLIFY_STEP
+        self.records([run_record(head='c0ffee01', path='small', schema=2, started=started, date='2026-11-07T11:00:00Z',
+                                 steps=[simplify, final])])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_dispatches_after_now_are_not_flagged(self):
+        # NOW is 2026-11-07T12:00Z: an implementer and a plan review on the 8th are ignored
+        late = [self.startup(),
+                asst('m-im', content=[tool_use('im', 'Agent', {'subagent_type': 'implementer', 'prompt': 'p'})],
+                     ts='2026-11-08T10:00:00.000Z'),
+                user([{'type': 'tool_result', 'tool_use_id': 'im', 'content': 'report'}], ts='2026-11-08T10:00:01.000Z'),
+                asst('m-pr', content=[tool_use('pr', 'Agent', {'subagent_type': 'plan-reviewer',
+                                                               'description': 'Plan review', 'prompt': 'p'})],
+                     ts='2026-11-08T10:00:02.000Z'),
+                user([{'type': 'tool_result', 'tool_use_id': 'pr', 'content': 'report'}], ts='2026-11-08T10:00:03.000Z')]
+        self.session(late, project='proj')
         self.assertEqual(self.health(), ['Health: no problems'])
 
     def test_a_plan_simplifier_that_was_not_found_does_not_count(self):
-        rows = self.agent('ps', error="Agent type 'plan-simplifier' not found", subagent_type='plan-simplifier',
-                          description='Plan simplify')
+        rows = [self.startup()] + self.agent('ps', error="Agent type 'plan-simplifier' not found",
+                                             subagent_type='plan-simplifier', description='Plan simplify')
         rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
         self.session(rows, project='proj')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
+    def pins(self, skills=False):
+        """A fixture agents folder: final-reviewer pinned fable/high and fix-checker sonnet/medium, listing their
+        skills only when skills is true."""
+        folder = os.path.join(self.root, 'agents')
+        os.makedirs(folder, exist_ok=True)
+        for name, model, effort, listed in (('final-reviewer', 'fable', 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
+                                            ('fix-checker', 'sonnet', 'medium', [])):
+            lines = ['---', f'name: {name}', 'description: d', f'model: {model}', f'effort: {effort}']
+            if skills and listed:
+                lines += ['skills:'] + [f'  - {skill}' for skill in listed]
+            with open(os.path.join(folder, name + '.md'), 'w') as f:
+                f.write('\n'.join(lines + ['---', 'Body.']) + '\n')
+        return folder
+
+    def schema2_run(self, steps, dispatch_rows, loads=('subagent-driven-development',), **over):
+        rows = [self.startup()] + [self.loaded(name) for name in loads] + [self.simplify()] + dispatch_rows
+        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:00Z', steps=steps, **over)])
+
+    def test_steps_match_launched_agents_and_count_lines(self):
+        final = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
+                 'findings': [{'id': 'F1', 'severity': 'important', 'summary': 's', 'outcome': 'fixed',
+                               'verdicts': ['fixed']}]}
+        fix = {'step': 'final_fix_check', 'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}
+        simplify = SIMPLIFY_STEP
+        self.schema2_run([simplify, final, fix],
+                         self.reviewed('fr', 'Findings: critical=0 important=1 minor=0 unneeded=0',
+                                       sub_model='claude-fable-5-1', sub_effort='high',
+                                       subagent_type='final-reviewer', description='Final review')
+                         + self.reviewed('fc', 'Verdicts: fixed=1 not_proportionate=0 open=0',
+                                         sub_model='claude-sonnet-5-5', sub_effort='medium',
+                                         subagent_type='fix-checker', description='Fix-check final findings'),
+                         final_findings={'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0})
+        self.assertEqual(self.health('--agents', self.pins()), ['Health: no problems'])
+
+    def test_a_missing_step_a_count_mismatch_and_a_missing_line_are_warned(self):
+        simplify = SIMPLIFY_STEP
+        plan = {'step': 'plan_simplify', 'counts': {'cuts': 0, 'flags': 0}, 'findings': []}
+        task = {'step': 'task_review', 'task': 1, 'round': 0, 'counts': {'critical': 0, 'important': 1, 'minor': 0},
+                'findings': [{'id': 'F1', 'severity': 'important', 'summary': 's', 'outcome': 'fixed',
+                              'verdicts': ['fixed']}]}
+        fix = {'step': 'fix_check', 'task': 1, 'round': 1, 'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}
+        rows = self.reviewed('ps', 'Nothing to cut.', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.reviewed('tr', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer',
+                              description='Review Task 1')
+        rows += self.reviewed('fc', 'Finding 1: fixed.', subagent_type='fix-checker', description='Fix-check Task 1')
+        # no final_review step for this launched final review
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                              subagent_type='final-reviewer', description='Final review')
+        self.schema2_run([simplify, plan, task, fix], rows)
+        prefix = 'WARN: b (2026-11-05): '
+        self.assertEqual(self.health(), [prefix + line for line in (
+            'plan simplify report has no Findings: line: Plan simplify',
+            'fix-check report has no Verdicts: line: Fix-check Task 1',
+            'record has 0 final_review steps, transcript launched 1',
+            "task_review step 1 counts critical=0 important=1 minor=0 differ from its report's "
+            'critical=0 important=0 minor=0',
+        )])
+
+    def test_a_malformed_step_for_a_launched_agent_shows_as_a_step_count_warn(self):
+        # the fix-check step isn't a dict, the final review's counts are strings, simplify's findings isn't a list
+        simplify = {'step': 'simplify', 'counts': {'applied': 2, 'skipped': 0}, 'findings': 'not a list'}
+        final = {'step': 'final_review', 'counts': {'critical': '0', 'important': '1', 'minor': '0', 'unneeded': '0'},
+                 'findings': []}
+        rows = self.reviewed('fr', 'Findings: critical=0 important=1 minor=0 unneeded=0',
+                             subagent_type='final-reviewer', description='Final review')
+        rows += self.reviewed('fc', 'Verdicts: fixed=1 not_proportionate=0 open=0', subagent_type='fix-checker',
+                              description='Fix-check final findings')
+        self.schema2_run([simplify, final, 'final_fix_check'], rows,
+                         final_findings={'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0})
+        prefix = 'WARN: b (2026-11-05): '
+        self.assertEqual(self.health(), [prefix + line for line in (
+            'record has 0 final_fix_check steps, transcript launched 1',
+            "final_review step 1 counts critical=0 important=0 minor=0 unneeded=0 differ from its report's "
+            'critical=0 important=1 minor=0 unneeded=0',
+            "simplify step 1 findings don't add up to its counts",
+        )])
+        self.assertIn('path=full', self.run_report())
+
+    def test_a_schema_1_fix_check_without_verdicts_is_not_warned(self):
+        rows = [self.startup(), self.simplify()]
+        rows += self.reviewed('ps', 'Nothing to cut.', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.reviewed('fc', 'Finding 1: fixed.', subagent_type='fix-checker', description='Fix-check Task 1')
+        rows.append(self.record_write('c0ffee01'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_findings_that_do_not_add_up_are_warned(self):
+        simplify = {'step': 'simplify', 'counts': {'applied': 1, 'skipped': 0},
+                    'findings': [{'id': 'S1', 'summary': 's', 'outcome': 'declined', 'reason': 'r'}]}
+        plan = {'step': 'plan_simplify', 'counts': {'cuts': 1, 'flags': 1},
+                'findings': [{'id': 'C1', 'kind': 'cut', 'summary': 's', 'outcome': 'applied'},
+                             {'id': 'C2', 'kind': 'cut', 'summary': 's', 'outcome': 'applied'}]}
+        review = {'step': 'plan_review', 'counts': {'findings': 2},
+                  'findings': [{'id': 'P1', 'severity': 'important', 'summary': 's', 'outcome': 'applied'}]}
+        task = {'step': 'task_review', 'task': 1, 'round': 0, 'counts': {'critical': 0, 'important': 1, 'minor': 1},
+                'findings': [{'id': 'F1', 'severity': 'important', 'summary': 's', 'outcome': 'fixed',
+                              'verdicts': ['open', 'fixed']},
+                             {'id': 'F2', 'severity': 'critical', 'summary': 's', 'outcome': 'fixed'}]}
+        fix = {'step': 'fix_check', 'task': 1, 'round': 1, 'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}
+        rows = self.reviewed('ps', 'Findings: cuts=1 flags=1', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.reviewed('pr', 'Findings: findings=2', subagent_type='plan-reviewer', description='Plan review')
+        rows += self.reviewed('tr', 'Findings: critical=0 important=1 minor=1', subagent_type='task-reviewer',
+                              description='Review Task 1')
+        rows += self.reviewed('fc', 'Verdicts: fixed=1 not_proportionate=0 open=0', subagent_type='fix-checker',
+                              description='Fix-check Task 1')
+        self.schema2_run([simplify, plan, review, task, fix], rows)
+        prefix = 'WARN: b (2026-11-05): '
+        self.assertEqual(self.health(), [prefix + line for line in (
+            "plan_simplify step 1 findings don't add up to its counts",
+            "plan_review step 1 findings don't add up to its counts",
+            "task_review step 1 findings don't add up to its counts",
+            "simplify step 1 findings don't add up to its counts",
+            "fix-check verdicts in findings don't add up to the fix-check steps' counts",
+        )])
+
+    def test_an_agent_off_its_pin_is_warned_unless_the_stage_allows_it(self):
+        prefix = 'WARN: b (2026-11-05): '
+        cases = (
+            # (record fields, dispatch input, subagent model and effort, expected)
+            ({}, {}, ('claude-opus-5-5', 'high'),
+             [prefix + 'final-reviewer ran on claude-opus-5-5/high, pinned fable/high: Final review']),
+            ({'stage': 'out'}, {}, ('claude-opus-5-5', 'xhigh'), ['Health: no problems']),
+            ({'stage': '3'}, {'model': 'opus'}, ('claude-opus-5-5', 'high'), ['Health: no problems']),
+            ({'risk_area': True}, {'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'), ['Health: no problems']),
+            ({'risk_area': True}, {}, ('claude-fable-5-1', 'xhigh'),
+             [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned fable/high: Final review']),
+        )
+        for over, inp, (model, effort), expected in cases:
+            with self.subTest(over=over, inp=inp):
+                self.tearDown()
+                self.setUp()
+                simplify = SIMPLIFY_STEP
+                final = FINAL_STEP
+                self.schema2_run([simplify, final],
+                                 self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                                               sub_model=model, sub_effort=effort, subagent_type='final-reviewer',
+                                               description='Final review', **inp), **over)
+                self.assertEqual(self.health('--agents', self.pins()), expected)
+
+    def test_a_risk_area_small_run_is_warned(self):
+        self.final_run(path='small', risk_area=True)
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): risk area on the Small path'])
+
+    def wave_run(self, waves, with_check=True):
+        """A clean Full run reviewing tasks 3 and 4 and, unless with_check is false, checking wave A, recording waves."""
+        clean = {'critical': 0, 'important': 0, 'minor': 0}
+        reviews = [('t3', 3, 'Review Task 3'), ('t4', 4, 'Review Task 4')]
+        steps = [{'step': 'task_review', 'task': n, 'round': 0, 'counts': clean, 'findings': []} for _, n, _ in reviews]
+        if with_check:
+            reviews.append(('wa', None, 'Wave A check'))
+            steps.append({'step': 'task_review', 'wave': 'A', 'round': 0, 'counts': clean, 'findings': []})
+        rows = []
+        for tid, _, description in reviews:
+            rows += self.reviewed(tid, 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer',
+                                  description=description)
+        self.final_run(rows, loads=('subagent-driven-development',), steps=steps, waves=waves)
+
+    def test_a_wave_with_its_check_is_clean(self):
+        self.wave_run([{'wave': 'A', 'tasks': [3, 4], 'conflicts': 0}])
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_wave_without_its_check_is_warned(self):
+        self.wave_run([{'wave': 'A', 'tasks': [3, 4], 'conflicts': 0}], with_check=False)
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): wave A has no wave check step'])
+
+    def test_malformed_waves_entries_are_dropped_or_read_as_absent(self):
+        self.wave_run(['not a dict', {'tasks': [3]}, {'wave': 'B', 'tasks': 'x', 'conflicts': 'y'}], with_check=False)
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): wave B has no wave check step'])
+
+    def test_archive_missing_or_started_differing_is_an_information_line(self):
+        cases = (
+            (None, ['b (2026-11-05): archive missing']),
+            ('Ledger.\nStarted: 2026-11-05T11:00:00+01:00\nStarted: 2026-11-05T09:00:00Z\n', []),
+            ('Started: 2026-11-05T09:00:00Z\n', ['b (2026-11-05): archive Started: differs']),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.tearDown()
+                self.setUp()
+                archive = os.path.join(self.root, 'archive', '2026-11-05-b.md')
+                if text is not None:
+                    self.write_lines(archive, [text.rstrip('\n')])
+                self.final_run(loads=('subagent-driven-development',), archive=archive, fix_growth=None)
+                self.assertEqual(self.run_report('--health').splitlines(), ['Health: no problems'] + expected)
+
+
+    def final_run(self, dispatch_rows=None, loads=(), steps=(), **over):
+        """A clean schema 2 Full run of steps, then a simplify and a final review, after dispatch_rows, loading loads."""
+        self.schema2_run([*steps, SIMPLIFY_STEP, FINAL_STEP],
+                         (dispatch_rows or []) + self.agent('fr', subagent_type='final-reviewer',
+                                                            description='Final review'),
+                         loads=loads, **over)
+
+    def test_a_full_run_without_sdd_is_warned(self):
+        self.final_run()
+        self.assertEqual(self.health(),
+                         ['WARN: b (2026-11-05): required skill subagent-driven-development did not run'])
+
+    def test_a_plan_record_needs_brainstorming_and_writing_plans(self):
+        started = '2026-11-05T10:00:00Z'
+        self.session([self.startup(), self.loaded('brainstorming'), self.record_write('', started=started)],
+                     project='proj')
+        self.records([plan_record(started=started)])
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): required skill writing-plans did not run'])
+
+    def test_an_agent_without_its_pinned_skill_is_warned(self):
+        prefix = 'WARN: b (2026-11-05): '
+        skill = 'andrej-karpathy-skills:karpathy-guidelines'
+        for loads, expected in (
+                ('karpathy-guidelines', ['Health: no problems']),
+                ('simplify', [prefix + f'final-reviewer ran without its skill {skill}: Final review'])):
+            with self.subTest(loads=loads):
+                self.tearDown()
+                self.setUp()
+                # An agent's preloaded skill: a command-message block, then the skill's text.
+                rows = [user([{'type': 'text', 'text': f'<command-message>{skill}</command-message>'},
+                              {'type': 'text', 'text': f'Base directory for this skill: /x/skills/{loads}\n\n# Skill'}],
+                             ts=self.ts(), isMeta=True)]
+                rows.append(asst('r-fr', content=[{'type': 'text', 'text': 'Findings: critical=0 important=0 minor=0 '
+                                                                           'unneeded=0'}],
+                                 model='claude-fable-5-1', ts=self.ts(), effort='high'))
+                self.subagent('final-reviewer', rows, project='proj', aid='fr', tid='fr')
+                self.final_run(loads=('subagent-driven-development',))
+                self.assertEqual(self.health('--agents', self.pins(skills=True)), expected)
+
+    def test_typed_grill_me_without_the_skill_is_warned_and_with_it_is_clean(self):
+        warned = ["WARN: session sess-1.jsonl: typed 'grill-me' but grill-me never loaded"]
+        for later, expected in (([], warned), (['grill-me'], ['Health: no problems'])):
+            with self.subTest(later=later):
+                self.tearDown()
+                self.setUp()
+                # a load before the trigger doesn't meet it
+                rows = [self.startup(), self.loaded('grill-me'), user('Grill me on this design', ts=self.ts())]
+                self.session(rows + [self.loaded(name) for name in later], project='proj')
+                self.assertEqual(self.health(), expected)
+
+    def test_a_session_with_no_run_and_no_startup_guidelines_is_warned(self):
+        rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
+        rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
+        self.session(rows, project='proj')
+        # the per-run check covers a session with a run, so it gets no second line
+        self.session([self.simplify(), self.record_write('c0ffee01')], project='proj', sid='sess-2')
+        self.records([run_record(head='c0ffee01')])
+        self.assertEqual(self.health(), ['WARN: b (2026-11-05): startup guidelines missing from the session',
+                                         'WARN: session sess-1.jsonl: startup guidelines missing'])
+
+    def test_a_chat_only_session_this_week_without_startup_guidelines_is_warned(self):
+        self.session([user('Hello', ts=self.ts())], project='proj')
+        # last week's session, by its file's time, is not
+        self.session([user('Hello', ts='2026-10-30T10:00:00.000Z')], project='proj', sid='sess-2')
+        old = datetime.datetime(2026, 10, 30, 10, tzinfo=datetime.timezone.utc).timestamp()
+        os.utime(os.path.join(self.projects, 'proj', 'sess-2.jsonl'), (old, old))
+        self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: startup guidelines missing'])
+
+    def test_a_compaction_summary_quoting_grill_me_is_not_a_trigger(self):
+        rows = [self.startup(), user('Grill me on this design', ts=self.ts()), self.loaded('grill-me'),
+                user('Summary: the owner asked "grill me" on the design.', ts=self.ts(), isCompactSummary=True)]
+        self.session(rows, project='proj')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_tool_result_quoting_the_skill_text_does_not_count_as_loaded(self):
+        quoted = 'Base directory for this skill: /x/skills/subagent-driven-development\n\n# SDD'
+        rows = [asst('m-rd', content=[tool_use('rd', 'Read', {'file_path': '/x/notes.md'})], ts=self.ts()),
+                user([{'type': 'tool_result', 'tool_use_id': 'rd', 'content': quoted}], ts=self.ts()),
+                {'type': 'attachment', 'timestamp': self.ts(),
+                 'attachment': {'type': 'invoked_skills',
+                                'skills': [{'name': 'subagent-driven-development', 'content': quoted}]}}]
+        self.final_run(rows)
+        self.assertEqual(self.health(),
+                         ['WARN: b (2026-11-05): required skill subagent-driven-development did not run'])
+
+    def test_json_carries_waves_and_the_wave_check_as_written(self):
+        waves = [{'wave': 'A', 'tasks': [3, 4], 'conflicts': 0}]
+        self.wave_run(waves)
+        run = self.json()['runs'][0]
+        self.assertEqual(run['record']['waves'], waves)
+        self.assertEqual([s['wave'] for s in run['steps']], [None, None, 'A', None, None])
+
+    def test_a_runs_cleaned_waves_reach_json_and_the_page(self):
+        self.records([run_record(schema=2, steps=[], waves=[{'wave': 'A', 'tasks': [3, 4], 'conflicts': 1},
+                                                            {'wave': 'B', 'tasks': 'x'}, 'not a dict'])])
+        run = self.json()['runs'][0]
+        self.assertEqual(run['waves'], [{'wave': 'A', 'tasks': [3, 4], 'conflicts': 1},
+                                        {'wave': 'B', 'tasks': [], 'conflicts': 0}])
+        html = self.html()
+        self.assertIn('waves=2', html)
+        self.assertIn('<tr><th>wave</th><th>tasks</th><th>conflicts</th></tr>\n<tr><td>A</td><td>3 4</td><td>1</td></tr>'
+                      '\n<tr><td>B</td><td></td><td>0</td></tr>', html)
+
+    def test_html_labels_the_wave_check_step(self):
+        self.wave_run([{'wave': 'A', 'tasks': [3, 4], 'conflicts': 0}])
+        self.assertIn('<td>wave A</td>', self.html())
+
+    def test_offers_are_cleaned_and_reach_json(self):
+        offers = [{'skill': 'grill-me', 'outcome': 'accepted'}, {'skill': 'some-skill', 'outcome': 'not_offered'},
+                  {'skill': 3, 'outcome': 'accepted'}, {'skill': 'x', 'outcome': 'maybe'}, 'junk']
+        self.records([dict(plan_record(), schema=3, offers=offers)])
+        self.assertEqual(self.json()['runs'][0]['offers'],
+                         [{'skill': 'grill-me', 'outcome': 'accepted', 'reason': None},
+                          {'skill': 'some-skill', 'outcome': 'not_offered', 'reason': None}])
+
+    def test_offer_totals_and_page_rows(self):
+        self.records([dict(plan_record(), schema=3, offers=[{'skill': 'grill-me', 'outcome': 'accepted'}]),
+                      dict(plan_record(), schema=3, offers=[{'skill': 'grill-me', 'outcome': 'skipped'},
+                                                            {'skill': 'some-skill', 'outcome': 'updated'}])])
+        self.assertEqual(self.json()['totals']['offers'],
+                         {'grill-me': {'offered': 2, 'accepted': 1, 'skipped': 1, 'not_offered': 0, 'updated': 0},
+                          'some-skill': {'offered': 0, 'accepted': 0, 'skipped': 0, 'not_offered': 0, 'updated': 1}})
+        html = self.html()
+        self.assertIn('<td>offer grill-me</td><td>2</td>', html)
+        self.assertIn('offers=grill-me:skipped some-skill:updated', html)
+
+    def test_a_schema_3_plan_record_missing_a_required_offer_is_warned(self):
+        started = '2026-11-05T10:00:00Z'
+        offers = [{'skill': 'some-skill', 'outcome': 'accepted'}]
+        for schema, rec in ((3, dict(plan_record(started=started), schema=3, offers=offers)),
+                            (2, plan_record(started=started))):
+            with self.subTest(schema=schema):
+                self.tearDown()
+                self.setUp()
+                self.session([self.startup(), self.loaded('brainstorming'), self.loaded('writing-plans'),
+                              self.record_write('', started=started)], project='proj')
+                self.records([rec])
+                warns = [line for line in self.health() if 'offer' in line]
+                if schema == 3:
+                    self.assertIn('WARN: b (2026-11-05): no grill-me offer recorded', warns)
+                else:
+                    self.assertEqual(warns, [])
+
+    def test_json_keeps_old_and_new_records_and_fills_what_each_has(self):
+        old = run_record(branch='old', head='dead0001',
+                         final_findings={'critical': 0, 'important': 0, 'minor': 2, 'unneeded': 0},
+                         simplify={'ran': 'agents', 'applied': 3, 'skipped': 1})
+        self.records([old])
+        final = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
+                 'findings': [{'id': 'F1', 'severity': 'important', 'summary': 's', 'outcome': 'fixed',
+                               'verdicts': ['fixed']}]}
+        fix = {'step': 'final_fix_check', 'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}
+        simplify = SIMPLIFY_STEP
+        # a row before started is outside the window
+        early = asst('early', model='claude-haiku-4-5', ts='2026-11-05T09:00:00.000Z')
+        rows = [early] + self.reviewed('fr', 'Findings: critical=0 important=1 minor=0 unneeded=0',
+                                       sub_model='claude-fable-5-1', sub_effort='high',
+                                       subagent_type='final-reviewer', description='Final review')
+        rows += self.reviewed('fc', 'Verdicts: fixed=1 not_proportionate=0 open=0', sub_model='claude-sonnet-5-5',
+                              sub_effort='medium', subagent_type='fix-checker', description='Fix-check final findings')
+        self.schema2_run([simplify, final, fix], rows,
+                         final_findings={'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0})
+        data = self.json()
+        first, second = data['runs']
+        self.assertEqual((first['schema'], first['record'], first['window'], first['minutes']), (1, old, None, None))
+        self.assertEqual(first['warns'], ['WARN: old (2026-11-05): no session transcript found'])
+        self.assertIsNone(first['dispatches'])
+        transcript = os.path.join(self.projects, 'proj', 'sess-1.jsonl')
+        self.assertEqual(second['schema'], 2)
+        self.assertEqual(second['window'], {'transcript': transcript, 'start': '2026-11-05T10:00:00.000Z',
+                                            'end': '2026-11-05T10:00:10.000Z'})
+        self.assertEqual(second['minutes'], 120.0)
+        self.assertEqual(second['warns'], [])
+        self.assertEqual(sorted(second['models']), ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5'])
+        self.assertEqual(second['main'], {'model': 'claude-opus-5-5', 'effort': None})
+        self.assertEqual([{k: d[k] for k in ('kind', 'agent', 'description', 'requested_model', 'model', 'effort',
+                                             'skills', 'counts')} for d in second['dispatches']], [
+            {'kind': 'final_review', 'agent': 'final-reviewer', 'description': 'Final review', 'requested_model': None,
+             'model': 'claude-fable-5-1', 'effort': 'high', 'skills': [],
+             'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0}},
+            {'kind': 'final_fix_check', 'agent': 'fix-checker', 'description': 'Fix-check final findings',
+             'requested_model': None, 'model': 'claude-sonnet-5-5', 'effort': 'medium', 'skills': [],
+             'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}])
+        board = data['totals']['scoreboard']
+        final_row = board['final_review']
+        self.assertAlmostEqual(final_row.pop('cost'), 0.0006)  # 10 input and 10 output tokens on Fable 5.1
+        self.assertEqual(final_row, {'ran': 2, 'found': 2,
+                                     'counts': {'critical': 0, 'important': 1, 'minor': 2, 'unneeded': 0},
+                                     'outcomes': {'fixed': 1},
+                                     'tokens': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0}})
+        self.assertEqual({k: board['simplify'][k] for k in ('ran', 'found', 'counts', 'outcomes')},
+                         {'ran': 2, 'found': 1, 'counts': {'applied': 3, 'skipped': 1}, 'outcomes': {}})
+        self.assertEqual(board['plan_review']['ran'], 0)
+        self.assertEqual(board['startup'], {'with': 1, 'without': 0})
+        self.assertEqual(board['stop_rule'], {'stops': 0})
+        self.assertEqual(data['totals']['models']['agents']['final-reviewer'],
+                         {'requested': {'-/-': 1}, 'actual': {'claude-fable-5-1/high': 1}, 'mismatches': 0})
+        self.assertEqual(data['totals']['models']['main']['full'],
+                         {'recommended': {'1': 'opus/medium', '2': 'opus/medium', '3': 'opus/medium',
+                                          'out': 'opus/medium'},
+                          'actual': {'claude-opus-5-5/-': 1}, 'differs': 0})
+        self.assertEqual(data['totals']['health'],
+                         {'warns': ['WARN: old (2026-11-05): no session transcript found'],
+                          'info': ['Git evidence unavailable for 2 runs']})
+
+    def test_json_prices_date_suffixed_ids_and_leaves_unknown_models_unpriced(self):
+        self.session([asst('h', model='claude-haiku-4-5-20251001', u=usage(None, 1000000, 0), ts=self.ts()),
+                      asst('u', model='claude-unknown-1', ts=self.ts())], project='proj')
+        data = self.json()
+        self.assertEqual(data['runs'], [])
+        self.assertEqual(data['sessions'], [{
+            'file': os.path.join(self.projects, 'proj', 'sess-1.jsonl'), 'skills': [], 'typed': [],
+            'models': {'claude-haiku-4-5-20251001': {'input': 1000000, 'output': 0, 'cache_read': 0, 'cache_write': 0,
+                                                     'cost': 1.0},
+                       'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0,
+                                            'cost': None}},
+            'efforts': {}, 'startup': False, 'warns': ['WARN: session sess-1.jsonl: startup guidelines missing']}])
+        self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
+
+    def test_json_weeks_rows(self):
+        rows = [self.startup(), asst('big', u=usage(None, 1000000, 0), ts=self.ts()),
+                self.record_write('c0ffee01', started='2026-11-05T10:00:00Z')]
+        self.session(rows, project='proj')
+        # Points count only from records with both ends as numbers: last week's has none, this week's last has one.
+        last_week = run_record(date='2026-10-30T12:00:00Z', started='2026-10-30T11:00:00Z', tasks=2, fix_rounds=1,
+                               stops=1, final_findings={'critical': 1, 'important': 0, 'minor': 0, 'unneeded': 0},
+                               all_end='20')
+        del last_week['fable_end']
+        half = run_record(head='h4', date='2026-11-06T13:00:00Z', fable_start=40, fable_end='41', all_start=32,
+                          all_end=33)
+        del half['all_start']
+        self.records([
+            last_week,
+            run_record(head='c0ffee01', path='small', started='2026-11-05T10:00:00Z', tasks=3, fable_start=20,
+                       fable_end=35, all_start=20, all_end=30),
+            run_record(head='h3', date='2026-11-06T12:00:00Z', path='small', started='2026-11-06T11:30:00Z',
+                       fable_start=35, fable_end=40, all_start=30, all_end=32,
+                       final_findings={'critical': 0, 'important': 0, 'minor': 2, 'unneeded': 0}),
+            half,
+        ])
+        data = self.json()
+        # last week's run has no window, so its cost is unknown, not 0
+        weeks = data['totals']['weeks']
+        self.assertAlmostEqual(weeks[1].pop('cost'), 4.00024)  # 1M input tokens and the record write's row on Opus
+        self.assertEqual(weeks, [
+            {'week': '2026-10-25', 'runs': {'full': 1}, 'tasks': 2,
+             'findings': {'critical': 1, 'important': 0, 'minor': 0, 'unneeded': 0}, 'fix_rounds': 1, 'stops': 1,
+             'fable_points': None, 'all_points': None, 'cost': None, 'minutes_per_run': 60.0, 'later_fixes': 0},
+            {'week': '2026-11-01', 'runs': {'full': 1, 'small': 2}, 'tasks': 5,
+             'findings': {'critical': 0, 'important': 0, 'minor': 2, 'unneeded': 0}, 'fix_rounds': 0, 'stops': 0,
+             'fable_points': 20, 'all_points': 12, 'minutes_per_run': 75.0, 'later_fixes': 0},
+        ])
+        # a schema 1 run's window has no required-skill check, so its missing skills are unknown
+        self.assertIsNotNone(data['runs'][1]['window'])
+        self.assertIsNone(data['runs'][1]['missing_skills'])
+
+    def test_json_skill_outcomes(self):
+        plan_started, full_started = '2026-11-05T10:00:00Z', '2026-11-05T10:00:20Z'
+        brainstorming, writing_plans = self.loaded('brainstorming'), self.loaded('writing-plans')
+        spec = asst('m-wr', content=[tool_use('wr', 'Write', {'file_path': '/r/docs/superpowers/specs/x.md',
+                                                              'content': 'c'})], ts=self.ts())
+        rows = [self.startup(), brainstorming, spec, writing_plans, self.record_write('', started=plan_started)]
+        self.clock = 20
+        sdd, tdd, simplify = (self.loaded(name) for name in
+                              ('subagent-driven-development', 'test-driven-development', 'simplify'))
+        rows += [sdd, tdd, simplify, user('Grill me on this', ts=self.ts()),
+                 self.record_write('f00d0001', started=full_started)]
+        self.session(rows, project='proj')
+        self.records([plan_record(started=plan_started),
+                      run_record(head='f00d0001', schema=2, started=full_started, steps=[],
+                                 simplify={'ran': 'agents', 'applied': 2, 'skipped': 1},
+                                 failing_test=[{'task': 1, 'result': 'passed'}])])
+        data = self.json()
+        plan, full = data['runs']
+        self.assertEqual(plan['skills'], [
+            {'name': 'brainstorming', 'time': brainstorming['timestamp'], 'outcome': '/r/docs/superpowers/specs/x.md'},
+            {'name': 'writing-plans', 'time': writing_plans['timestamp'], 'outcome': None}])
+        self.assertEqual(full['skills'], [
+            {'name': 'subagent-driven-development', 'time': sdd['timestamp'], 'outcome': True},
+            {'name': 'test-driven-development', 'time': tdd['timestamp'], 'outcome': [{'task': 1, 'result': 'passed'}]},
+            {'name': 'simplify', 'time': simplify['timestamp'], 'outcome': {'applied': 2, 'skipped': 1}}])
+        skills = data['totals']['skills']
+        self.assertEqual(skills['brainstorming'],
+                         {'runs': 1, 'last': brainstorming['timestamp'], 'outcomes': {'spec': 1}, 'missing': 0})
+        self.assertEqual(skills['writing-plans'],
+                         {'runs': 1, 'last': writing_plans['timestamp'], 'outcomes': {'none': 1}, 'missing': 0})
+        self.assertEqual(skills['grill-me'], {'runs': 0, 'last': None, 'outcomes': {}, 'missing': 1})
+
+    def test_json_survives_a_malformed_stage_and_counts_the_runs_refusals(self):
+        reason = 'No simplify since the last final review in this session\'s transcript.'
+        rows = [self.startup()] + self.agent('fr', error=reason, subagent_type='final-reviewer',
+                                             description='Final review')
+        self.session(rows + [self.record_write('c0ffee01')], project='proj')
+        self.records([run_record(head='c0ffee01', stage=['2'])])
+        data = self.json()
+        self.assertEqual(data['runs'][0]['refusals'], {'no_simplify': 1})
+        self.assertEqual(data['totals']['models']['main']['full']['actual'], {'claude-opus-5-5/-': 1})
+
+    def test_json_runs_are_oldest_first(self):
+        undated = run_record(branch='undated')
+        del undated['date']
+        self.records([run_record(branch='later', date='2026-11-06T12:00:00Z'), undated,
+                      run_record(branch='first', date='2026-11-05T12:00:00+01:00'),
+                      run_record(branch='second', date='2026-11-05T11:00:00Z')])
+        self.assertEqual([run['record']['branch'] for run in self.json()['runs']],
+                         ['first', 'second', 'later', 'undated'])
+
+    def test_json_advisor_and_rule_rows(self):
+        advisor_30 = dict(ADVISOR, input_tokens=3000000, output_tokens=0)  # $30 at Fable 5.1's input price
+        reason = 'No simplify since the last final review in this session\'s transcript.'
+        rows = [self.startup(), asst('m_adv', iterations=[executor(), advisor_30], ts=self.ts()),
+                asst('m_fable', model='claude-fable-5-1', u=usage([executor(input_tokens=7000000, output_tokens=0)]),
+                     ts=self.ts())]
+        self.session(rows + self.agent('fr', error=reason, subagent_type='final-reviewer', description='Final review'),
+                     project='proj')
+        ruled = {'step': 'task_review', 'task': 1, 'round': 0, 'counts': {'critical': 0, 'important': 1, 'minor': 0},
+                 'findings': [{'id': 'F1', 'severity': 'important', 'summary': 's', 'outcome': 'ruled', 'reason': 'r'}]}
+        third = {'step': 'fix_check', 'task': 1, 'round': 3, 'counts': {'fixed': 0, 'not_proportionate': 0, 'open': 1}}
+        self.records([run_record(schema=2, stops=2, steps=[ruled, third]), run_record(stops=1)])
+        totals = self.json()['totals']
+        self.assertEqual(totals['advisor'], {
+            'calls': 1, 'tokens': {'input': 3000000, 'output': 0, 'cache_read': 0, 'cache_write': 0}, 'cost': 30.0,
+            'by_role': {'main': {'calls': 1, 'flagged': False}}, 'failed': {}, 'notes': 0, 'changed': 0, 'missing': 1,
+            'weeks': [{'week': '2026-11-01', 'advisor': 30.0, 'fable': 70.0, 'share': 30.0, 'stop': True}],
+            'trial': 'runs 2/5, weeks 0/3'})
+        board = totals['scoreboard']
+        self.assertEqual(board['advisor'], {'calls': 1, 'notes': 0, 'changed': 0, 'cost': 30.0, 'share': 30.0})
+        self.assertEqual(board['dispatch_guard'], {'no_simplify': 1})
+        self.assertEqual(board['fix_round_cap'], {'runs': 1, 'ruled': 1})
+        self.assertEqual(board['stop_rule'], {'stops': 3})
+        self.assertEqual(board['task_review']['outcomes'], {'ruled': 1})
+
+    def test_a_malformed_archive_path_reads_as_missing(self):
+        self.final_run(loads=('subagent-driven-development',), archive='/p/a\u0000b.md', fix_growth=None)
+        self.assertEqual(self.run_report('--health').splitlines(),
+                         ['Health: no problems', 'b (2026-11-05): archive missing'])
+        self.assertEqual(len(self.json()['runs']), 1)
+        page = os.path.join(self.root, 'page.html')
+        self.assertIn('Wrote ' + page, self.run_report('--html', page))
+
+    def test_an_injected_row_quoting_grill_me_is_not_a_trigger(self):
+        rows = [self.startup(), user('please build it', ts=self.ts(), origin={'kind': 'human'}),
+                user('The owner said grill me.', ts=self.ts(), origin={'kind': 'task-notification'})]
+        self.session(rows, project='proj')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_simplify_that_found_nothing_reads_none(self):
+        self.final_run(loads=('subagent-driven-development', 'simplify'))
+        self.assertEqual(self.json()['totals']['skills']['simplify']['outcomes'], {'none': 1})
 
 if __name__ == '__main__':
     unittest.main()

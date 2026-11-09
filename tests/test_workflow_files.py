@@ -68,14 +68,40 @@ class AgentFiles(unittest.TestCase):
                 self.assertEqual(fields, expected)
                 self.assertTrue(body.strip())
 
+    def test_checked_agents_end_with_their_count_line(self):
+        lines = {'fix-checker': '`Verdicts: fixed=N not_proportionate=N open=N`',
+                 'plan-simplifier': '`Findings: cuts=N flags=N`',
+                 'plan-reviewer': '`Findings: findings=N`'}
+        for name, line in lines.items():
+            with self.subTest(agent=name):
+                _, body = frontmatter(read(os.path.join('agents', name + '.md')))
+                self.assertIn(line, body)
+                self.assertIn('End your report with this line', body)
+
     def test_section_stays_short_and_holds_the_exact_contract(self):
         text = read('claude-md/agentic-workflow.md')
         self.assertLessEqual(len(text.splitlines()), 30)  # About 25 lines.
         for must in ('failing-test-check.py', 'workflow-log.jsonl', 'workflow-report.py --brief',
                      'workflow-report.py --schema', 'Advisor: ', '**Failing-test check:** exempt:',
-                     '/advisor fable', '/advisor off'):
+                     '/advisor fable', '/advisor off', 'workflow-archive', 'Started:', '"plan"', 'F1',
+                     '**Wave:**', '/usr/bin/python3 -I ~/.claude/scripts/wave.py', '**Offers:**', 'grill-me',
+                     'offers'):
             with self.subTest(must=must):
                 self.assertIn(must, text)
+
+    def test_every_skill_has_a_row_in_the_offers_table(self):
+        text = read('README.md')
+        lines = text[text.index('### Offered skills and commands\n'):].splitlines()[1:]
+        table = []
+        for line in lines:
+            if line.startswith('#'):
+                break
+            if line.startswith('|'):
+                table.append(line.split('|')[1].strip())
+        for name in sorted(os.listdir(os.path.join(ROOT, 'skills'))):
+            if os.path.isdir(os.path.join(ROOT, 'skills', name)):
+                with self.subTest(skill=name):
+                    self.assertIn('`%s`' % name, table)
 
     def test_section_tells_the_controller_how_to_run_the_failing_test_check(self):
         text = read('claude-md/agentic-workflow.md')
@@ -128,6 +154,25 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('nothing the spec requires was cut', body)
         self.assertNotIn('## Code conventions', body)
         self.assertNotIn("doesn't require, as a separate list", body)
+
+    def test_implementers_keep_conventions_in_the_report_on_a_wave_task(self):
+        for name in ('implementer', 'implementer-copy', 'implementer-escalated'):
+            _, body = frontmatter(read(os.path.join('agents', name + '.md')))
+            for must in ('**Wave:**', 'Conventions:', "don't edit"):
+                with self.subTest(agent=name, must=must):
+                    self.assertIn(must, body)
+
+    def test_task_reviewer_reviews_wave_tasks_and_merged_waves(self):
+        _, body = frontmatter(read('agents/task-reviewer.md'))
+        for must in ('**Wave:**', 'Conventions:', 'merged wave', 'duplicate', 'fit together'):
+            with self.subTest(must=must):
+                self.assertIn(must, body)
+
+    def test_plan_reviewer_checks_each_wave(self):
+        _, body = frontmatter(read('agents/plan-reviewer.md'))
+        for must in ('**Wave:**', 'same part', 'sibling', 'at most 3'):
+            with self.subTest(must=must):
+                self.assertIn(must, body)
 
     def test_section_holds_the_rules_and_monitoring_contract(self):
         text = read('claude-md/agentic-workflow.md')
