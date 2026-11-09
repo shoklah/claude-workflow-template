@@ -170,6 +170,9 @@ class Report(unittest.TestCase):
     def json(self, *args):
         return json.loads(self.run_report('--json', *args))
 
+    def kinds(self, *args):
+        return [w['kind'] for w in self.json(*args)['totals']['health']['warnings']]
+
     def html(self):
         page = os.path.join(self.root, 'page.html')
         self.run_report('--html', page)
@@ -467,6 +470,20 @@ class Report(unittest.TestCase):
         self.records([run_record(schema=2, steps=steps)])
         self.assertIn('path=full', self.run_report())
 
+    def test_schema_4_steps_carry_the_agent_id(self):
+        out = self.run_report('--schema')
+        schema = json.loads(out)
+        self.assertEqual(schema['schema'], 'int, record format: 4; a record without it is 1')
+        self.assertIn('"agent_id"', schema['steps'])
+        self.assertIn('every kind but simplify', schema['steps'])
+
+    def test_a_step_agent_id_is_read_as_a_string_or_null(self):
+        steps = [{'step': 'final_review', 'agent_id': 'abc123', 'counts': {}, 'findings': []},
+                 {'step': 'task_review', 'agent_id': 7, 'counts': {}, 'findings': []},
+                 {'step': 'simplify', 'counts': {}, 'findings': []}]
+        self.records([run_record(schema=4, steps=steps)])
+        self.assertEqual([s['agent_id'] for s in self.json()['runs'][0]['steps']], ['abc123', None, None])
+
     def test_schema_lists_simplify_ran_and_fix_growth(self):
         schema = json.loads(self.run_report('--schema'))
         for name in ('"ran"', '"agents"', '"inline"', '"no"'):
@@ -492,6 +509,7 @@ class Report(unittest.TestCase):
         self.assertLessEqual(len(brief), 3)
         # the one more is this run's own "no session transcript found"; last week's run is not counted
         self.assertEqual(brief[2], 'WARN: simplify did not run on feature/skipped (2026-11-05) (+1 more, run --health)')
+        self.assertEqual(self.kinds('--since', '2026-11-02'), ['simplify_not_run', 'no_transcript'])
         self.assertNotIn('Consultations with no note', '\n'.join(brief))
         self.assertIn('missing=1', section(self.run_report(), 'Advisor notes:')[0])
 
@@ -696,13 +714,15 @@ class HealthCheck(Report):
         return asst('simplify-' + str(self.clock), content=[tool_use('s' + str(self.clock), 'Skill', {'skill': 'simplify'})],
                     ts=self.ts())
 
-    def agent(self, tid, error=None, **inp):
-        """An Agent dispatch and its tool_result: an error when error is given, else a launched agent's report."""
+    def agent(self, tid, error=None, agent_id=None, **inp):
+        """An Agent dispatch and its tool_result: an error when error is given, else a launched agent's report, whose
+        row carries agent_id as its toolUseResult's agentId when given."""
         result = {'type': 'tool_result', 'tool_use_id': tid, 'content': error or 'report'}
         if error:
             result['is_error'] = True
+        extra = {} if agent_id is None else {'toolUseResult': {'agentId': agent_id}}
         return [asst('m-' + tid, content=[tool_use(tid, 'Agent', dict(inp, prompt='p'))], ts=self.ts()),
-                user([result], ts=self.ts())]
+                user([result], ts=self.ts(), **extra)]
 
     def record_write(self, head, base='0000aaaa', started=None):
         fields = f'"base": "{base}", "head": "{head}"' + (f', "started": "{started}"' if started else '')
@@ -775,6 +795,24 @@ class HealthCheck(Report):
             "WARN: one (2026-11-05): agent type 'final-reviewer' not found",
             'WARN: two (2026-11-05): final review without simplify: Final review of the second run',
         ])
+        self.assertEqual(self.kinds(), ['agent_not_found', 'final_review_without_simplify'])
+
+    def test_titles_come_from_the_last_custom_title_row(self):
+        def title_row(text):
+            return {'type': 'custom-title', 'customTitle': text, 'sessionId': 's'}
+        rows = [self.startup(), title_row('First name'), self.simplify(), title_row(7), title_row('Second name')]
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                              subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        self.session(rows, project='proj')
+        self.session([title_row('Chat'), asst('x', ts='2026-11-05T11:00:00.000Z')], project='proj', sid='sess-2')
+        self.session([asst('y', ts='2026-11-05T11:00:00.000Z')], project='proj', sid='sess-3')
+        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:00Z', steps=[]),
+                      run_record(head='nowhere', branch='lost')])
+        data = self.json()
+        self.assertEqual([r['title'] for r in data['runs']], ['Second name', None])
+        self.assertEqual(sorted((os.path.basename(s['file']), s['title']) for s in data['sessions']),
+                         [('sess-2.jsonl', 'Chat'), ('sess-3.jsonl', None)])
 
     def test_a_run_ends_where_its_head_is_written_not_where_it_is_the_next_base(self):
         # run two's session sorts first, and its record names run one's head as its base
@@ -897,6 +935,7 @@ class HealthCheck(Report):
         self.records([run_record(head='c0ffee01', simplify={'ran': 'inline', 'applied': 1, 'skipped': 0})])
         self.assertEqual(self.health(), [
             'WARN: b (2026-11-05): record says simplify ran (inline) but the transcript has no simplify call'])
+        self.assertEqual(self.kinds(), ['simplify_record_differs'])
 
     def test_record_says_no_but_transcript_has_simplify(self):
         self.session([self.startup(), self.simplify(), self.record_write('c0ffee01')], project='proj')
@@ -928,6 +967,7 @@ class HealthCheck(Report):
         self.records([run_record(head='c0ffee01', simplify=NO_RAN_KEY)])
         self.assertEqual(self.health(), [
             'WARN: b (2026-11-05): model-less general-purpose dispatch launched: Explore the code'])
+        self.assertEqual(self.kinds(), ['model_less_dispatch'])
 
     def test_sdd_template_descriptions_count_as_named_roles(self):
         launched = ['Implement Task 2: x', 'Review Task 2 (spec + quality)', 'Re-review Task 2 fix round 1',
@@ -947,6 +987,7 @@ class HealthCheck(Report):
         self.records([run_record(head='c0ffee01', simplify=NO_RAN_KEY)])
         self.assertEqual(sorted(self.health()),
                          sorted(f'WARN: b (2026-11-05): named role by general-purpose: {d}' for d in launched))
+        self.assertEqual(self.kinds(), ['named_role_by_general_purpose'] * len(launched))
 
     def test_run_with_no_record_write_warns(self):
         self.records([run_record(head='c0ffee01')])
@@ -1021,6 +1062,7 @@ class HealthCheck(Report):
             "WARN: b (2026-11-05): record's final_findings critical=0 important=2 minor=0 unneeded=0 differ from the "
             "final review's critical=0 important=0 minor=1 unneeded=1",
             'WARN: b (2026-11-05): named role by general-purpose: Fix-check final review findings'])
+        self.assertEqual(self.kinds(), ['final_findings_differ', 'named_role_by_general_purpose'])
 
     def test_not_proportionate_verdicts_are_counted_not_flagged(self):
         rows = [self.startup(), self.simplify()]
@@ -1069,6 +1111,7 @@ class HealthCheck(Report):
         ])
         self.assertEqual(self.health(), [
             'WARN: elsewhere (2026-11-05): final review asked for a ## Code conventions entry but the branch added none'])
+        self.assertEqual(self.kinds(), ['conventions_not_added'])
 
     def test_fix_growth_mismatch_is_flagged(self):
         repo, change = self.repo()
@@ -1094,6 +1137,7 @@ class HealthCheck(Report):
             (run_record(branch='small', base=second, head=third, fix_growth=dict(growth, fix_added=15)), report),
         ])
         self.assertEqual(self.health(), ["WARN: off (2026-11-05): record's fix_added 10 differs from git's 40"])
+        self.assertEqual(self.kinds(), ['fix_added_differs'])
 
     def test_unusable_git_is_skipped_without_warn(self):
         # the default project /p is not there; the second project is a folder but not a repo
@@ -1124,6 +1168,7 @@ class HealthCheck(Report):
         self.assertEqual(self.health(), [
             'WARN: session sess-1.jsonl ran workflow agents but wrote no run record',
             'WARN: session sess-2.jsonl ran workflow agents but wrote no run record'])
+        self.assertEqual(self.kinds(), ['unrecorded_session', 'unrecorded_session'])
         self.assertEqual(self.run_report('--brief').splitlines()[2],
                          'WARN: session sess-1.jsonl ran workflow agents but wrote no run record (+1 more, run --health)')
 
@@ -1138,6 +1183,7 @@ class HealthCheck(Report):
         self.session([self.startup()] + self.agent('pr', subagent_type='plan-reviewer', description='Plan review'),
                      project='proj')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
+        self.assertEqual(self.kinds(), ['plan_review_without_simplify'])
 
     def test_a_check_that_mentions_plan_simplifier_does_not_count(self):
         rows = [self.startup()] + self.agent('ck', subagent_type='general-purpose', model='opus',
@@ -1225,11 +1271,11 @@ class HealthCheck(Report):
                 f.write('\n'.join(lines + ['---', 'Body.']) + '\n')
         return folder
 
-    def schema2_run(self, steps, dispatch_rows, loads=('subagent-driven-development',), **over):
+    def schema2_run(self, steps, dispatch_rows, loads=('subagent-driven-development',), schema=2, **over):
         rows = [self.startup()] + [self.loaded(name) for name in loads] + [self.simplify()] + dispatch_rows
         rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
         self.session(rows, project='proj')
-        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:00Z', steps=steps, **over)])
+        self.records([run_record(head='c0ffee01', schema=schema, started='2026-11-05T10:00:00Z', steps=steps, **over)])
 
     def test_steps_match_launched_agents_and_count_lines(self):
         final = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
@@ -1247,7 +1293,99 @@ class HealthCheck(Report):
                          final_findings={'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0})
         self.assertEqual(self.health('--agents', self.pins()), ['Health: no problems'])
 
-    def test_a_missing_step_a_count_mismatch_and_a_missing_line_are_warned(self):
+    def test_dispatches_carry_their_id_start_and_end(self):
+        reviewed = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                                 subagent_type='final-reviewer', description='Final review')
+        launched = self.agent('gp', agent_id='abc123', subagent_type='general-purpose', model='opus', description='x')
+        odd = self.agent('gq', subagent_type='general-purpose', model='opus', description='y')
+        odd[1]['toolUseResult'] = 'not a dict'
+        self.schema2_run([SIMPLIFY_STEP], reviewed + launched + odd)
+        with open(os.path.join(self.projects, 'proj', 'sess-1', 'subagents', 'agent-fr.jsonl')) as f:
+            sub_rows = [json.loads(line) for line in f]
+        dispatches = self.json()['runs'][0]['dispatches']
+        self.assertEqual([(d['id'], d['time'], d['end']) for d in dispatches], [
+            ('fr', reviewed[-2]['timestamp'], sub_rows[-1]['timestamp']),
+            ('abc123', launched[0]['timestamp'], None),
+            (None, odd[0]['timestamp'], None)])
+
+    def test_steps_tie_to_dispatches_by_agent_id_or_when_alone(self):
+        def step(kind, agent_id=None, **more):
+            return dict({'step': kind, 'agent_id': agent_id, 'counts': {}, 'findings': []}, **more)
+        rows = self.reviewed('tr1', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer', description='Review Task 1')
+        rows += self.reviewed('tr2', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer', description='Review Task 2')
+        rows += self.reviewed('fc', 'Verdicts: fixed=0 not_proportionate=0 open=0', subagent_type='fix-checker', description='Fix-check Task 1')
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', subagent_type='final-reviewer', description='Final review')
+        steps = [step('task_review', 'tr2', task=2, round=0), step('task_review', 'tr1', task=1, round=0),
+                 step('fix_check', task=1, round=1), step('final_review', 'nope'), SIMPLIFY_STEP]
+        call = self.simplify()
+        session = [self.startup(), self.loaded('subagent-driven-development'), call, self.loaded('simplify')] + rows
+        session.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        self.session(session, project='proj')
+        self.records([run_record(head='c0ffee01', schema=4, started='2026-11-05T10:00:00Z', steps=steps),
+                      run_record(head='nowhere', branch='lost', schema=4, steps=[step('final_review', 'x')])])
+        run, lost = self.json()['runs']
+        self.assertEqual([(s['time'], s['end']) for s in lost['steps']], [(None, None)])
+        by_id = {d['id']: d for d in run['dispatches']}
+        self.assertEqual([d['step'] for d in run['dispatches']], [1, 0, 2, None])
+        self.assertEqual([s['time'] for s in run['steps']],
+                         [by_id['tr2']['time'], by_id['tr1']['time'], by_id['fc']['time'], None, call['timestamp']])
+        self.assertEqual([s['end'] for s in run['steps']][:3], [by_id['tr2']['end'], by_id['tr1']['end'], by_id['fc']['end']])
+        self.assertEqual([s['step'] for s in run['skills'] if s['name'] == 'simplify'], [4])
+        self.assertTrue(all(s['step'] is None for s in run['skills'] if s['name'] != 'simplify'))
+
+    def test_a_schema_2_run_ties_its_single_final_review_but_not_two_task_reviews(self):
+        final = FINAL_STEP
+        task = {'step': 'task_review', 'task': 1, 'round': 0, 'counts': {'critical': 0, 'important': 0, 'minor': 0}, 'findings': []}
+        rows = self.reviewed('t1', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer', description='Review Task 1')
+        rows += self.reviewed('t2', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer', description='Review Task 2')
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', subagent_type='final-reviewer', description='Final review')
+        self.schema2_run([SIMPLIFY_STEP, task, dict(task, task=2), final], rows)
+        run = self.json()['runs'][0]
+        self.assertEqual([d['step'] for d in run['dispatches']], [None, None, 3])
+        self.assertEqual([s['time'] is None for s in run['steps']], [False, True, True, False])
+        self.assertEqual([s['agent_id'] for s in run['steps']], [None] * 4)
+
+    def test_schema_4_steps_are_compared_by_agent_id_not_by_order(self):
+        counts_a = {'critical': 0, 'important': 1, 'minor': 0}
+        counts_b = {'critical': 0, 'important': 0, 'minor': 2}
+        rows = self.reviewed('ta', 'Findings: critical=0 important=1 minor=0', subagent_type='task-reviewer', description='Review Task 1')
+        rows += self.reviewed('tb', 'Findings: critical=0 important=0 minor=2', subagent_type='task-reviewer', description='Review Task 2')
+        finding = lambda sev: {'id': 'F', 'severity': sev, 'summary': 's', 'outcome': 'deferred'}
+        steps = [{'step': 'task_review', 'task': 2, 'round': 0, 'agent_id': 'tb', 'counts': counts_b, 'findings': [finding('minor')] * 2},
+                 {'step': 'task_review', 'task': 1, 'round': 0, 'agent_id': 'ta', 'counts': counts_a, 'findings': [finding('important')]},
+                 SIMPLIFY_STEP]
+        self.schema2_run(steps, rows, schema=4)
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_missing_unknown_mismatched_or_shared_agent_id_is_warned_and_ties_nothing(self):
+        rows = self.reviewed('tr', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer', description='Review Task 1')
+        rows += self.reviewed('fc', 'Verdicts: fixed=0 not_proportionate=0 open=0', subagent_type='fix-checker', description='Fix-check Task 1')
+        rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', subagent_type='final-reviewer', description='Final review')
+        counts = {'critical': 0, 'important': 0, 'minor': 0}
+        steps = [{'step': 'task_review', 'task': 1, 'round': 0, 'counts': counts, 'findings': []},
+                 {'step': 'fix_check', 'task': 1, 'round': 1, 'agent_id': 'tr', 'counts': {'fixed': 0, 'not_proportionate': 0, 'open': 0}},
+                 dict(FINAL_STEP, agent_id='nope'),
+                 {'step': 'final_fix_check', 'agent_id': 'fc', 'counts': {'fixed': 0, 'not_proportionate': 0, 'open': 0}},
+                 {'step': 'final_fix_check', 'agent_id': 'fc', 'counts': {'fixed': 0, 'not_proportionate': 0, 'open': 0}},
+                 SIMPLIFY_STEP]
+        self.schema2_run(steps, rows, schema=4)
+        prefix = 'WARN: b (2026-11-05): '
+        lines = self.health()
+        self.assertIn(prefix + 'record has 2 final_fix_check steps, transcript launched 0', lines)
+        self.assertIn(prefix + 'task_review step 1 has no agent id', lines)
+        self.assertIn(prefix + "fix_check step 1's agent id tr belongs to a task_review dispatch", lines)
+        self.assertIn(prefix + "final_review step 1's agent id nope matches no launched dispatch", lines)
+        self.assertIn(prefix + 'final_fix_check step 1 and final_fix_check step 2 share agent id fc', lines)
+        run = self.json()['runs'][0]
+        # The task review has no id, so the JSON still ties it one-and-one; the health check warned instead of comparing.
+        self.assertEqual([d['step'] for d in run['dispatches']], [0, None, None])
+        kinds = {w['kind']: w for w in run['warnings']}
+        self.assertEqual(kinds['step_agent_mismatch']['step'], {'step': 'fix_check', 'task': 1, 'round': 1, 'wave': None})
+        self.assertEqual(kinds['step_agent_mismatch']['agent'], 'task-reviewer')
+
+    def mismatched_run(self, loads=('subagent-driven-development',)):
+        """A plan simplify with no Findings: line, a task review whose counts differ, a fix-check with no Verdicts:
+        line and a launched final review with no step."""
         simplify = SIMPLIFY_STEP
         plan = {'step': 'plan_simplify', 'counts': {'cuts': 0, 'flags': 0}, 'findings': []}
         task = {'step': 'task_review', 'task': 1, 'round': 0, 'counts': {'critical': 0, 'important': 1, 'minor': 0},
@@ -1261,7 +1399,10 @@ class HealthCheck(Report):
         # no final_review step for this launched final review
         rows += self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
                               subagent_type='final-reviewer', description='Final review')
-        self.schema2_run([simplify, plan, task, fix], rows)
+        self.schema2_run([simplify, plan, task, fix], rows, loads=loads)
+
+    def test_a_missing_step_a_count_mismatch_and_a_missing_line_are_warned(self):
+        self.mismatched_run()
         prefix = 'WARN: b (2026-11-05): '
         self.assertEqual(self.health(), [prefix + line for line in (
             'plan simplify report has no Findings: line: Plan simplify',
@@ -1290,6 +1431,42 @@ class HealthCheck(Report):
             "simplify step 1 findings don't add up to its counts",
         )])
         self.assertIn('path=full', self.run_report())
+
+    def warned_run_and_session(self):
+        """mismatched_run with no skill loaded, and a second session with no startup row."""
+        self.mismatched_run(loads=())
+        self.session([asst('x', ts='2026-11-05T11:00:00.000Z')], project='proj', sid='sess-2')
+
+    def test_warnings_mirror_warns_in_every_list(self):
+        self.warned_run_and_session()
+        data = self.json()
+        run, session, health = data['runs'][0], data['sessions'][0], data['totals']['health']
+        for unit in (run, session, health):
+            self.assertEqual([w['text'] for w in unit['warnings']], unit['warns'])
+            self.assertTrue(all(isinstance(w['kind'], str) and w['kind'] for w in unit['warnings']))
+        self.assertTrue(run['warnings'])
+        self.assertTrue(all(w['run'] == {'date': '2026-11-05T12:00:00Z', 'project': '/p', 'branch': 'b'}
+                            and w['session'] is None for w in run['warnings']))
+        self.assertEqual([w['kind'] for w in session['warnings']], ['startup_missing'])
+        self.assertEqual(session['warnings'][0]['session'], session['file'])
+        self.assertIsNone(session['warnings'][0]['run'])
+        self.assertEqual(sorted(health['warnings'][0]), ['agent', 'kind', 'run', 'session', 'skill', 'step', 'text'])
+        self.assertEqual(len(health['warnings']), len(run['warnings']) + len(session['warnings']))
+
+    def test_warning_kinds_name_their_step_skill_and_agent(self):
+        self.warned_run_and_session()
+        by_kind = {}
+        for w in self.json()['runs'][0]['warnings']:
+            by_kind.setdefault(w['kind'], w)
+        self.assertEqual(by_kind['step_counts_differ']['step'],
+                         {'step': 'task_review', 'task': 1, 'round': 0, 'wave': None})
+        missing = by_kind['count_line_missing']
+        self.assertEqual((missing['step']['step'], missing['agent']), ('plan_simplify', 'plan-simplifier'))
+        self.assertEqual(by_kind['step_count_differs']['step'],
+                         {'step': 'final_review', 'task': None, 'round': None, 'wave': None})
+        required = by_kind['required_skill_missing']
+        self.assertEqual((required['skill'], required['step'], required['agent']),
+                         ('subagent-driven-development', None, None))
 
     def test_a_schema_1_fix_check_without_verdicts_is_not_warned(self):
         rows = [self.startup(), self.simplify()]
@@ -1328,6 +1505,7 @@ class HealthCheck(Report):
             "simplify step 1 findings don't add up to its counts",
             "fix-check verdicts in findings don't add up to the fix-check steps' counts",
         )])
+        self.assertEqual(self.kinds(), ['findings_dont_add_up'] * 4 + ['verdicts_dont_add_up'])
 
     def test_an_agent_off_its_pin_is_warned_unless_the_stage_allows_it(self):
         prefix = 'WARN: b (2026-11-05): '
@@ -1352,10 +1530,13 @@ class HealthCheck(Report):
                                                sub_model=model, sub_effort=effort, subagent_type='final-reviewer',
                                                description='Final review', **inp), **over)
                 self.assertEqual(self.health('--agents', self.pins()), expected)
+                self.assertEqual(self.kinds('--agents', self.pins()),
+                                 ['agent_off_pin'] if expected[0].startswith('WARN') else [])
 
     def test_a_risk_area_small_run_is_warned(self):
         self.final_run(path='small', risk_area=True)
         self.assertEqual(self.health(), ['WARN: b (2026-11-05): risk area on the Small path'])
+        self.assertEqual(self.kinds(), ['risk_area_small_path'])
 
     def wave_run(self, waves, with_check=True):
         """A clean Full run reviewing tasks 3 and 4 and, unless with_check is false, checking wave A, recording waves."""
@@ -1378,6 +1559,7 @@ class HealthCheck(Report):
     def test_a_wave_without_its_check_is_warned(self):
         self.wave_run([{'wave': 'A', 'tasks': [3, 4], 'conflicts': 0}], with_check=False)
         self.assertEqual(self.health(), ['WARN: b (2026-11-05): wave A has no wave check step'])
+        self.assertEqual(self.kinds(), ['wave_unchecked'])
 
     def test_malformed_waves_entries_are_dropped_or_read_as_absent(self):
         self.wave_run(['not a dict', {'tasks': [3]}, {'wave': 'B', 'tasks': 'x', 'conflicts': 'y'}], with_check=False)
@@ -1438,6 +1620,8 @@ class HealthCheck(Report):
                 self.subagent('final-reviewer', rows, project='proj', aid='fr', tid='fr')
                 self.final_run(loads=('subagent-driven-development',))
                 self.assertEqual(self.health('--agents', self.pins(skills=True)), expected)
+                self.assertEqual(self.kinds('--agents', self.pins(skills=True)),
+                                 ['agent_skill_missing'] if expected[0].startswith('WARN') else [])
 
     def test_typed_grill_me_without_the_skill_is_warned_and_with_it_is_clean(self):
         warned = ["WARN: session sess-1.jsonl: typed 'grill-me' but grill-me never loaded"]
@@ -1449,6 +1633,7 @@ class HealthCheck(Report):
                 rows = [self.startup(), self.loaded('grill-me'), user('Grill me on this design', ts=self.ts())]
                 self.session(rows + [self.loaded(name) for name in later], project='proj')
                 self.assertEqual(self.health(), expected)
+                self.assertEqual(self.kinds(), ['typed_skill_not_loaded'] if expected == warned else [])
 
     def test_a_session_with_no_run_and_no_startup_guidelines_is_warned(self):
         rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
@@ -1540,8 +1725,10 @@ class HealthCheck(Report):
                 warns = [line for line in self.health() if 'offer' in line]
                 if schema == 3:
                     self.assertIn('WARN: b (2026-11-05): no grill-me offer recorded', warns)
+                    self.assertIn('offer_not_recorded', self.kinds())
                 else:
                     self.assertEqual(warns, [])
+                    self.assertNotIn('offer_not_recorded', self.kinds())
 
     def test_json_keeps_old_and_new_records_and_fills_what_each_has(self):
         old = run_record(branch='old', head='dead0001',
@@ -1603,6 +1790,10 @@ class HealthCheck(Report):
                           'actual': {'claude-opus-5-5/-': 1}, 'differs': 0})
         self.assertEqual(data['totals']['health'],
                          {'warns': ['WARN: old (2026-11-05): no session transcript found'],
+                          'warnings': [{'text': 'WARN: old (2026-11-05): no session transcript found',
+                                        'kind': 'no_transcript',
+                                        'run': {'date': '2026-11-05T12:00:00Z', 'project': '/p', 'branch': 'old'},
+                                        'session': None, 'step': None, 'skill': None, 'agent': None}],
                           'info': ['Git evidence unavailable for 2 runs']})
 
     def test_json_prices_date_suffixed_ids_and_leaves_unknown_models_unpriced(self):
@@ -1610,13 +1801,17 @@ class HealthCheck(Report):
                       asst('u', model='claude-unknown-1', ts=self.ts())], project='proj')
         data = self.json()
         self.assertEqual(data['runs'], [])
+        file = os.path.join(self.projects, 'proj', 'sess-1.jsonl')
         self.assertEqual(data['sessions'], [{
-            'file': os.path.join(self.projects, 'proj', 'sess-1.jsonl'), 'skills': [], 'typed': [],
+            'file': file, 'skills': [], 'typed': [],
             'models': {'claude-haiku-4-5-20251001': {'input': 1000000, 'output': 0, 'cache_read': 0, 'cache_write': 0,
                                                      'cost': 1.0},
                        'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0,
                                             'cost': None}},
-            'efforts': {}, 'startup': False, 'warns': ['WARN: session sess-1.jsonl: startup guidelines missing']}])
+            'efforts': {}, 'startup': False, 'warns': ['WARN: session sess-1.jsonl: startup guidelines missing'],
+            'warnings': [{'text': 'WARN: session sess-1.jsonl: startup guidelines missing', 'kind': 'startup_missing',
+                          'run': None, 'session': file, 'step': None, 'skill': None, 'agent': None}],
+            'title': None}])
         self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
 
     def test_json_weeks_rows(self):
@@ -1675,12 +1870,14 @@ class HealthCheck(Report):
         data = self.json()
         plan, full = data['runs']
         self.assertEqual(plan['skills'], [
-            {'name': 'brainstorming', 'time': brainstorming['timestamp'], 'outcome': '/r/docs/superpowers/specs/x.md'},
-            {'name': 'writing-plans', 'time': writing_plans['timestamp'], 'outcome': None}])
+            {'name': 'brainstorming', 'time': brainstorming['timestamp'], 'outcome': '/r/docs/superpowers/specs/x.md',
+             'step': None},
+            {'name': 'writing-plans', 'time': writing_plans['timestamp'], 'outcome': None, 'step': None}])
         self.assertEqual(full['skills'], [
-            {'name': 'subagent-driven-development', 'time': sdd['timestamp'], 'outcome': True},
-            {'name': 'test-driven-development', 'time': tdd['timestamp'], 'outcome': [{'task': 1, 'result': 'passed'}]},
-            {'name': 'simplify', 'time': simplify['timestamp'], 'outcome': {'applied': 2, 'skipped': 1}}])
+            {'name': 'subagent-driven-development', 'time': sdd['timestamp'], 'outcome': True, 'step': None},
+            {'name': 'test-driven-development', 'time': tdd['timestamp'], 'outcome': [{'task': 1, 'result': 'passed'}],
+             'step': None},
+            {'name': 'simplify', 'time': simplify['timestamp'], 'outcome': {'applied': 2, 'skipped': 1}, 'step': None}])
         skills = data['totals']['skills']
         self.assertEqual(skills['brainstorming'],
                          {'runs': 1, 'last': brainstorming['timestamp'], 'outcomes': {'spec': 1}, 'missing': 0})

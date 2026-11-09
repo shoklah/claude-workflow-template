@@ -85,7 +85,7 @@ class AgentFiles(unittest.TestCase):
                      'workflow-report.py --schema', 'Advisor: ', '**Failing-test check:** exempt:',
                      '/advisor fable', '/advisor off', 'workflow-archive', 'Started:', '"plan"', 'F1',
                      '**Wave:**', '/usr/bin/python3 -I ~/.claude/scripts/wave.py', '**Offers:**', 'grill-me',
-                     'offers'):
+                     'offers', 'agent_id'):
             with self.subTest(must=must):
                 self.assertIn(must, text)
 

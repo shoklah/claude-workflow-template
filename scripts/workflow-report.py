@@ -18,16 +18,19 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               since the previous plan review, for this week's typed triggers whose skill never loaded, and for
               this week's sessions outside every run with no startup guidelines, or "Health: no problems"; for
               schema 2 runs it also checks the steps against the launched agents, their count lines, the agents'
-              pinned model, effort and skills, and the skills the run's path requires, and for schema 3 plan runs
-              a required offer with no entry; then information lines: the "fixed, not proportionate" counts,
-              archives missing or with another Started: time, and the runs whose git evidence is unavailable
+              pinned model, effort and skills, and the skills the run's path requires, for schema 3 plan runs a
+              required offer with no entry, and for schema 4 records each step's agent id against the launched
+              dispatches; then information lines: the "fixed, not proportionate" counts, archives missing or with
+              another Started: time, and the runs whose git evidence is unavailable
   --schema    print the run record schema and exit
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
               bumps it), "generated", "since", "now", "runs" (each record in range as written, its window and what
               the window shows: dispatches, skills, refusals, models, tokens and cost, advisor, its WARN and
               information lines, later fix commits), "sessions" (main sessions in range with no run window) and
-              "totals" (scoreboard, weeks, run_time, skills, models, advisor, offers, health). It holds personal
-              data: print it, never write it into a repo
+              "totals" (scoreboard, weeks, run_time, skills, models, advisor, offers, health); each WARN also as an
+              object with its kind, run or session, step, skill and agent, each session's title, and each step's
+              agent id, time and end with the dispatch and skill load tied to it. It holds personal data: print it,
+              never write it into a repo
   --html      write the same data as one self-contained HTML page, with no script and nothing loaded from outside,
               to FILE (default ~/.claude/workflow-dashboard.html), and print "Wrote FILE". It holds personal data:
               never write it into a repo
@@ -56,7 +59,7 @@ REQUIRED_OFFERS = ('grill-me',)
 STEP_KINDS = ('plan_simplify', 'plan_review', 'task_review', 'fix_check', 'simplify', 'final_review', 'final_fix_check')
 
 SCHEMA = {
-    'schema': 'int, record format: 3; a record without it is 1',
+    'schema': 'int, record format: 4; a record without it is 1',
     'date': 'ISO 8601 time the run finished',
     'started': 'ISO 8601 time the session named the run\'s path and stage, in its first message',
     'project': 'absolute path of the project',
@@ -86,10 +89,12 @@ SCHEMA = {
     'steps': 'list of the steps that ran, in order: {"step": ' + '|'.join(f'"{k}"' for k in STEP_KINDS)
              + ', "task": N, "wave": "A" in place of "task" on the wave check (a task_review) and on the wave\'s '
              'fix_check steps, "round": N (0 is the first review, fix-checks are 1 to 3), "agent", "model", "effort" '
-             '(as dispatched; agent "simplify" for the skill), "counts": {keys of the step\'s count line: reviews '
-             'critical, important, minor, plus unneeded for the final review; plan_simplify cuts, flags; plan_review '
-             'findings; fix-checks fixed, not_proportionate, open; simplify applied, skipped}, "findings" (every step '
-             'but fix-checks): [{"id": "F7", "severity" (or "kind": "cut"|"flag" for plan_simplify), "summary", '
+             '(as dispatched; agent "simplify" for the skill), "agent_id": the agentId the Agent tool returned for the '
+             'step\'s dispatch, which names its subagent transcript (every kind but simplify; schema 4), "counts": '
+             '{keys of the step\'s count line: reviews critical, important, minor, plus unneeded for the final review; '
+             'plan_simplify cuts, flags; plan_review findings; fix-checks fixed, not_proportionate, open; simplify '
+             'applied, skipped}, "findings" (every step but fix-checks): [{"id": "F7", "severity" (or "kind": '
+             '"cut"|"flag" for plan_simplify), "summary", '
              '"outcome": ' + '|'.join(f'"{o}"' for o in OUTCOMES)
              + ', "reason" (required for declined and ruled), "closed_round": N, "verdicts": the fix-checker verdicts '
              'in order}]}',
@@ -174,10 +179,11 @@ NOT_FOUND = re.compile(r"Agent type '([^']*)' not found")
 STARTUP_TAG = b'<karpathy-guidelines-session-start>'
 RUN_LOG = 'workflow-log.jsonl'
 # Only lines matching this can hold a dispatch, a simplify call, a record write, the startup block, an error, a skill
-# load, a typed trigger or a spec or plan write. A typed command shows as <command-name>/name</command-name>.
+# load, a typed trigger, a spec or plan write or a session title. A typed command shows as
+# <command-name>/name</command-name>.
 HEALTH_NEEDLES = (b'"Agent"', b'simplify', b'workflow-log.jsonl', b'karpathy-guidelines-session-start',
                   b'"is_error":true', b'"is_error": true', b'Base directory for this skill', b'rill me',
-                  b'command-name', b'docs/superpowers/')
+                  b'command-name', b'docs/superpowers/', b'"custom-title"')
 SKILL_LOADED = 'Base directory for this skill: '
 SPECS_AND_PLANS = {'spec': 'docs/superpowers/specs/', 'plan': 'docs/superpowers/plans/'}
 
@@ -312,6 +318,7 @@ class Transcripts:
         self.typed = 0
         self.ask_user = 0
         self.wrap_up_ask = 0
+        self.last = None  # the greatest timestamp of the rows read, the since/now filter aside
 
     def read_file(self, path, role, stats):
         if self.since is not None:
@@ -330,6 +337,8 @@ class Transcripts:
         for row in read_jsonl(path, stats):
             if isinstance(row.get('origin'), dict):
                 has_origin = True
+            if isinstance(row.get('timestamp'), str) and (self.last is None or row['timestamp'] > self.last):
+                self.last = row['timestamp']
             t = parse_time(row.get('timestamp'))
             if t is not None and (self.since is not None and t < self.since or self.now is not None and t > self.now):
                 continue
@@ -536,6 +545,7 @@ def read_steps(rec):
                       'wave': field(step, 'wave', str, None),
                       'round': field(step, 'round', int, None), 'agent': field(step, 'agent', str, None),
                       'model': field(step, 'model', str, None), 'effort': field(step, 'effort', str, None),
+                      'agent_id': field(step, 'agent_id', str, None),
                       'counts': {k: num(v) for k, v in field(step, 'counts', dict, {}).items()},
                       'findings': findings})
     return steps
@@ -705,14 +715,16 @@ def user_texts(content):
 
 
 def launched_ids(row, ids):
-    """The ids, among ids, that this row reports as launched: their tool_result is not an error.
+    """(id, agent id) for the ids, among ids, that this row reports as launched: their tool_result is not an error.
+    The agent id is the row's toolUseResult agentId, or None.
 
     Only is_error decides this, never the result's text, which may be a review that says "not found" or "denied".
     """
     content = row.get('message', {}).get('content')
     if row.get('type') != 'user' or not isinstance(content, list):
         return []
-    return [block['tool_use_id'] for block in content
+    agent_id = field(row, 'toolUseResult', dict, {}).get('agentId')
+    return [(block['tool_use_id'], agent_id if isinstance(agent_id, str) else None) for block in content
             if block.get('type') == 'tool_result' and block.get('tool_use_id') in ids and block.get('is_error') is not True]
 
 
@@ -725,16 +737,16 @@ def result_text(block):
 
 @functools.lru_cache(maxsize=None)
 def transcript_events(path):
-    """Read a transcript once and return (events, launched ids, has the startup block).
+    """Read a transcript once and return (events, {launched id: its agent id or None}, has the startup block).
 
     Events are (timestamp, kind, value) in file order: ('simplify', None), ('agent', (id, input)), ('not_found',
     agent type), ('refused', GUARD_REASONS key), ('write', Bash command naming the run log), ('skill', name) for a
     skill's load, the row that follows a Skill call, a typed command or an agent's start with its preloaded skills,
-    ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, and ('wrote', path) for a Write or Edit of a
-    spec or plan. A row with no timestamp takes the previous row's.
+    ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('wrote', path) for a Write or Edit of a
+    spec or plan, and ('title', text) for a custom-title row. A row with no timestamp takes the previous row's.
     Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of dispatches still waiting for one.
     """
-    events, launched, startup, timestamp = [], set(), False, ''
+    events, launched, startup, timestamp = [], {}, False, ''
     pending = {}  # tool_use id -> its bytes, for Agent dispatches with no result yet
     try:
         f = open(path, 'rb')
@@ -751,6 +763,8 @@ def transcript_events(path):
                 kind, content = row.get('type'), row.get('message', {}).get('content')
                 # Prompts and briefs can quote the tag; only the hook's attachment row shows the block was injected.
                 startup = startup or (kind == 'attachment' and STARTUP_TAG in line)
+                if kind == 'custom-title' and isinstance(row.get('customTitle'), str):
+                    events.append((timestamp, 'title', row['customTitle']))
                 if row_calls_simplify(row):
                     events.append((timestamp, 'simplify', None))
                 # Only the load's own row counts, never a tool result quoting it or an attachment re-listing it.
@@ -796,6 +810,11 @@ def transcript_events(path):
             except (ValueError, AttributeError, TypeError, RecursionError):  # A torn or odd line says nothing.
                 continue
     return events, launched, startup
+
+
+def transcript_title(path):
+    """The transcript's last custom title, or None when it has none."""
+    return next((value for _, kind, value in reversed(transcript_events(path)[0]) if kind == 'title'), None)
 
 
 def main_transcripts(projects_root):
@@ -867,11 +886,12 @@ def subagent_transcripts(path):
 
 @functools.lru_cache(maxsize=None)
 def span_events(path, start, end):
-    """(events, launched ids) of the rows timed in (start, end] of the main transcript path and its subagents."""
-    launched, per_file = set(), []
+    """(events, {launched id: its agent id or None}) of the rows timed in (start, end] of the main transcript path and
+    its subagents."""
+    launched, per_file = {}, []
     for p in [path] + subagent_transcripts(path):
         events, file_launched, _ = transcript_events(p)
-        launched |= file_launched
+        launched.update(file_launched)
         per_file.append([e for e in events if (start is None or e[0] > start) and e[0] <= end])
     # Rows from several transcripts merge by timestamp, as in the dispatch hook.
     return list(heapq.merge(*per_file, key=lambda e: e[0])), launched
@@ -898,8 +918,9 @@ def review_report(subagent_path):
 
 @functools.lru_cache(maxsize=None)
 def span_reports(path, start, end):
-    """(dispatch input, subagent transcript path, report) for each dispatch launched in the span, in order; the path
-    and report are None when its subagent transcript isn't there."""
+    """(dispatch input, subagent transcript path, report, launch time, agent id) for each dispatch launched in the span,
+    in order; the path and report are None when its subagent transcript isn't there. The agent id is the launch's own,
+    else the subagent transcript's agent-<id>.jsonl name, else None."""
     events, launched = span_events(path, start, end)
     files = {}
     for p in subagent_transcripts(path):
@@ -907,22 +928,24 @@ def span_reports(path, start, end):
         if isinstance(tid, str):
             files[tid] = p
     reports = []
-    for _, kind, value in events:
+    for time, kind, value in events:
         if kind == 'agent' and value[0] in launched:
             sub = files.get(value[0])
-            reports.append((value[1], sub, review_report(sub) if sub else None))
+            name = os.path.basename(sub) if sub else ''
+            agent_id = launched[value[0]] or (name[len('agent-'):-len('.jsonl')] if name.startswith('agent-') else None)
+            reports.append((value[1], sub, review_report(sub) if sub else None, time, agent_id))
     return reports
 
 
 @functools.lru_cache(maxsize=None)
 def span_dispatches(path, start, end):
-    """{'inp', 'sub', 'report', 'kind'} for each dispatch launched in the span, in order: its input, subagent transcript
-    path and report as span_reports gives them, and its step kind."""
+    """{'inp', 'sub', 'report', 'time', 'id', 'kind'} for each dispatch launched in the span, in order: its input,
+    subagent transcript path, report, launch time and agent id as span_reports gives them, and its step kind."""
     dispatches, after_final = [], False
-    for inp, sub, report in span_reports(path, start, end):
+    for inp, sub, report, time, agent_id in span_reports(path, start, end):
         kind = step_kind(inp, after_final)
         after_final = after_final or kind == 'final_review'
-        dispatches.append({'inp': inp, 'sub': sub, 'report': report, 'kind': kind})
+        dispatches.append({'inp': inp, 'sub': sub, 'report': report, 'time': time, 'id': agent_id, 'kind': kind})
     return dispatches
 
 
@@ -952,6 +975,54 @@ def step_kind(tool_input, after_final):
     if tool_input.get('subagent_type') == 'fix-checker':
         return 'final_fix_check' if after_final else 'fix_check'
     return None
+
+
+def step_ties(run, dispatches):
+    """Each step's tie by agent id, in record order: ('tied', dispatch index) when no other step carries its agent_id
+    and exactly one dispatch of the step's kind has that id; else why it has none: ('missing', None) with no agent_id,
+    ('duplicate', None) when another step carries it, ('unknown', None) when no dispatch has it, and ('mismatch', the
+    index of a dispatch with the id, of another kind where there is one)."""
+    ids = [s['agent_id'] for s in run['steps']]
+    ties = []
+    for step in run['steps']:
+        agent_id = step['agent_id']
+        with_id = [] if agent_id is None else [j for j, d in enumerate(dispatches) if d['id'] == agent_id]
+        of_kind = [j for j in with_id if dispatches[j]['kind'] == step['step']]
+        if agent_id is None:
+            ties.append(('missing', None))
+        elif ids.count(agent_id) > 1:
+            ties.append(('duplicate', None))
+        elif len(of_kind) == 1:
+            ties.append(('tied', of_kind[0]))
+        elif not with_id:
+            ties.append(('unknown', None))
+        else:
+            ties.append(('mismatch', next((j for j in with_id if j not in of_kind), with_id[0])))
+    return ties
+
+
+def ties_by_id(run, dispatches):
+    """Step index to dispatch index, for each step step_ties ties."""
+    return {i: j for i, (reason, j) in enumerate(step_ties(run, dispatches)) if reason == 'tied'}
+
+
+def dispatch_steps(run, dispatches):
+    """The step each dispatch's warnings name, by dispatch index: the record step ties_by_id ties it to, else its kind
+    alone, else None for a dispatch of no step kind."""
+    tied = {j: run['steps'][i] for i, j in ties_by_id(run, dispatches).items()}
+    return [tied.get(j) or ({'step': d['kind']} if d['kind'] else None) for j, d in enumerate(dispatches)]
+
+
+def tie_steps(run, dispatches):
+    """ties_by_id, plus each step with no agent_id whose kind has exactly one step in the record and one dispatch in
+    dispatches. A step is tied only when its dispatch is certain, never by order; simplify steps have no dispatch."""
+    ties = ties_by_id(run, dispatches)
+    kinds = [s['step'] for s in run['steps']]
+    for i, step in enumerate(run['steps']):
+        same = [j for j, d in enumerate(dispatches) if d['kind'] == step['step']]
+        if step['agent_id'] is None and kinds.count(step['step']) == 1 and len(same) == 1:
+            ties[i] = same[0]
+    return ties
 
 
 def count_line(report, name):
@@ -992,7 +1063,7 @@ def asks_for_conventions(report):
 
 def count_not_proportionate(path, start, end):
     """"fixed, not proportionate" verdicts in the span's fix-checker reports."""
-    return sum(report.lower().count(NOT_PROPORTIONATE) for inp, _, report in span_reports(path, start, end)
+    return sum(report.lower().count(NOT_PROPORTIONATE) for inp, _, report, _, _ in span_reports(path, start, end)
                if report is not None and inp.get('subagent_type') == 'fix-checker')
 
 
@@ -1083,27 +1154,86 @@ def missing_skills(run, events, dispatches, pins):
     return missing
 
 
+def problem(kind, text, step=None, skill=None, agent=None):
+    """A WARN before its prefix: its sentence, its kind and the step, skill and agent it names. step is a record step,
+    or {'step': kind} for a step kind alone, and keeps only its step, task, round and wave."""
+    if step is not None:
+        step = {k: step.get(k) for k in ('step', 'task', 'round', 'wave')}
+    return {'kind': kind, 'text': text, 'step': step, 'skill': skill, 'agent': agent}
+
+
+def run_ref(r):
+    """The date, project and branch that name a run record."""
+    return {key: field(r, key, str, None) for key in ('date', 'project', 'branch')}
+
+
+def warning(prob, run=None, session=None, label=None):
+    """A problem as a WARN: its full line, after the run's label when it has one, with the run or the session
+    transcript path it belongs to."""
+    return dict(prob, text=f"WARN: {label}: {prob['text']}" if label else f"WARN: {prob['text']}", run=run,
+                session=session)
+
+
+def texts(warnings):
+    return [w['text'] for w in warnings]
+
+
 def check_steps(run, dispatches, events, pins):
     """Problems in a schema 2 record's steps against its window's events and its span_dispatches."""
     steps = {kind: [s for s in run['steps'] if s['step'] == kind] for kind in STEP_KINDS}
     launched = {kind: [d for d in dispatches if d['kind'] == kind] for kind in STEP_KINDS}
     launched['simplify'] = [e for e in events if e[1] == 'simplify']
-    problems = [f'record has {len(steps[kind])} {kind} steps, transcript launched {len(launched[kind])}'
+    problems = [problem('step_count_differs',
+                        f'record has {len(steps[kind])} {kind} steps, transcript launched {len(launched[kind])}',
+                        step={'step': kind})
                 for kind in STEP_KINDS if len(steps[kind]) != len(launched[kind])]
-    # The n-th step of a kind is checked against the n-th launched dispatch of that kind.
+    nth = [sum(s['step'] == step['step'] for s in run['steps'][:i + 1]) for i, step in enumerate(run['steps'])]
+    tied = ties_by_id(run, dispatches)
+    if run['schema'] >= 4:
+        # Each step but simplify that step_ties leaves untied gets one WARN saying why; a shared id gets one for all the
+        # steps carrying it.
+        shared = set()
+        for i, (step, (reason, j)) in enumerate(zip(run['steps'], step_ties(run, dispatches))):
+            kind, agent_id = step['step'], step['agent_id']
+            if kind == 'simplify' or reason == 'tied' or agent_id in shared:
+                continue
+            if reason == 'missing':
+                problems.append(problem('step_agent_missing', f'{kind} step {nth[i]} has no agent id', step=step))
+            elif reason == 'duplicate':
+                shared.add(agent_id)
+                sharing = ' and '.join(f"{s['step']} step {nth[k]}" for k, s in enumerate(run['steps'])
+                                       if s['agent_id'] == agent_id)
+                problems.append(problem('step_agent_duplicate', f'{sharing} share agent id {agent_id}', step=step))
+            elif reason == 'unknown':
+                problems.append(problem('step_agent_unknown',
+                                        f"{kind} step {nth[i]}'s agent id {agent_id} matches no launched dispatch",
+                                        step=step))
+            else:
+                problems.append(problem('step_agent_mismatch', f"{kind} step {nth[i]}'s agent id {agent_id} belongs "
+                                        f"to a {dispatches[j]['kind'] or 'non-step'} dispatch", step=step,
+                                        agent=dispatches[j]['inp'].get('subagent_type')))
+    # A schema 4 step is checked against the dispatch ties_by_id gives it, an older one, the n-th step of a kind,
+    # against the n-th launched dispatch of that kind.
     for kind, (_, name, keys) in COUNT_LINES.items():
-        for n, (step, d) in enumerate(zip(steps[kind], launched[kind]), 1):
+        if run['schema'] >= 4:
+            compared = [(nth[i], step, dispatches[tied[i]]) for i, step in enumerate(run['steps'])
+                        if i in tied and step['step'] == kind]
+        else:
+            compared = [(n, step, d) for n, (step, d) in enumerate(zip(steps[kind], launched[kind]), 1)]
+        for n, step, d in compared:
             line = count_line(d['report'], name) if d['report'] is not None else None
             if line is not None and any(step['counts'].get(k, 0) != line.get(k, 0) for k in keys):
-                problems.append(f"{kind} step {n} counts {findings_text(step['counts'])} differ from its report's "
-                                f"{findings_text(line)}")
+                problems.append(problem('step_counts_differ',
+                                        f"{kind} step {n} counts {findings_text(step['counts'])} differ from its "
+                                        f"report's {findings_text(line)}", step=step))
     for kind, (count_of, keys) in ADDS_UP.items():
         for n, step in enumerate(steps[kind], 1):
             tally = dict.fromkeys(keys, 0)
             for key in map(count_of, step['findings']):
                 tally[key] = tally.get(key, 0) + 1
             if tally != {k: step['counts'].get(k, 0) for k in keys}:
-                problems.append(f"{kind} step {n} findings don't add up to its counts")
+                problems.append(problem('findings_dont_add_up', f"{kind} step {n} findings don't add up to its counts",
+                                        step=step))
     verdicts = dict.fromkeys(VERDICTS, 0)
     for step in run['steps']:
         for finding in step['findings']:
@@ -1111,11 +1241,13 @@ def check_steps(run, dispatches, events, pins):
                 verdicts[verdict] = verdicts.get(verdict, 0) + 1
     checks = steps['fix_check'] + steps['final_fix_check']
     if verdicts != {k: sum(s['counts'].get(k, 0) for s in checks) for k in VERDICTS}:
-        problems.append("fix-check verdicts in findings don't add up to the fix-check steps' counts")
+        problems.append(problem('verdicts_dont_add_up',
+                                "fix-check verdicts in findings don't add up to the fix-check steps' counts"))
     missing = missing_skills(run, events, dispatches, pins)
-    problems += [f'required skill {skill} did not run' for skill, d in missing if d is None]
+    problems += [problem('required_skill_missing', f'required skill {skill} did not run', skill=skill)
+                 for skill, d in missing if d is None]
     stage = run.get('stage')
-    for d in dispatches:
+    for d, step in zip(dispatches, dispatch_steps(run, dispatches)):
         inp, sub = d['inp'], d['sub']
         agent = inp.get('subagent_type')
         pin = pins.get(agent)
@@ -1131,17 +1263,22 @@ def check_steps(run, dispatches, events, pins):
                      or final and run.get('risk_area') is True and inp.get('effort') == effort == 'xhigh')
         out_ok = final and stage == 'out' and (model or '').startswith('claude-opus') and effort == 'xhigh'
         if not (model_ok and effort_ok or out_ok):
-            problems.append(f"{agent} ran on {model}/{effort}, pinned {pin['model']}/{pin['effort']}: "
-                            f"{inp.get('description')}")
-        problems += [f"{agent} ran without its skill {skill}: {inp.get('description')}"
+            problems.append(problem('agent_off_pin', f"{agent} ran on {model}/{effort}, pinned "
+                                    f"{pin['model']}/{pin['effort']}: {inp.get('description')}",
+                                    step=step, agent=agent))
+        problems += [problem('agent_skill_missing', f"{agent} ran without its skill {skill}: {inp.get('description')}",
+                             step=step, skill=skill, agent=agent)
                      for skill, owner in missing if owner is d]
     if run.get('risk_area') is True and run.get('path') == 'small':
-        problems.append('risk area on the Small path')
+        problems.append(problem('risk_area_small_path', 'risk area on the Small path'))
     checked = {s['wave'] for s in steps['task_review']}
-    problems += [f"wave {w['wave']} has no wave check step" for w in run['waves'] if w['wave'] not in checked]
+    problems += [problem('wave_unchecked', f"wave {w['wave']} has no wave check step",
+                         step={'step': 'task_review', 'wave': w['wave']})
+                 for w in run['waves'] if w['wave'] not in checked]
     if run['schema'] >= 3 and run.get('path') == 'plan':
         offered = {o['skill'] for o in run['offers']}
-        problems += [f'no {skill} offer recorded' for skill in REQUIRED_OFFERS if skill not in offered]
+        problems += [problem('offer_not_recorded', f'no {skill} offer recorded', skill=skill)
+                     for skill in REQUIRED_OFFERS if skill not in offered]
     return problems
 
 
@@ -1160,16 +1297,23 @@ def check_run(path, start, end, run, pins):
         elif kind == 'agent' and value[0] in launched and is_final_review(value[1]):
             # When the record says simplify did not run, its own warning covers these.
             if not since and ran != 'no':
-                problems.append(f"final review without simplify: {value[1].get('description')}")
+                problems.append(problem('final_review_without_simplify',
+                                        f"final review without simplify: {value[1].get('description')}",
+                                        step={'step': 'final_review'}))
             since = False
     # A schema 2 record's simplify steps are checked against the simplify calls in check_steps instead.
     recorded = None if schema2 else ran
     if recorded == 'no' and simplified:
-        problems.append('record says simplify did not run but the transcript has a simplify call')
+        problems.append(problem('simplify_record_differs',
+                                'record says simplify did not run but the transcript has a simplify call',
+                                step={'step': 'simplify'}))
     elif recorded in ('agents', 'inline') and not simplified:
-        problems.append(f'record says simplify ran ({recorded}) but the transcript has no simplify call')
-    problems += [f"agent type '{value}' not found" for _, kind, value in events if kind == 'not_found']
-    for d in dispatches:
+        problems.append(problem('simplify_record_differs',
+                                f'record says simplify ran ({recorded}) but the transcript has no simplify call',
+                                step={'step': 'simplify'}))
+    problems += [problem('agent_not_found', f"agent type '{value}' not found", agent=value)
+                 for _, kind, value in events if kind == 'not_found']
+    for d, step in zip(dispatches, dispatch_steps(run, dispatches)):
         if d['report'] is None:
             continue
         if schema2 and d['kind'] in COUNT_LINES:
@@ -1179,18 +1323,23 @@ def check_run(path, start, end, run, pins):
         else:
             continue
         if count_line(d['report'], name) is None:
-            problems.append(f"{label} report has no {name}: line: {d['inp'].get('description')}")
+            problems.append(problem('count_line_missing',
+                                    f"{label} report has no {name}: line: {d['inp'].get('description')}",
+                                    step=step, agent=d['inp'].get('subagent_type')))
     finals = [findings_line(d['report']) for d in dispatches if d['report'] is not None and d['kind'] == 'final_review']
     if finals and finals[-1] is not None and finals[-1] != run['final_findings']:
-        problems.append(f"record's final_findings {findings_text(run['final_findings'])} differ from the final "
-                        f"review's {findings_text(finals[-1])}")
+        problems.append(problem('final_findings_differ',
+                                f"record's final_findings {findings_text(run['final_findings'])} differ from the "
+                                f"final review's {findings_text(finals[-1])}", step={'step': 'final_review'}))
     unnamed = [inp for inp in agents if inp.get('subagent_type') in UNNAMED_TYPES]
-    problems += [f"named role by general-purpose: {inp.get('description')}" for inp in unnamed
+    problems += [problem('named_role_by_general_purpose', f"named role by general-purpose: {inp.get('description')}",
+                         agent=inp.get('subagent_type')) for inp in unnamed
                  if isinstance(inp.get('description'), str) and NAMED_ROLE.search(inp['description'])]
-    problems += [f"model-less general-purpose dispatch launched: {inp.get('description')}" for inp in unnamed
-                 if not inp.get('model')]
+    problems += [problem('model_less_dispatch',
+                         f"model-less general-purpose dispatch launched: {inp.get('description')}",
+                         agent=inp.get('subagent_type')) for inp in unnamed if not inp.get('model')]
     if not transcript_events(path)[2]:
-        problems.append('startup guidelines missing from the session')
+        problems.append(problem('startup_missing', 'startup guidelines missing from the session'))
     if schema2:
         problems += check_steps(run, dispatches, events, pins)
     return problems
@@ -1211,12 +1360,15 @@ def check_git(run, final_report):
             recorded = num(run['fix_growth'].get('fix_added'))
             off = abs(recorded - growth['fix_added'])
             if off > growth['fix_added'] / 2 and off > FIX_GROWTH_SLACK:
-                problems.append(f"record's fix_added {recorded} differs from git's {growth['fix_added']}")
+                problems.append(problem('fix_added_differs',
+                                        f"record's fix_added {recorded} differs from git's {growth['fix_added']}"))
     if asks_for_conventions(final_report):
         added = conventions_added(project, base, head)
         usable = usable and added is not None
         if added == 0:
-            problems.append(f'final review asked for a {CONVENTIONS} entry but the branch added none')
+            problems.append(problem('conventions_not_added',
+                                    f'final review asked for a {CONVENTIONS} entry but the branch added none',
+                                    step={'step': 'final_review'}))
     return problems, usable
 
 
@@ -1229,7 +1381,7 @@ def is_workflow_agent(tool_input):
 
 
 def unrecorded_sessions(projects_root, spans, now):
-    """(transcript path, WARN line) for each main transcript that launched a workflow agent this week, up to now,
+    """(transcript path, problem) for each main transcript that launched a workflow agent this week, up to now,
     outside every run's span."""
     week = week_start(now)
     covered = {}
@@ -1244,13 +1396,15 @@ def unrecorded_sessions(projects_root, spans, now):
             if (kind == 'agent' and value[0] in launched and is_workflow_agent(value[1]) and t is not None
                     and week <= t <= now
                     and not any((start is None or timestamp > start) and timestamp <= end for start, end in own)):
-                out.append((path, f'WARN: session {os.path.basename(path)} ran workflow agents but wrote no run record'))
+                out.append((path, problem('unrecorded_session',
+                                          f'session {os.path.basename(path)} ran workflow agents but wrote no run '
+                                          'record')))
                 break
     return out
 
 
 def unsimplified_plan_reviews(projects_root, now):
-    """(transcript path, WARN line) for each plan review a main transcript launched this week, up to now, with no
+    """(transcript path, problem) for each plan review a main transcript launched this week, up to now, with no
     launched plan simplify since the previous launched plan review."""
     week = week_start(now)
     out = []
@@ -1264,8 +1418,10 @@ def unsimplified_plan_reviews(projects_root, now):
             simplified = simplified or is_plan_simplify(value[1])
             if is_plan_review(value[1]):
                 if not simplified and t is not None and t >= week:
-                    out.append((path, f"WARN: session {os.path.basename(path)}: plan review without plan-simplifier: "
-                                      f"{value[1].get('description')}"))
+                    out.append((path, problem('plan_review_without_simplify',
+                                              f"session {os.path.basename(path)}: plan review without "
+                                              f"plan-simplifier: {value[1].get('description')}",
+                                              step={'step': 'plan_review'})))
                 simplified = False
     return out
 
@@ -1278,7 +1434,7 @@ def typed_triggers(events):
 
 
 def session_warnings(projects_root, spans, now):
-    """(transcript path, WARN line) for each typed trigger a main transcript holds this week, up to now, that no later
+    """(transcript path, problem) for each typed trigger a main transcript holds this week, up to now, that no later
     load of its skill meets, and for each main transcript written this week with no run's span and no startup block."""
     week = week_start(now)
     covered = {path for path, _, _ in spans.values()}
@@ -1290,7 +1446,8 @@ def session_warnings(projects_root, spans, now):
         for timestamp, skill, met in typed_triggers(events):
             t = parse_time(timestamp)
             if not met and t is not None and t >= week:
-                out.append((path, f"WARN: session {name}: typed '{skill}' but {skill} never loaded"))
+                out.append((path, problem('typed_skill_not_loaded',
+                                          f"session {name}: typed '{skill}' but {skill} never loaded", skill=skill)))
         # A session with a run gets the per-run line instead. The file's time says it ran this week, since a chat-only
         # session has no events.
         try:
@@ -1298,7 +1455,7 @@ def session_warnings(projects_root, spans, now):
         except OSError:
             this_week = False
         if path not in covered and not startup and this_week:
-            out.append((path, f'WARN: session {name}: startup guidelines missing'))
+            out.append((path, problem('startup_missing', f'session {name}: startup guidelines missing')))
     return out
 
 
@@ -1313,21 +1470,22 @@ def archive_line(run):
 
 
 def health(projects_root, runs, now, records, pins, spans):
-    """WARN lines for the problems the transcripts and git show in each run, for this week's sessions with no run
-    record and for this week's plan reviews with no plan simplify, then the information lines, then each run's own WARN
-    and information lines in runs' order, then the session lines by transcript path; records is the whole run log,
-    pins the agent files' read_pins and spans the log's run_spans."""
+    """Warnings for the problems the transcripts and git show in each run, for this week's sessions with no run
+    record and for this week's plan reviews with no plan simplify, then the information lines, then each run's own
+    warnings and information lines in runs' order, then the session warnings by transcript path; records is the whole
+    run log, pins the agent files' read_pins and spans the log's run_spans."""
     span_of = {id(r): spans.get(i) for i, r in enumerate(records)}
     warns, info, unavailable, per_run = [], [], 0, []
     for r in runs:
         label = f"{r.get('branch')} ({run_date(r)})"
         span = span_of.get(id(r))
-        problems = check_run(*span, r, pins) if span else ['no session transcript found']
+        problems = check_run(*span, r, pins) if span else [problem('no_transcript', 'no session transcript found')]
         finals = [d['report'] for d in span_dispatches(*span)
                   if d['report'] is not None and d['kind'] == 'final_review'] if span else []
         git_problems, usable = check_git(r, finals[-1] if finals else '')
         unavailable += not usable
-        own_warns, own_info = [f'WARN: {label}: {problem}' for problem in problems + git_problems], []
+        own_warns = [warning(p, run=run_ref(r), label=label) for p in problems + git_problems]
+        own_info = []
         count = count_not_proportionate(*span) if span else 0
         if count:
             own_info.append(f'{label}: {NOT_PROPORTIONATE}: {count}')
@@ -1339,20 +1497,23 @@ def health(projects_root, runs, now, records, pins, spans):
         per_run.append((own_warns, own_info))
     if unavailable:
         info.append(f'Git evidence unavailable for {unavailable} runs')
-    sessions = (unrecorded_sessions(projects_root, spans, now) + unsimplified_plan_reviews(projects_root, now)
-                + session_warnings(projects_root, spans, now))
+    sessions = [warning(p, session=path) for path, p in
+                unrecorded_sessions(projects_root, spans, now) + unsimplified_plan_reviews(projects_root, now)
+                + session_warnings(projects_root, spans, now)]
     per_session = {}
-    for path, line in sessions:
-        per_session.setdefault(path, []).append(line)
-    return warns + [line for _, line in sessions], info, per_run, per_session
+    for w in sessions:
+        per_session.setdefault(w['session'], []).append(w)
+    return warns + sessions, info, per_run, per_session
 
 
 def run_warnings(projects_root, runs, now, records, pins, spans):
-    """WARN lines for these runs (simplify recorded as not run, then the health lines), the information lines, each
-    run's own WARN lines (its simplify line first) and information lines, and the session lines by transcript path."""
+    """Warnings for these runs (simplify recorded as not run, then the health warnings), the information lines, each
+    run's own warnings (its simplify warning first) and information lines, and the session warnings by transcript
+    path."""
     warns, info, per_run, per_session = health(projects_root, runs, now, records, pins, spans)
-    simplify = [[f"WARN: simplify did not run on {r.get('branch')} ({run_date(r)})"] if r['simplify']['ran'] == 'no'
-                else [] for r in runs]
+    simplify = [[warning(problem('simplify_not_run', f"simplify did not run on {r.get('branch')} ({run_date(r)})",
+                                 step={'step': 'simplify'}), run=run_ref(r))] if r['simplify']['ran'] == 'no' else []
+                for r in runs]
     return (sum(simplify, []) + warns, info,
             [(own_simplify + own_warns, own_info) for own_simplify, (own_warns, own_info) in zip(simplify, per_run)],
             per_session)
@@ -1469,8 +1630,8 @@ def full_report(tr, runs, stats, since, now, projects_root):
 def warnings(projects_root, runs, now, records, pins, spans):
     """This week's WARN lines."""
     week = week_start(now)
-    return run_warnings(projects_root, [r for r in runs if r['_time'] is not None and r['_time'] >= week], now, records,
-                        pins, spans)[0]
+    return texts(run_warnings(projects_root, [r for r in runs if r['_time'] is not None and r['_time'] >= week], now,
+                              records, pins, spans)[0])
 
 
 def template_drift(stamp_path):
@@ -1537,16 +1698,17 @@ def skill_entries(events, main_events, run):
 def run_entry(r, span, warns, info, pins):
     """A run's record and what its window shows; the window's facts are None when it has no window."""
     known = r['_time'] is not None and r['_started'] is not None
-    entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': r['steps'], 'final_findings': r['final_findings'],
+    entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': [dict(s, time=None, end=None) for s in r['steps']],
+             'final_findings': r['final_findings'],
              'simplify': r['simplify'], 'waves': r['waves'], 'offers': r['offers'],
              'fable_points': run_points(r, 'fable_start', 'fable_end'),
              'all_points': run_points(r, 'all_start', 'all_end'),
              'minutes': (r['_time'] - r['_started']).total_seconds() / 60 if known else None,
              'window': None if span is None else dict(zip(('transcript', 'start', 'end'), span)),
-             'warns': warns, 'info': info,
+             'warns': texts(warns), 'warnings': warns, 'info': info,
              'later_fixes': [dict(zip(('sha', 'date', 'subject'), fix)) for fix in later_fixes(r)]}
     entry.update(dict.fromkeys(('dispatches', 'skills', 'missing_skills', 'refusals', 'models', 'efforts', 'advisor',
-                                'notes', 'main')))
+                                'notes', 'main', 'title')))
     if span is None:
         return entry
     path, start, end = span
@@ -1568,16 +1730,28 @@ def run_entry(r, span, warns, info, pins):
         name = COUNT_LINES[kind][1] if kind in COUNT_LINES else None
         sub_tr = sub_usage(sub) if sub else None
         sub_model, sub_effort = ran_on(sub_tr) if sub_tr else (None, None)
-        dispatches.append({'kind': kind, 'agent': inp.get('subagent_type'), 'description': inp.get('description'),
+        dispatches.append({'kind': kind, 'id': d['id'], 'time': d['time'], 'end': sub_tr.last if sub_tr else None,
+                           'step': None, 'agent': inp.get('subagent_type'), 'description': inp.get('description'),
                            'requested_model': inp.get('model'), 'requested_effort': inp.get('effort'),
                            'model': sub_model, 'effort': sub_effort, 'skills': agent_skills(sub) if sub else None,
                            'counts': count_line(report, name) if name and report is not None else None,
                            'models': sub_tr.models if sub_tr else None})
-    entry.update(dispatches=dispatches, skills=skill_entries(events, transcript_events(path)[0], r),
+    for i, j in tie_steps(r, span_ds).items():
+        entry['steps'][i].update(time=dispatches[j]['time'], end=dispatches[j]['end'])
+        dispatches[j]['step'] = i
+    # The simplify step takes its time from the window's simplify call when each is the only one.
+    simplify_steps = [i for i, s in enumerate(r['steps']) if s['step'] == 'simplify']
+    simplify_calls = [e[0] for e in events if e[1] == 'simplify']
+    simplify_step = simplify_steps[0] if len(simplify_steps) == len(simplify_calls) == 1 else None
+    if simplify_step is not None:
+        entry['steps'][simplify_step]['time'] = simplify_calls[0]
+    skills = [dict(s, step=simplify_step if s['name'] == 'simplify' else None)
+              for s in skill_entries(events, transcript_events(path)[0], r)]
+    entry.update(dispatches=dispatches, skills=skills,
                  missing_skills=missing, refusals=refusal_counts(events), models=tr.models, efforts=tr.efforts,
                  advisor={'calls': sum(n for n, _ in tr.by_role.values()), 'cost': tr.advisor_cost},
                  notes={'notes': tr.notes, 'changed': tr.changed, 'missing': tr.missing},
-                 main={'model': model, 'effort': effort})
+                 main={'model': model, 'effort': effort}, title=transcript_title(path))
     return entry
 
 
@@ -1785,7 +1959,8 @@ def report_data(projects_root, records, runs, tr, spans, pins, now, since):
         sessions.append({'file': path, 'skills': skill_entries(window_events, events, None),
                          'typed': [{'skill': skill, 'time': timestamp, 'met': met} for timestamp, skill, met in typed],
                          'models': tr_session.models, 'efforts': tr_session.efforts,
-                         'startup': transcript_events(path)[2], 'warns': own})
+                         'startup': transcript_events(path)[2], 'warns': texts(own), 'warnings': own,
+                         'title': transcript_title(path)})
     transcripts = {e['window']['transcript'] for e in entries if e['window']} | {s['file'] for s in sessions}
     startup = [transcript_events(path)[2] for path in sorted(transcripts)]
     advisor = advisor_facts(tr, runs, now)
@@ -1800,7 +1975,7 @@ def report_data(projects_root, records, runs, tr, spans, pins, now, since):
                    'weeks': week_rows(runs, entries), 'run_time': run_time(runs, entries),
                    'skills': skill_totals(entries + sessions, typed_missing),
                    'models': model_totals(runs, entries), 'advisor': advisor, 'offers': offer_totals(runs),
-                   'health': {'warns': warns, 'info': info}},
+                   'health': {'warns': texts(warns), 'warnings': warns, 'info': info}},
     }
 
 
@@ -1985,7 +2160,7 @@ def main():
     spans = run_spans(args.projects, records, now)
     if args.health:
         warns, info, _, _ = run_warnings(args.projects, runs, now, records, pins, spans)
-        print('\n'.join((warns or ['Health: no problems']) + info))
+        print('\n'.join((texts(warns) or ['Health: no problems']) + info))
         return 0
     tr = read_transcripts(args.projects, since, now, stats)
     if args.json or args.html:
