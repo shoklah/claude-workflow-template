@@ -3,6 +3,8 @@
 Run with: /usr/bin/python3 -I tests/test_report.py
 """
 import datetime
+import glob
+import hashlib
 import json
 import os
 import re
@@ -18,6 +20,11 @@ SCRIPT = os.path.join(SCRIPTS_DIR, 'workflow-report.py')
 PYTHON = '/usr/bin/python3'
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 NOW = '2026-11-07T12:00:00Z'  # a Saturday; its week started Sunday 2026-11-01 07:00 UTC
+
+
+# Copied from scripts/workflow-report.py's unit_key, since tests can't import the script: keep them the same.
+def key(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
 
 ADVISOR = {'type': 'advisor_message', 'model': 'claude-fable-5-1', 'input_tokens': 70000, 'output_tokens': 1600,
            'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
@@ -157,12 +164,17 @@ class Report(unittest.TestCase):
         git('config', 'commit.gpgsign', 'false')
         return repo, change
 
+    def report_args(self, *args):
+        # No test reads the real ~/.claude/agents, export stamp or cache; a test's own option comes later and wins.
+        return [PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW,
+                '--agents', os.path.join(self.root, 'no agents'), '--export-stamp', os.path.join(self.root, 'no stamp'),
+                '--cache', os.path.join(self.root, 'cache'), *args]
+
+    def report_process(self, *args, env=CLEAN_ENV):
+        return subprocess.run(self.report_args(*args), capture_output=True, text=True, env=env, timeout=60)
+
     def run_report(self, *args, env=CLEAN_ENV):
-        # No test reads the real ~/.claude/agents or export stamp; a test's own option comes later and wins.
-        p = subprocess.run([PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW,
-                            '--agents', os.path.join(self.root, 'no agents'),
-                            '--export-stamp', os.path.join(self.root, 'no stamp'), *args],
-                           capture_output=True, text=True, env=env, timeout=60)
+        p = self.report_process(*args, env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stderr, '')
         return p.stdout
@@ -740,9 +752,7 @@ class Report(unittest.TestCase):
 
     def test_json_into_a_reader_that_stops_early_exits_cleanly(self):
         self.records([run_record(branch=f'b{i}') for i in range(400)])
-        p = subprocess.Popen([PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW,
-                              '--agents', os.path.join(self.root, 'no agents'), '--json'],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=CLEAN_ENV)
+        p = subprocess.Popen(self.report_args('--json'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=CLEAN_ENV)
         self.assertEqual(len(p.stdout.read(300)), 300)
         p.stdout.close()
         stderr = p.stderr.read()
@@ -876,7 +886,7 @@ class HealthCheck(Report):
         data = self.json()
         self.assertEqual([r['title'] for r in data['runs']], ['Second name', None])
         self.assertEqual(sorted((os.path.basename(s['file']), s['title']) for s in data['sessions']),
-                         [('sess-2.jsonl', 'Chat'), ('sess-3.jsonl', None)])
+                         [('sess-1.jsonl', 'Second name'), ('sess-2.jsonl', 'Chat'), ('sess-3.jsonl', None)])
 
     def test_a_run_ends_where_its_head_is_written_not_where_it_is_the_next_base(self):
         # run two's session sorts first, and its record names run one's head as its base
@@ -1546,7 +1556,8 @@ class HealthCheck(Report):
     def test_warnings_mirror_warns_in_every_list(self):
         self.warned_run_and_session()
         data = self.json()
-        run, session, health = data['runs'][0], data['sessions'][0], data['totals']['health']
+        session = next(s for s in data['sessions'] if any(w['kind'] == 'startup_missing' for w in s['warnings']))
+        run, health = data['runs'][0], data['totals']['health']
         for unit in (run, session, health):
             self.assertEqual([w['text'] for w in unit['warnings']], unit['warns'])
             self.assertTrue(all(isinstance(w['kind'], str) and w['kind'] for w in unit['warnings']))
@@ -1914,10 +1925,14 @@ class HealthCheck(Report):
                                                      'cost': 1.0},
                        'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0,
                                             'cost': None}},
-            'efforts': {}, 'startup': False, 'warns': ['WARN: session sess-1.jsonl: startup guidelines missing'],
+            'efforts': {}, 'startup': False,
+            'advisor': {'calls': 0, 'cost': 0.0, 'tokens': {'input': 0, 'output': 0, 'cache_read': 0, 'cache_write': 0},
+                        'by_role': {}, 'failed': {}, 'weeks': []},
+            'notes': {'notes': 0, 'changed': 0, 'missing': 0}, 'refusals': {},
+            'warns': ['WARN: session sess-1.jsonl: startup guidelines missing'],
             'warnings': [{'text': 'WARN: session sess-1.jsonl: startup guidelines missing', 'kind': 'startup_missing',
                           'run': None, 'session': file, 'step': None, 'skill': None, 'agent': None}],
-            'title': None}])
+            'title': None, 'key': key(file)}])
         self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
 
     def test_json_weeks_rows(self):
@@ -2052,6 +2067,312 @@ class HealthCheck(Report):
     def test_a_simplify_that_found_nothing_reads_none(self):
         self.final_run(loads=('subagent-driven-development', 'simplify'))
         self.assertEqual(self.json()['totals']['skills']['simplify']['outcomes'], {'none': 1})
+
+    def cache_fixture(self):
+        """A covered run with a reviewed final review, and a second session with an advisor iteration, a hook decision
+        and a typed trigger."""
+        rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                             sub_model='claude-fable-5-1', sub_effort='high', subagent_type='final-reviewer',
+                             description='Final review')
+        self.schema2_run([SIMPLIFY_STEP, {'step': 'final_review', 'counts': {}, 'findings': []}], rows)
+        self.session([asst('adv', iterations=[executor(), ADVISOR], ts=self.ts()),
+                      hook_row('guard-main-commit.py', decision('ask', 'commit on main'), ts=self.ts()),
+                      user('grill me', ts=self.ts())], project='proj', sid='sess-2')
+
+    def outputs(self, *cache):
+        data = self.json(*cache)
+        data.pop('generated')
+        return data, self.run_report('--health', *cache), self.run_report('--brief', *cache)
+
+    def test_the_cache_never_changes_the_report(self):
+        self.cache_fixture()
+        plain = self.outputs('--no-cache')
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'cache')))
+        self.assertEqual(self.outputs(), plain)  # cold
+        self.assertEqual(self.outputs(), plain)  # warm
+        folder = os.path.join(self.root, 'cache')
+        self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+        self.assertTrue(os.listdir(os.path.join(folder, 'transcripts')))
+
+    def test_a_grown_transcript_is_read_again(self):
+        self.cache_fixture()
+        self.json()
+        self.write_lines(os.path.join(self.projects, 'proj', 'sess-2.jsonl'),
+                         [asst('late', model='claude-sonnet-5-5', ts=self.ts())])
+        session = next(s for s in self.json()['sessions'] if s['file'].endswith('sess-2.jsonl'))
+        self.assertIn('claude-sonnet-5-5', session['models'])
+
+    def test_a_corrupt_or_old_cache_entry_is_read_again(self):
+        self.cache_fixture()
+        plain = self.outputs('--no-cache')
+        self.outputs()
+        entries = glob.glob(os.path.join(self.root, 'cache', 'transcripts', '*.json'))
+        for i, entry in enumerate(entries):
+            with open(entry) as f:
+                stored = json.load(f)
+            with open(entry, 'w') as f:
+                f.write('not json' if i % 2 else json.dumps(dict(stored, version=0, value=None)))
+        self.assertEqual(self.outputs(), plain)
+        for entry in entries:
+            with open(entry) as f:
+                self.assertNotEqual(json.load(f)['version'], 0)
+
+    def test_an_unusable_cache_folder_changes_nothing(self):
+        self.cache_fixture()
+        blocked = os.path.join(self.root, 'a file')
+        with open(blocked, 'w') as f:
+            f.write('x')
+        self.assertEqual(self.outputs('--cache', blocked), self.outputs('--no-cache'))
+
+    def test_a_deeply_nested_row_reads_the_same_from_the_cache(self):
+        self.cache_fixture()
+        # Rows nested near the recursion limit: some parse, yet sit too deep once wrapped in a cache entry.
+        rows = [json.dumps(asst(f'deep{d}', ts=self.ts(), u=dict(usage(), x='DEEP')))
+                .replace('"DEEP"', '[' * d + ']' * d) for d in range(950, 1000)]
+        self.session(rows, project='proj', sid='sess-2')
+        plain = self.outputs('--no-cache')
+        self.assertEqual(self.outputs(), plain)  # cold
+        self.assertEqual(self.outputs(), plain)  # warm
+
+    def partition_fixture(self):
+        """One transcript with a run window between rows outside it, and one with no run; each holds an advisor
+        iteration, a typed trigger and a refusal, one refusal inside a subagent transcript."""
+        refusal = 'No simplify since the last final review in this session\'s transcript.'
+        early = [self.startup(), asst('early', model='claude-haiku-4-5', iterations=[executor(), ADVISOR], ts=self.ts())]
+        early += self.agent('ref1', error=refusal, subagent_type='final-reviewer', description='Final review')
+        self.clock = 30
+        inside = [asst('in', iterations=[executor(), ADVISOR], ts=self.ts()), user('grill me', ts=self.ts())]
+        inside.append(self.record_write('c0ffee01', started='2026-11-05T10:00:20Z'))
+        after = [asst('after', model='claude-sonnet-5-5', ts=self.ts())]
+        self.session(early + inside + after, project='proj')
+        self.subagent('implementer', [asst('nested', ts=self.ts())] + self.agent('ref2', error=refusal,
+                      subagent_type='final-reviewer', description='Final review'), project='proj', aid='i1', tid='ti1')
+        self.session([asst('other', iterations=[executor(), ADVISOR], ts=self.ts()), user('grill me', ts=self.ts())],
+                     project='proj', sid='sess-2')
+        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:20Z', steps=[])])
+        return self.json()
+
+    def units(self, data):
+        return [u for u in data['runs'] + data['sessions'] if u['advisor'] is not None]
+
+    def test_rows_outside_run_windows_form_the_transcripts_session(self):
+        data = self.partition_fixture()
+        run = data['runs'][0]
+        covered = next(s for s in data['sessions'] if s['file'] == run['window']['transcript'])
+        self.assertEqual(set(run['models']), {'claude-opus-5-5'})  # the advisor's executor row and the record write
+        self.assertTrue({'claude-haiku-4-5', 'claude-sonnet-5-5'} <= set(covered['models']))
+        self.assertEqual([t['skill'] for t in run['typed']], ['grill-me'])
+        self.assertEqual(covered['typed'], [])
+        self.assertEqual(run['refusals'], {})
+        self.assertEqual(covered['refusals'], {'no_simplify': 2})  # one in the main transcript, one in its subagent
+
+    def test_the_advisor_totals_are_the_sums_over_the_units(self):
+        data = self.partition_fixture()
+        totals, units = data['totals']['advisor'], self.units(data)
+        self.assertEqual(totals['calls'], sum(u['advisor']['calls'] for u in units))
+        self.assertEqual(totals['calls'], 3)
+        self.assertEqual(totals['cost'], sum(u['advisor']['cost'] for u in units))
+        self.assertEqual(totals['missing'], sum(u['notes']['missing'] for u in units))
+        self.assertEqual([w['advisor'] for w in totals['weeks']],
+                         [sum(x['advisor'] for u in units for x in u['advisor']['weeks'] if x['week'] == w['week'])
+                          for w in totals['weeks']])
+
+    def test_the_rule_totals_are_the_sums_over_the_units(self):
+        data = self.partition_fixture()
+        board, units = data['totals']['scoreboard'], self.units(data)
+        self.assertEqual(board['dispatch_guard'], {'no_simplify': 2})
+        self.assertEqual(board['startup'], {'with': sum(s['startup'] for s in data['sessions']),
+                                            'without': sum(not s['startup'] for s in data['sessions'])})
+        self.assertEqual(data['totals']['skills']['grill-me']['missing'],
+                         sum(not t['met'] for u in units for t in u['typed'] if t['skill'] == 'grill-me'))
+        self.assertEqual(data['totals']['skills']['grill-me']['missing'], 2)
+
+    def test_every_warning_belongs_to_one_unit(self):
+        data = self.partition_fixture()
+        owned = [w for u in data['runs'] + data['sessions'] for w in u['warns']]
+        self.assertEqual(sorted(owned), sorted(data['totals']['health']['warns']))
+        unavailable = sum(r['git_evidence'] is False for r in data['runs'])
+        self.assertIn(f'Git evidence unavailable for {unavailable} runs', data['totals']['health']['info'])
+
+    def test_overlapping_windows_and_shared_messages_count_once(self):
+        rows = [self.startup(), asst('dup', ts=self.ts()), self.record_write('aaaa1111', started='2026-11-05T10:00:00Z')]
+        self.session(rows, project='proj')
+        self.session([asst('dup', ts=self.ts())], project='proj', sid='sess-2')
+        self.records([run_record(head='aaaa1111', schema=2, started='2026-11-05T10:00:00Z', steps=[]),
+                      run_record(head='aaaa1111', branch='twin', schema=2, started='2026-11-05T10:00:00Z', steps=[])])
+        data = self.json()
+        first, twin = data['runs']
+        self.assertEqual(first['models']['claude-opus-5-5']['output'], 20)  # the shared message and the record write
+        self.assertEqual(twin['models'], {})
+        other = next(s for s in data['sessions'] if s['file'].endswith('sess-2.jsonl'))
+        self.assertEqual(other['models'], {})  # its copy of the shared message counted in the run
+        self.assertEqual(sum(m['output'] for u in self.units(data) for m in u['models'].values()), 20)
+
+    def test_a_message_split_across_a_window_end_counts_once_from_its_fullest_row(self):
+        rows = [self.startup(), asst('M', u=usage(None, 10, 5), ts=self.ts()),
+                self.record_write('aaaa1111', started='2026-11-05T10:00:00Z'), asst('M', u=usage(None, 10, 50), ts=self.ts())]
+        self.session(rows, project='proj')
+        self.records([run_record(head='aaaa1111', schema=2, started='2026-11-05T10:00:00Z', steps=[])])
+        data = self.json()
+        run, session = data['runs'][0], data['sessions'][0]
+        self.assertEqual(run['models']['claude-opus-5-5']['output'], 10)  # the record write only
+        self.assertEqual(session['models']['claude-opus-5-5']['output'], 50)  # the message's fullest row, after the end
+
+    def split_across_a_cut(self, day, cut, *args):
+        """Messages M, O (rows in the run window) and N, P (rows before it) each split with a row past the cut; O's and
+        P's fullest rows are inside the range, M's and N's past the cut."""
+        def at(clock, mid, output):
+            return asst(mid, u=usage(None, 10, output), ts=f'{day}T00:00:{clock:02d}.000Z')
+        inside = [at(1, 'N', 5), at(1, 'P', 50), at(3, 'M', 5), at(3, 'O', 50)]
+        past = [asst(mid, u=usage(None, 10, output), ts=cut) for mid, output in (('M', 50), ('N', 50), ('O', 5), ('P', 5))]
+        rows = inside + [dict(self.record_write('aaaa1111', started=f'{day}T00:00:02Z'), timestamp=f'{day}T00:00:05.000Z')]
+        self.session(past + rows if cut < day else rows + past, project='proj')
+        self.records([run_record(head='aaaa1111', date=f'{day}T00:00:05Z', schema=2, started=f'{day}T00:00:02Z',
+                                 steps=[])])
+        data = self.json(*args)
+        run, session = data['runs'][0], data['sessions'][0]
+        # Each message counts once, from its fullest row, in the unit holding it; M and N count nowhere.
+        self.assertEqual(run['models']['claude-opus-5-5']['output'], 60)  # O's fullest row and the record write
+        self.assertEqual(session['models']['claude-opus-5-5']['output'], 50)  # P's fullest row
+        self.assertEqual(sum(m['output'] for u in (run, session) for m in u['models'].values()), 110)
+
+    def test_a_message_split_across_a_past_now_counts_from_its_fullest_row_or_nowhere(self):
+        self.split_across_a_cut('2026-11-05', '2026-11-05T00:00:07.000Z', '--now', '2026-11-05T00:00:06Z')
+
+    def test_a_message_split_across_since_counts_from_its_fullest_row_or_nowhere(self):
+        self.split_across_a_cut('2026-11-05', '2026-11-04T23:59:59.500Z', '--since', '2026-11-05')
+
+    def test_rows_in_the_window_of_a_run_before_since_belong_to_the_session(self):
+        rows = [self.startup(), asst('in', model='claude-sonnet-5-5', ts=self.ts()), user('grill me', ts=self.ts()),
+                self.record_write('aaaa1111', started='2026-11-05T10:00:00Z')]
+        self.session(rows, project='proj')
+        self.records([run_record(head='aaaa1111', date='2026-11-04T12:00:00Z', schema=2,
+                                 started='2026-11-05T10:00:00Z', steps=[])])
+        data = self.json('--since', '2026-11-05')
+        self.assertEqual(data['runs'], [])
+        session = data['sessions'][0]
+        self.assertIn('claude-sonnet-5-5', session['models'])
+        self.assertEqual([t['skill'] for t in session['typed']], ['grill-me'])
+
+    def changed(self, cursor):
+        return self.json('--changed-since', cursor)
+
+    def test_units_carry_the_dashboards_keys(self):
+        self.partition_fixture()
+        undated = run_record(head='nowhere', branch='undated')
+        del undated['date']
+        self.records([undated])
+        data = self.json()
+        run = data['runs'][0]
+        rec = run['record']
+        self.assertEqual(run['key'], key(f"{rec['date']}|{rec['project']}|{rec['branch']}"))
+        self.assertEqual([r['key'] for r in data['runs'] if r['record']['branch'] == 'undated'],
+                         [key('|/p|undated')])
+        self.assertTrue(all(s['key'] == key(s['file']) for s in data['sessions']))
+
+    def test_plain_json_leaves_no_state_and_changed_since_bootstraps_from_nothing(self):
+        full = self.partition_fixture()
+        self.json()
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'cache', 'state.json')))
+        first = self.changed('0')
+        self.assertRegex(first['cursor'], r'^[0-9a-f]{16}:1$')
+        self.assertEqual(first['removed'], {'runs': [], 'sessions': []})
+        for data in (first, full):
+            data.pop('generated')
+        self.assertEqual({k: v for k, v in first.items() if k not in ('cursor', 'removed')}, full)
+        second = self.changed(first['cursor'])
+        self.assertEqual((second['runs'], second['sessions']), ([], []))
+        self.assertEqual(second['cursor'], first['cursor'][:-1] + '2')
+
+    def test_changed_since_exports_what_changed_and_what_was_removed(self):
+        self.partition_fixture()
+        cursor = self.changed('0')['cursor']
+        other = os.path.join(self.projects, 'proj', 'sess-2.jsonl')
+        self.write_lines(other, [asst('more', ts=self.ts())])
+        grown = self.changed(cursor)
+        self.assertEqual(([r['key'] for r in grown['runs']], [s['file'] for s in grown['sessions']]), ([], [other]))
+        os.remove(other)
+        gone = self.changed(grown['cursor'])
+        self.assertEqual(gone['removed']['sessions'], [key(other)])
+        self.assertEqual(self.changed(gone['cursor'])['removed'], {'runs': [], 'sessions': []})
+
+    def test_an_unknown_cursor_or_a_lost_state_exports_everything(self):
+        full = self.partition_fixture()
+        cursor = self.changed('0')['cursor']
+        count = len(full['runs']) + len(full['sessions'])
+        for bad in ('x', '0123456789abcdef:1', cursor.split(':')[0] + ':99'):
+            out = self.changed(bad)
+            self.assertEqual((len(out['runs']) + len(out['sessions']), out['removed']), (count, {'runs': [], 'sessions': []}))
+        with open(os.path.join(self.root, 'cache', 'state.json'), 'w') as f:
+            f.write('broken')
+        out = self.changed(cursor)
+        self.assertEqual(len(out['runs']) + len(out['sessions']), count)
+        self.assertNotEqual(out['cursor'].split(':')[0], cursor.split(':')[0])
+
+    def test_a_unit_removed_then_restored_unchanged_is_exported_again(self):
+        self.partition_fixture()
+        cursor = self.changed('0')['cursor']
+        other = os.path.join(self.projects, 'proj', 'sess-2.jsonl')
+        os.rename(other, other + '.away')
+        gone = self.changed(cursor)
+        self.assertEqual(gone['removed']['sessions'], [key(other)])
+        os.rename(other + '.away', other)
+        back = self.changed(gone['cursor'])
+        self.assertEqual(([r['key'] for r in back['runs']], [s['file'] for s in back['sessions']]), ([], [other]))
+        self.assertEqual(back['removed'], {'runs': [], 'sessions': []})
+
+    def test_a_malformed_state_gives_a_new_id_and_a_full_export(self):
+        full = self.partition_fixture()
+        count = len(full['runs']) + len(full['sessions'])
+        unit = {'kind': 'run', 'hash': 'h', 'changed': 1, 'seen': 1}
+        for units, sequence in (({}, -1), ({'k': 'x'}, 1), ({'k': dict(unit, seen=True)}, 1),
+                                ({'k': dict(unit, kind=None)}, 1), ({'k': dict(unit, changed=2)}, 1)):
+            with open(os.path.join(self.root, 'cache', 'state.json'), 'w') as f:
+                json.dump({'version': 1, 'id': 'abc', 'sequence': sequence, 'units': units}, f)
+            out = self.changed('abc:0')
+            self.assertEqual((len(out['runs']) + len(out['sessions']), out['cursor'].split(':')[0] != 'abc'),
+                             (count, True), (units, sequence))
+
+    def test_units_sharing_a_key_change_together(self):
+        self.partition_fixture()
+        self.records([run_record(head='nowhere')])  # shares the fixture run's date, project and branch
+        cursor = self.changed('0')['cursor']
+        self.records([run_record(head='nowhere3', branch='other')])
+        out = self.changed(cursor)
+        self.assertEqual([r['record']['branch'] for r in out['runs']], ['other'])
+        self.write_lines(os.path.join(self.projects, 'proj', 'sess-1.jsonl'),
+                         [{'type': 'custom-title', 'customTitle': 'Renamed', 'sessionId': 's'}])
+        out = self.changed(out['cursor'])
+        self.assertEqual([r['record']['branch'] for r in out['runs']], ['b', 'b'])
+
+    def test_changed_since_prunes_only_its_own_entries_of_deleted_transcripts(self):
+        self.session([asst('a', ts=self.ts())], project='proj')
+        self.session([asst('b', ts=self.ts())], project='proj', sid='sess-2')
+        folder, sibling = os.path.join(self.root, 'cache [1]'), os.path.join(self.root, 'cache 1', 'transcripts')
+        os.makedirs(sibling)
+        stranger = os.path.join(sibling, 'someone-elses.json')
+        with open(stranger, 'w') as f:
+            json.dump({'path': os.path.join(self.root, 'nowhere.jsonl')}, f)
+        cursor = self.json('--changed-since', '0', '--cache', folder)['cursor']
+        gone = os.path.join(self.projects, 'proj', 'sess-2.jsonl')
+        os.remove(gone)
+        self.json('--changed-since', cursor, '--cache', folder)
+        paths = set()
+        for entry in glob.glob(os.path.join(glob.escape(folder), 'transcripts', '*.json')):
+            with open(entry) as f:
+                paths.add(json.load(f)['path'])
+        self.assertNotIn(gone, paths)
+        self.assertIn(os.path.join(self.projects, 'proj', 'sess-1.jsonl'), paths)
+        self.assertTrue(os.path.exists(stranger))
+
+    def test_changed_since_refuses_since_no_cache_and_other_modes(self):
+        for args in (('--json', '--changed-since', '0', '--since', '2026-11-01'),
+                     ('--json', '--changed-since', '0', '--no-cache'), ('--health', '--changed-since', '0')):
+            p = self.report_process(*args)
+            self.assertEqual((p.returncode, p.stdout), (2, ''))
+            self.assertIn('--changed-since', p.stderr)
+            self.assertNotIn('unrecognized', p.stderr)  # the refusal is the option's own, not argparse's
+
 
 if __name__ == '__main__':
     unittest.main()
