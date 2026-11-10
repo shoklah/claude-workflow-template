@@ -33,15 +33,15 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
               tie-break rule, validity definitions and areas), "stage_table" (the main session's recommended model and
               effort, by path and stage), "runs" (each record in range as written, its window and what the window
-              shows: dispatches, skills, refusals, models, tokens and cost, advisor, its WARN and information lines,
-              later fix commits), "sessions" (each main transcript's rows in range outside its run windows, with its
-              start, end, project and slash commands, by name and time, never their arguments) and "totals"
-              (scoreboard, weeks, run_time, skills, models, advisor, offers, health); each WARN also as an object with
-              its kind, run or session, step, skill and agent, each session's title, each step's agent id, time and
-              end with the dispatch and skill load tied to it, and each finding's category and validity and each
-              review step's strengths. Every transcript row belongs to one run or to its transcript's session, so
-              every total is a sum over the runs and sessions exported. It holds personal data: print it, never write
-              it into a repo
+              shows: dispatches, skills, refusals, models, tokens and cost, advisor, its spend by phase, its WARN and
+              information lines, later fix commits), "sessions" (each main transcript's rows in range outside its run
+              windows, with their models, advisor and spend by phase, and its start, end, project and slash commands,
+              by name and time, never their arguments) and "totals" (scoreboard, weeks, run_time, skills, models,
+              advisor, offers, health); each WARN also as an object with its kind, run or session, step, skill and
+              agent, each session's title, each step's agent id, time and end with the dispatch and skill load tied
+              to it, and each finding's category and validity and each review step's strengths. Every transcript row
+              belongs to one run or to its transcript's session, so every total is a sum over the runs and sessions
+              exported. It holds personal data: print it, never write it into a repo
   --changed-since CURSOR  with --json: print only the runs and sessions whose entry changed since the export that
               gave CURSOR, the keys removed since, and a new cursor; 0 or an unknown cursor exports everything; refused
               with --since or --no-cache
@@ -55,6 +55,7 @@ Advisor use is read from message.usage.iterations entries of type advisor_messag
 Weeks run from Sunday 07:00 UTC. Costs are list-price estimates at each model's list price.
 """
 import argparse
+import bisect
 import datetime
 import fcntl
 import functools
@@ -218,6 +219,14 @@ ADVISOR_MODEL = 'claude-fable-5-1'  # for advisor iterations that name no model
 # Report label, usage field.
 TOKENS = (('input', 'input_tokens'), ('output', 'output_tokens'), ('cache_read', 'cache_read_input_tokens'),
           ('cache_write', 'cache_creation_input_tokens'))
+# The phases --json splits a run's or session's spend into, in the order it lists them.
+PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'fix_check',
+          'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
+# The main session's phase from the last of these skills it loaded, and before any of them from the run's path.
+SKILL_PHASES = {'brainstorming': 'design', 'writing-plans': 'plan_writing',
+                'subagent-driven-development': 'coordination', 'executing-plans': 'implement',
+                'test-driven-development': 'implement'}
+PATH_PHASES = {'plan': 'design', 'full': 'coordination', 'small': 'implement'}
 
 STOP_SHARE = 25.0
 TRIAL_RUNS = 5
@@ -357,9 +366,9 @@ def field(obj, key, kind, default):
     return value if isinstance(value, kind) and not (kind is int and isinstance(value, bool)) else default
 
 
-def cost(u, model):
-    """The list price of usage u on model, or None for a model PRICES lacks. Cache writes are priced by lifetime when
-    u['cache_creation'] splits them, else all at the 5-minute rate."""
+def kind_costs(u, model):
+    """The list price of each token kind of usage u on model, keyed as TOKENS labels them, or None for a model PRICES
+    lacks. Cache writes are priced by lifetime when u['cache_creation'] splits them, else all at the 5-minute rate."""
     prices = PRICES.get(DATE_SUFFIX.sub('', model))
     if prices is None:
         return None
@@ -369,8 +378,15 @@ def cost(u, model):
         write_5m, write_1h = num(split.get('ephemeral_5m_input_tokens')), num(split.get('ephemeral_1h_input_tokens'))
     else:
         write_5m, write_1h = num(u.get('cache_creation_input_tokens')), 0
-    return (num(u.get('input_tokens')) * p_input + num(u.get('output_tokens')) * p_output
-            + num(u.get('cache_read_input_tokens')) * p_read + write_5m * p_5m + write_1h * p_1h) / 1e6
+    return {'input': num(u.get('input_tokens')) * p_input / 1e6, 'output': num(u.get('output_tokens')) * p_output / 1e6,
+            'cache_read': num(u.get('cache_read_input_tokens')) * p_read / 1e6,
+            'cache_write': (write_5m * p_5m + write_1h * p_1h) / 1e6}
+
+
+def cost(u, model):
+    """The list price of usage u on model, the sum of its kind_costs, or None for a model PRICES lacks."""
+    kinds = kind_costs(u, model)
+    return None if kinds is None else sum(kinds.values())
 
 
 def read_jsonl(path, stats):
@@ -400,12 +416,16 @@ def usage_iterations(msg):
 
 
 class Transcripts:
-    def __init__(self, since, now, keep=None, shared=None):
+    def __init__(self, since, now, keep=None, shared=None, phase_of=None):
         """A row counts when it is in since..now and keep is None or keep(its timestamp) is true. With shared, the
-        message ids and advisor failures already counted are shared's, so each counts once across the instances."""
+        message ids and advisor failures already counted are shared's, so each counts once across the instances. With
+        phase_of(path, timestamp), the phase of a message counted from a row of the transcript at path, each message
+        also counts in its phase."""
         self.since = since
         self.now = now
         self.keep = keep
+        self.phase_of = phase_of
+        self.phases = {}
         self.advisor_ids = shared.advisor_ids if shared else set()
         self.spent_ids = shared.spent_ids if shared else set()
         self.tokens = {label: 0 for label, _ in TOKENS}
@@ -453,13 +473,14 @@ class Transcripts:
             in_range = t is None or not (self.since is not None and t < self.since or self.now is not None and t > self.now)
             kind = row.get('type')
             kept = in_range and (self.keep is None or self.keep(row['timestamp']))
+            phase = self.phase_of(path, row['timestamp']) if kept and kind == 'assistant' and self.phase_of else None
             if kind == 'assistant':
-                self.pick_spend(row, t, kept, file_spend)
+                self.pick_spend(row, t, kept, file_spend, phase)
             if not kept:
                 continue
             if kind == 'assistant':
                 self.assistant_rows += 1
-                file_calls += self.assistant(row, t, role, main, file_notes)
+                file_calls += self.assistant(row, t, role, main, file_notes, phase)
             elif kind == 'attachment':
                 self.hook(row.get('attachment'))
             elif kind == 'user' and main:
@@ -467,10 +488,10 @@ class Transcripts:
                     typed_human += 1
                 else:
                     typed_plain += 1
-        for mid, (_, model, own, t, kept) in file_spend.items():
+        for mid, (_, model, own, t, kept, phase) in file_spend.items():
             if kept and mid not in self.spent_ids:
                 self.spent_ids.add(mid)
-                self.spend(model, own, week_start(t) if t is not None else None)
+                self.spend(model, own, week_start(t) if t is not None else None, phase)
         # Transcripts since Claude Code 2.1.187 mark typed rows origin.kind "human"; rows without it there are
         # injected (reminders, task notifications, resumes). Older transcripts have no origin at all.
         self.typed += typed_human if has_origin else typed_plain
@@ -478,9 +499,9 @@ class Transcripts:
         self.changed += sum(1 for _, _, changed in file_notes if changed == 'yes')
         self.missing += max(0, file_calls - len(file_notes))
 
-    def pick_spend(self, row, t, kept, file_spend):
-        """Count an assistant row's own iterations now when it has no message id and kept is true, else keep it in
-        file_spend when it is its message's row with the most output tokens so far."""
+    def pick_spend(self, row, t, kept, file_spend, phase):
+        """Count an assistant row's own iterations now, in phase, when it has no message id and kept is true, else keep
+        it in file_spend when it is its message's row with the most output tokens so far."""
         msg = row.get('message')
         if not isinstance(msg, dict):
             return
@@ -491,13 +512,13 @@ class Transcripts:
         own = [i for i in iterations if i.get('type') == 'message'] if iterations else [usage]
         if not mid:
             if kept:
-                self.spend(model, own, week_start(t) if t is not None else None)
+                self.spend(model, own, week_start(t) if t is not None else None, phase)
             return
         output = sum(num(i.get('output_tokens')) for i in own)
         if mid not in file_spend or output > file_spend[mid][0]:
-            file_spend[mid] = (output, model, own, t, kept)
+            file_spend[mid] = (output, model, own, t, kept, phase)
 
-    def assistant(self, row, t, role, main, file_notes):
+    def assistant(self, row, t, role, main, file_notes, phase):
         msg = row.get('message')
         if not isinstance(msg, dict):
             return 0
@@ -537,22 +558,52 @@ class Transcripts:
                 self.tokens[token] += num(i.get(name))
             spent = cost(i, field(i, 'model', str, '') or ADVISOR_MODEL) or 0.0
             self.advisor_cost += spent
+            if phase is not None:
+                phase_advisor = self.phase(phase)['advisor']
+                phase_advisor['calls'] += 1
+                phase_advisor['cost'] += spent
             if week is not None:
                 self.week_advisor[week] = self.week_advisor.get(week, 0.0) + spent
         return len(advisor)
 
-    def spend(self, model, own, week):
-        """Count the executor's own iterations own on model, and on Fable toward week's Fable use."""
-        entry = self.models.setdefault(model, dict({label: 0 for label, _ in TOKENS}, cost=cost({}, model)))
+    def spend(self, model, own, week, phase=None):
+        """Count the executor's own iterations own on model, in phase when it is not None, and on Fable toward week's
+        Fable use."""
+        if model not in self.models:
+            self.models[model] = dict({label: 0 for label, _ in TOKENS}, cost=cost({}, model))
+        entry, part = self.models[model], None
+        if phase is not None:
+            part = self.phase(phase)['models'].get(model)
+            if part is None:
+                part = self.phases[phase]['models'][model] = dict(
+                    {label: 0 for label, _ in TOKENS}, cost=None if entry['cost'] is None else 0.0, cost_by_kind=kind_costs({}, model))
+        entries = [entry] if part is None else [entry, part]
         for i in own:
             for token, name in TOKENS:
-                entry[token] += num(i.get(name))
+                n = num(i.get(name))
+                for e in entries:
+                    e[token] += n
         if entry['cost'] is None:
             return
-        spent = sum(cost(i, model) for i in own)
-        entry['cost'] += spent
+        spent = 0.0
+        for i in own:
+            kinds = kind_costs(i, model)
+            spent += sum(kinds.values())
+            if part is not None:
+                for kind, dollars in kinds.items():
+                    part['cost_by_kind'][kind] += dollars
+        for e in entries:
+            e['cost'] += spent
         if week is not None and model.startswith('claude-fable'):
             self.week_fable[week] = self.week_fable.get(week, 0.0) + spent
+
+    def phase(self, name):
+        """The models and advisor counted in phase name so far."""
+        return self.phases.setdefault(name, {'models': {}, 'advisor': {'calls': 0, 'cost': 0.0}})
+
+    def phase_list(self):
+        """The phases value of --json: one entry per phase that counted a message, in PHASES order."""
+        return [dict(name=name, **self.phases[name]) for name in PHASES if name in self.phases]
 
     def advisor_result(self, block):
         tid = block.get('tool_use_id')
@@ -674,10 +725,10 @@ def file_usage(path):
     return cached(path, 'usage', lambda: usage_rows(path))
 
 
-def usage_of(main_paths, sub_paths, since, now, stats, keep=None, shared=None):
+def usage_of(main_paths, sub_paths, since, now, stats, keep=None, shared=None, phase_of=None):
     """The Transcripts of main_paths, read with no role, and of the subagent transcripts sub_paths, read with the role
-    their .meta.json names; keep and shared as Transcripts takes them."""
-    tr = Transcripts(since, now, keep, shared)
+    their .meta.json names; keep, shared and phase_of as Transcripts takes them."""
+    tr = Transcripts(since, now, keep, shared, phase_of)
     for path in main_paths:
         tr.read_file(path, None, stats)
     for path in sub_paths:
@@ -958,6 +1009,11 @@ def is_final_review(tool_input):
     description = tool_input.get('description')
     return (subagent_type in UNNAMED_TYPES and isinstance(description, str)
             and bool(FINAL_REVIEW_DESCRIPTION.search(description)) and not NOT_FINAL_REVIEW.search(description))
+
+
+def launches_final_review(kind, value, launched):
+    """Whether a transcript event of kind and value launched a final review: the event that ends a simplify span."""
+    return kind == 'agent' and value[0] in launched and is_final_review(value[1])
 
 
 def is_plan_review(tool_input):
@@ -1610,7 +1666,7 @@ def check_run(path, start, end, run, pins):
     for _, kind, value in events:
         if kind == 'simplify':
             since = simplified = True
-        elif kind == 'agent' and value[0] in launched and is_final_review(value[1]):
+        elif launches_final_review(kind, value, launched):
             # When the record says simplify did not run, its own warning covers these.
             if not since and ran != 'no':
                 problems.append(problem('final_review_without_simplify',
@@ -2010,6 +2066,56 @@ def skill_entries(events, main_events, run):
     return entries
 
 
+def unit_phases(path, start, end, unit_path, run_ends=()):
+    """The phase function of a run or session whose main transcript is path, over the window (start, end]: a run's,
+    on path unit_path, or a session's, with unit_path None and run_ends the ends of its transcript's run windows.
+
+    The main session's phase changes at each of its own events in the window: a skill load named in SKILL_PHASES, a
+    simplify call, which starts the simplify span, and a launched final review or a run window's end, which ends it.
+    A subagent transcript takes its dispatch's step kind, else implement for an implementer, else the main session's
+    phase at its launch; one that no dispatch in the window launched is unattributed.
+    """
+    events, launched, _ = transcript_events(path)
+    first = PATH_PHASES.get(unit_path, 'unattributed')
+    times, phases, loaded, in_simplify = [], [], first, False
+    # A run's end sorts after the events at its time, so a simplify call or skill load at that time is the run's.
+    marks = sorted([e for e in events if in_window(e[0], start, end)]
+                   + [(t, 'run_end', None) for t in run_ends if in_window(t, start, end)], key=lambda e: e[0])
+    for timestamp, kind, value in marks:
+        if kind == 'skill' and value in SKILL_PHASES:
+            loaded = SKILL_PHASES[value]
+        elif kind == 'simplify':
+            in_simplify = True
+        elif kind == 'run_end' or launches_final_review(kind, value, launched):
+            in_simplify = False
+        else:
+            continue
+        times.append(timestamp)
+        phases.append('simplify' if in_simplify else loaded)
+
+    def main_phase(timestamp):
+        if not isinstance(timestamp, str):
+            return 'unattributed'
+        i = bisect.bisect_right(times, timestamp)
+        return phases[i - 1] if i else first
+
+    subs = None
+
+    def phase_of(transcript, timestamp):
+        nonlocal subs
+        if transcript == path:
+            return main_phase(timestamp)
+        if subs is None:  # read the dispatches only for a unit that counts a subagent row
+            subs = {}
+            for d in span_dispatches(path, start, end):
+                if d['sub']:
+                    # Final reviews already have a kind, so is_workflow_agent picks out the implementers here.
+                    subs[d['sub']] = d['kind'] or ('implement' if is_workflow_agent(d['inp'])
+                                                   else main_phase(d['time']))
+        return subs.get(transcript, 'unattributed')
+    return phase_of
+
+
 def run_entry(r, span, warns, info, pins, seen, keep, typed, git_evidence):
     """A run's record and what its window shows; the window's facts are None when it has no window. keep says whether
     a row's timestamp is the run's, its window being the first to end among those holding it; seen is the Transcripts
@@ -2026,14 +2132,15 @@ def run_entry(r, span, warns, info, pins, seen, keep, typed, git_evidence):
              'later_fixes': [dict(zip(('sha', 'date', 'subject'), fix)) for fix in later_fixes(r)],
              'typed': typed, 'git_evidence': git_evidence,
              'key': unit_key('|'.join(field(r, k, str, '') for k in ('date', 'project', 'branch')))}
-    entry.update(dict.fromkeys(('dispatches', 'skills', 'missing_skills', 'refusals', 'models', 'efforts', 'advisor',
-                                'notes', 'main', 'title')))
+    entry.update(dict.fromkeys(('dispatches', 'skills', 'missing_skills', 'refusals', 'models', 'phases', 'efforts',
+                                'advisor', 'notes', 'main', 'title')))
     if span is None:
         return entry
-    path = span[0]
+    path, start, end = span
     events = [e for e in span_events(*span)[0] if keep(e[0])]
     # The main transcript is read first, so its model and effort are known before the subagents are added.
-    tr = Transcripts(None, None, keep=keep, shared=seen)
+    tr = Transcripts(None, None, keep=keep, shared=seen,
+                     phase_of=unit_phases(path, start, end, field(r, 'path', str, None)))
     tr.read_file(path, None, {'skipped': 0})
     model, effort = ran_on(tr)
     for sub in subagent_transcripts(path):
@@ -2065,8 +2172,8 @@ def run_entry(r, span, warns, info, pins, seen, keep, typed, git_evidence):
     skills = [dict(s, step=simplify_step if s['name'] == 'simplify' else None)
               for s in skill_entries(events, transcript_events(path)[0], r)]
     entry.update(dispatches=dispatches, skills=skills,
-                 missing_skills=missing, refusals=refusal_counts(events), models=tr.models, efforts=tr.efforts,
-                 advisor=unit_advisor(tr), notes=unit_notes(tr),
+                 missing_skills=missing, refusals=refusal_counts(events), models=tr.models, phases=tr.phase_list(),
+                 efforts=tr.efforts, advisor=unit_advisor(tr), notes=unit_notes(tr),
                  main={'model': model, 'effort': effort}, title=transcript_title(path))
     return entry
 
@@ -2289,19 +2396,21 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         entries.append(run_entry(r, spans.get(i), own_warns, own_info, pins, seen, owned_by(path, i),
                                  typed.get((path, i), []), git_evidence))
     sessions = []
+    start, end = stamp(since) if since else None, stamp(now)
     for path, main_events in events.items():
         keep = owned_by(path, None)
-        tr_session = usage_of([path], subagent_transcripts(path), since, now, {'skipped': 0}, keep, seen)
+        tr_session = usage_of([path], subagent_transcripts(path), since, now, {'skipped': 0}, keep, seen,
+                              unit_phases(path, start, end, None, [w[1] for w in windows.get(path, [])]))
         own = per_session.get(path, [])
         if path not in windows and not tr_session.assistant_rows and not own:
             continue
-        rest = [e for e in span_events(path, stamp(since) if since else None, stamp(now))[0] if keep(e[0])]
+        rest = [e for e in span_events(path, start, end)[0] if keep(e[0])]
         whole = file_usage(path)
         sessions.append({'file': path, 'start': whole['first'], 'end': whole['last'], 'project': whole['cwd'],
                          'commands': [{'name': v, 'time': t} for t, k, v in main_events if k == 'command'],
                          'skills': skill_entries(rest, main_events, None),
                          'typed': typed.get((path, None), []),
-                         'models': tr_session.models, 'efforts': tr_session.efforts,
+                         'models': tr_session.models, 'phases': tr_session.phase_list(), 'efforts': tr_session.efforts,
                          'advisor': unit_advisor(tr_session), 'notes': unit_notes(tr_session),
                          'refusals': refusal_counts(rest),
                          'startup': transcript_events(path)[2], 'warns': texts(own), 'warnings': own,

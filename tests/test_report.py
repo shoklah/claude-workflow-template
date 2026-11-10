@@ -21,10 +21,15 @@ PYTHON = '/usr/bin/python3'
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 NOW = '2026-11-07T12:00:00Z'  # a Saturday; its week started Sunday 2026-11-01 07:00 UTC
 
+# The spec's phase order, as PHASES in scripts/workflow-report.py: keep them the same.
+PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'fix_check',
+          'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
+
 
 # Copied from scripts/workflow-report.py's unit_key, since tests can't import the script: keep them the same.
 def key(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
 
 ADVISOR = {'type': 'advisor_message', 'model': 'claude-fable-5-1', 'input_tokens': 70000, 'output_tokens': 1600,
            'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
@@ -110,6 +115,11 @@ def section(out, title):
     raise AssertionError(f'no section {title!r} in:\n{out}')
 
 
+def phase_inputs(unit):
+    """The input tokens of each of a unit's phases, by phase name."""
+    return {p['name']: sum(m['input'] for m in p['models'].values()) for p in unit['phases']}
+
+
 class Report(unittest.TestCase):
     def setUp(self):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='workflow report test '))
@@ -180,7 +190,32 @@ class Report(unittest.TestCase):
         return p.stdout
 
     def json(self, *args):
-        return json.loads(self.run_report('--json', *args))
+        data = json.loads(self.run_report('--json', *args))
+        for unit in data['runs'] + data['sessions']:
+            self.check_phases(unit)
+        return data
+
+    def check_phases(self, unit):
+        """The spec's rule: a unit's phases add up to its models and its advisor."""
+        if unit['models'] is None:
+            self.assertIsNone(unit['phases'])
+            return
+        names = [p['name'] for p in unit['phases']]
+        self.assertEqual(names, [n for n in PHASES if n in names])
+        self.assertEqual(set().union(*(p['models'] for p in unit['phases'])), set(unit['models']))
+        for model, total in unit['models'].items():
+            entries = [p['models'][model] for p in unit['phases'] if model in p['models']]
+            # The token kinds, TOKENS' labels in scripts/workflow-report.py: keep them the same.
+            for kind in ('input', 'output', 'cache_read', 'cache_write'):
+                self.assertEqual(sum(e[kind] for e in entries), total[kind])
+            if total['cost'] is None:
+                self.assertEqual([(e['cost'], e['cost_by_kind']) for e in entries], [(None, None)] * len(entries))
+            else:
+                self.assertAlmostEqual(sum(e['cost'] for e in entries), total['cost'], delta=1e-6)
+                for e in entries:
+                    self.assertAlmostEqual(sum(e['cost_by_kind'].values()), e['cost'], delta=1e-6)
+        self.assertEqual(sum(p['advisor']['calls'] for p in unit['phases']), unit['advisor']['calls'])
+        self.assertAlmostEqual(sum(p['advisor']['cost'] for p in unit['phases']), unit['advisor']['cost'], delta=1e-6)
 
     def kinds(self, *args):
         return [w['kind'] for w in self.json(*args)['totals']['health']['warnings']]
@@ -867,15 +902,20 @@ class HealthCheck(Report):
         return user([{'type': 'text', 'text': f'Base directory for this skill: /x/skills/{name}\n\n# {name}'}],
                     ts=self.ts(), isMeta=True)
 
+    def said(self, tokens):
+        """A main-session message of tokens input tokens and no output."""
+        return asst(f'said-{self.clock}', u=usage(None, tokens, 0), ts=self.ts())
+
     def health(self, *args):
         """The problem lines of --health. Information lines are checked by the tests about them."""
         return [line for line in self.run_report('--health', *args).splitlines() if line.startswith(('WARN', 'Health'))]
 
-    def reviewed(self, tid, report, handback=None, sub_model=None, sub_effort=None, **inp):
+    def reviewed(self, tid, report, handback=None, sub_model=None, sub_effort=None, u=None, **inp):
         """A launched dispatch whose subagent transcript ends with report as its last text, then a SubagentHandback
-        whose message is handback when one is given. Its rows run on sub_model and sub_effort when given."""
+        whose message is handback when one is given. Its rows run on sub_model and sub_effort when given, and its
+        report row has usage u when given."""
         ran = dict({'model': sub_model} if sub_model else {}, effort=sub_effort)
-        rows = [asst('r-' + tid, content=[{'type': 'text', 'text': report}], ts=self.ts(), **ran)]
+        rows = [asst('r-' + tid, content=[{'type': 'text', 'text': report}], ts=self.ts(), u=u, **ran)]
         if handback is not None:
             rows.append(asst('h-' + tid, content=[tool_use('hb' + tid, 'SubagentHandback', {'message': handback})],
                              ts=self.ts(), **ran))
@@ -1930,6 +1970,7 @@ class HealthCheck(Report):
         self.assertEqual((first['schema'], first['record'], first['window'], first['minutes']), (1, old, None, None))
         self.assertEqual(first['warns'], ['WARN: old (2026-11-05): no session transcript found'])
         self.assertIsNone(first['dispatches'])
+        self.assertIsNone(first['phases'])
         transcript = os.path.join(self.projects, 'proj', 'sess-1.jsonl')
         self.assertEqual(second['schema'], 2)
         self.assertEqual(second['window'], {'transcript': transcript, 'start': '2026-11-05T10:00:00.000Z',
@@ -1985,6 +2026,13 @@ class HealthCheck(Report):
                                                      'cost': 1.0},
                        'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0,
                                             'cost': None}},
+            'phases': [{'name': 'unattributed', 'advisor': {'calls': 0, 'cost': 0.0}, 'models': {
+                'claude-haiku-4-5-20251001': {'input': 1000000, 'output': 0, 'cache_read': 0, 'cache_write': 0,
+                                              'cost': 1.0,
+                                              'cost_by_kind': {'input': 1.0, 'output': 0.0, 'cache_read': 0.0,
+                                                               'cache_write': 0.0}},
+                'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0, 'cost': None,
+                                     'cost_by_kind': None}}}],
             'efforts': {}, 'startup': False,
             'advisor': {'calls': 0, 'cost': 0.0, 'tokens': {'input': 0, 'output': 0, 'cache_read': 0, 'cache_write': 0},
                         'by_role': {}, 'failed': {}, 'weeks': []},
@@ -1994,6 +2042,152 @@ class HealthCheck(Report):
                           'run': None, 'session': file, 'step': None, 'skill': None, 'agent': None}],
             'title': None, 'key': key(file)}])
         self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
+
+    def test_json_phase_costs_split_by_kind_and_cache_lifetime(self):
+        u = {'input_tokens': 1000000, 'output_tokens': 1000000, 'cache_read_input_tokens': 1000000,
+             'cache_creation_input_tokens': 2000000,
+             'cache_creation': {'ephemeral_5m_input_tokens': 1000000, 'ephemeral_1h_input_tokens': 1000000}}
+        self.session([asst('m', model='claude-fable-5-1', u=u, ts=self.ts())], project='proj')
+        session = self.json()['sessions'][0]
+        [phase] = session['phases']
+        entry = phase['models']['claude-fable-5-1']
+        self.assertEqual(phase['name'], 'unattributed')
+        for kind, dollars in {'input': 10.0, 'output': 50.0, 'cache_read': 0.25, 'cache_write': 32.5}.items():
+            self.assertAlmostEqual(entry['cost_by_kind'][kind], dollars)
+        self.assertAlmostEqual(entry['cost'], 92.75)
+        self.assertAlmostEqual(session['models']['claude-fable-5-1']['cost'], 92.75)
+
+    def test_json_phases_place_a_full_run(self):
+        rows = [self.startup(), self.loaded('subagent-driven-development'), self.said(1000)]
+        rows += self.reviewed('im1', 'ok', u=usage(None, 20000, 0), subagent_type='implementer',
+                              description='Implement Task 1')
+        rows += self.reviewed('tr1', 'ok', u=usage(None, 30000, 0), subagent_type='task-reviewer',
+                              description='Review Task 1')
+        rows += self.reviewed('fc1', 'ok', u=usage(None, 40000, 0), subagent_type='fix-checker',
+                              description='Fix-check Task 1')
+        rows += self.reviewed('ex1', 'ok', u=usage(None, 50000, 0), subagent_type='Explore',
+                              description='Find the callers')
+        rows += [self.simplify(), asst('adv', iterations=[executor(2000, 0), ADVISOR], ts=self.ts())]
+        rows += self.agent('fx', error=NOT_FOUND, subagent_type='final-reviewer', description='Final review')
+        rows += self.reviewed('sa1', 'ok', u=usage(None, 60000, 0), subagent_type='general-purpose', model='opus',
+                              description='Reuse pass')
+        rows += self.reviewed('fr', 'ok', u=usage(None, 70000, 0), subagent_type='final-reviewer',
+                              description='Final review')
+        rows += [self.said(3000)]
+        rows += self.reviewed('im2', 'ok', u=usage(None, 80000, 0), subagent_type='implementer',
+                              description='Fix the final findings')
+        rows += self.reviewed('fc2', 'ok', u=usage(None, 90000, 0), subagent_type='fix-checker',
+                              description='Fix-check final findings')
+        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', started='2026-11-05T10:00:00Z')])
+        run = self.json()['runs'][0]
+        self.assertEqual(phase_inputs(run), {
+            'implement': 100000, 'task_review': 30000, 'fix_check': 40000,
+            'simplify': 62030,  # the simplify call, the advisor's message, the errored and the launched dispatch's
+            'final_review': 70000, 'final_fix_check': 90000,
+            'coordination': 54080})  # 1000 + 3000 + Explore's 50000 + seven launches and the record write
+        simplify = next(p for p in run['phases'] if p['name'] == 'simplify')
+        self.assertEqual(simplify['advisor']['calls'], 1)
+        self.assertAlmostEqual(simplify['advisor']['cost'], 0.78)
+        final = next(p for p in run['phases'] if p['name'] == 'final_review')['models']['claude-opus-5-5']
+        self.assertAlmostEqual(final['cost_by_kind']['input'], 0.28)
+
+    def test_json_phases_place_a_plan_run(self):
+        rows = [self.startup(), self.said(1000), self.loaded('brainstorming')]
+        rows += self.reviewed('ex', 'ok', u=usage(None, 2000, 0), subagent_type='Explore', description='Read the code')
+        rows += [self.said(3000), self.loaded('writing-plans'), self.said(4000)]
+        rows += self.reviewed('ps', 'ok', u=usage(None, 5000, 0), subagent_type='plan-simplifier',
+                              description='Plan simplify')
+        rows += self.reviewed('pr', 'ok', u=usage(None, 6000, 0), subagent_type='plan-reviewer',
+                              description='Plan review')
+        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        self.session(rows, project='proj')
+        self.records([plan_record(started='2026-11-05T10:00:00Z')])
+        self.assertEqual(phase_inputs(self.json()['runs'][0]),
+                         {'design': 6010, 'plan_writing': 4030, 'plan_simplify': 5000, 'plan_review': 6000})
+
+    def test_json_phases_follow_the_loads_of_a_full_run_that_designed_itself(self):
+        rows = [self.startup(), self.loaded('brainstorming'), self.said(1000), self.loaded('writing-plans'),
+                self.said(2000), self.loaded('subagent-driven-development'), self.said(3000),
+                self.record_write('c0ffee01', started='2026-11-05T10:00:00Z')]
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', started='2026-11-05T10:00:00Z')])
+        self.assertEqual(phase_inputs(self.json()['runs'][0]),
+                         {'design': 1000, 'plan_writing': 2000, 'coordination': 3010})
+
+    def test_json_phases_place_a_small_run(self):
+        rows = [self.startup(), self.said(1000), self.loaded('brainstorming'), self.said(2000),
+                self.loaded('test-driven-development'), self.said(3000), self.simplify(), self.said(4000)]
+        rows += self.reviewed('fr', 'ok', u=usage(None, 5000, 0), subagent_type='final-reviewer',
+                              description='Final review')
+        rows += [self.said(6000)]
+        rows += self.reviewed('fc', 'ok', u=usage(None, 7000, 0), subagent_type='fix-checker',
+                              description='Fix-check final findings')
+        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        self.session(rows, project='proj')
+        self.records([run_record(path='small', head='c0ffee01', started='2026-11-05T10:00:00Z')])
+        self.assertEqual(phase_inputs(self.json()['runs'][0]), {
+            'design': 2000, 'implement': 10030, 'simplify': 4010, 'final_review': 5000, 'final_fix_check': 7000})
+
+    def test_json_phases_place_a_session_with_no_run(self):
+        no_time = asst('no-time', u=usage(None, 8000, 0))
+        del no_time['timestamp']
+        rows = [self.said(1000), self.loaded('brainstorming'),
+                asst('adv', iterations=[executor(100, 0), ADVISOR], ts=self.ts())]
+        rows += self.reviewed('ex', 'ok', u=usage(None, 3000, 0), subagent_type='Explore', description='Read the code')
+        rows += [self.said(2000), self.loaded('writing-plans'), self.said(4000),
+                 asst('u', model='claude-unknown-1', u=usage(None, 9000, 0), ts=self.ts()),
+                 self.loaded('subagent-driven-development')]
+        rows += self.reviewed('im', 'ok', u=usage(None, 5000, 0), subagent_type='general-purpose', model='opus',
+                              description='Implement Task 1')
+        rows += [self.said(6000), no_time]
+        self.session(rows, project='proj')
+        # a subagent transcript no dispatch of the session launched
+        self.subagent('general-purpose', [asst('wf', u=usage(None, 7000, 0), ts=self.ts())], project='proj',
+                      aid='wf', tid='nowhere')
+        session = self.json()['sessions'][0]
+        self.assertEqual(phase_inputs(session), {'design': 5110, 'plan_writing': 13000, 'implement': 5000,
+                                                 'coordination': 6010, 'unattributed': 16000})
+        self.assertEqual(session['advisor']['calls'], 1)
+        self.assertAlmostEqual(session['advisor']['cost'], 0.78)
+        writing = next(p for p in session['phases'] if p['name'] == 'plan_writing')
+        self.assertEqual(writing['models']['claude-unknown-1'], {'input': 9000, 'output': 0, 'cache_read': 0,
+                                                                 'cache_write': 0, 'cost': None,
+                                                                 'cost_by_kind': None})
+
+    def test_json_phases_start_at_the_window_and_simplify_runs_to_its_end(self):
+        rows = [self.startup(), self.loaded('writing-plans'), self.said(1000)]  # before the run's start
+        started = '2026-11-05T10:00:03.500Z'
+        rows += [self.said(2000), user('<command-name>/simplify</command-name>', ts=self.ts()), self.said(3000),
+                 self.record_write('c0ffee01', started=started)]
+        self.assertGreater(rows[3]['timestamp'], started)
+        self.session(rows, project='proj')
+        self.records([run_record(path='small', head='c0ffee01', started=started)])
+        self.assertEqual(phase_inputs(self.json()['runs'][0]), {'implement': 2000, 'simplify': 3010})
+
+    def test_json_a_runs_simplify_span_ends_with_its_window_in_its_sessions_rows(self):
+        rows = [self.startup(), self.loaded('writing-plans'), self.said(1000)]  # before the run's start
+        started = '2026-11-05T10:00:03.500Z'
+        rows += [self.said(2000), user('<command-name>/simplify</command-name>', ts=self.ts()), self.said(3000),
+                 self.record_write('c0ffee01', started=started), self.said(4000)]  # the last after the run's end
+        self.session(rows, project='proj')
+        self.records([run_record(path='small', head='c0ffee01', started=started)])
+        data = self.json()
+        self.assertEqual(phase_inputs(data['runs'][0]), {'implement': 2000, 'simplify': 3010})
+        self.assertEqual(phase_inputs(data['sessions'][0]), {'plan_writing': 5000})
+
+    def test_json_phases_of_an_unknown_path_start_unattributed(self):
+        self.session([self.startup(), self.said(1000), self.record_write('c0ffee01', started='2026-11-05T10:00:00Z')],
+                     project='proj')
+        self.records([run_record(path='medium', head='c0ffee01', started='2026-11-05T10:00:00Z')])
+        self.assertEqual(phase_inputs(self.json()['runs'][0]), {'unattributed': 1010})
+
+    def test_json_a_split_message_takes_the_phase_of_its_fullest_row(self):
+        self.session([asst('same', u=usage(None, 500, 1), ts=self.ts()), self.loaded('brainstorming'),
+                      asst('same', u=usage(None, 500, 2000), ts=self.ts())], project='proj')
+        [phase] = self.json()['sessions'][0]['phases']
+        self.assertEqual((phase['name'], phase['models']['claude-opus-5-5']['output']), ('design', 2000))
 
     def test_json_weeks_rows(self):
         rows = [self.startup(), asst('big', u=usage(None, 1000000, 0), ts=self.ts()),
