@@ -4,15 +4,16 @@
 start: make one worktree per task at <toplevel>/.worktrees/task-N, on a new branch <run branch>-task-N cut from
        --base, with each --link path symlinked in from the checkout and kept out of git status.
 merge: merge the task branches into the run branch, in the order given.
-finish: remove the tasks' worktrees and branches, once every one is merged and clean.
+finish: remove the tasks' worktrees and branches, once every one is merged and clean, finding each worktree by its
+        branch so it works from any worktree of the repo.
 
 Prints one JSON object. start prints {"run_branch", "base", "tasks": [{"task", "branch", "path"}]}; merge prints
 {"run_branch", "merged": [N], "conflict": null | {"task", "files"}} and stops at the first conflict, leaving it in
 progress, while any other failed merge is a refusal carrying git's message (the tasks before it stay merged); finish
 prints {"removed": [{"task", "branch", "path"}]}, or {"error", "unmerged": [N]} with nothing removed; any other
-refusal, a task worktree with uncommitted changes included, prints {"error"}. Exit codes: done 0, a merge conflict or
-the git state isn't what the command expects 1 (refusals change nothing else), usage error 2 (on stderr, nothing on
-stdout).
+refusal, a task worktree with uncommitted changes or a task branch no worktree has checked out included, prints
+{"error"}. Exit codes: done 0, a merge conflict or the git state isn't what the command expects 1 (refusals change
+nothing else), usage error 2 (on stderr, nothing on stdout).
 
 Usage: wave.py start --base SHA [--repo DIR] [--link PATH]... TASK...
        wave.py merge [--repo DIR] TASK...
@@ -101,6 +102,17 @@ def task_branch(run_branch, n):
 
 def task_path(toplevel, n):
     return os.path.join(toplevel, '.worktrees', f'task-{n}')
+
+
+def worktree_paths(toplevel):
+    """Each branch checked out in one of the repo's worktrees, mapped to that worktree's path."""
+    paths, path = {}, None
+    for line in git(toplevel, 'worktree', 'list', '--porcelain').stdout.splitlines():
+        if line.startswith('worktree '):
+            path = line[len('worktree '):]
+        elif line.startswith('branch refs/heads/'):
+            paths[line[len('branch refs/heads/'):]] = path
+    return paths
 
 
 def branch_exists(toplevel, branch):
@@ -194,14 +206,18 @@ def finish(opts, toplevel, run_branch):
     if unmerged:
         names = ', '.join(task_branch(run_branch, n) for n in unmerged)
         return {'error': 'not merged into %s yet: %s' % (run_branch, names), 'unmerged': unmerged}, 1
-    paths = [task_path(toplevel, n) for n in opts.tasks]
+    branches = [task_branch(run_branch, n) for n in opts.tasks]
+    worktrees = worktree_paths(toplevel)
+    missing = [b for b in branches if b not in worktrees]
+    if missing:
+        return {'error': 'no worktree has %s checked out' % ', '.join(missing)}, 1
+    paths = [worktrees[b] for b in branches]
     dirty = [p for p in paths if os.path.isdir(p) and git(p, 'status', '--porcelain').stdout]
     if dirty:
         return {'error': 'uncommitted changes in %s: commit or discard them first' % ', '.join(dirty)}, 1
     removed = []
-    for n, path in zip(opts.tasks, paths):
-        branch = task_branch(run_branch, n)
-        # A folder that is already gone is fine: git just drops its registration.
+    for n, branch, path in zip(opts.tasks, branches, paths):
+        # A folder that is already gone is fine: git still lists it, and just drops its registration.
         for args in (('worktree', 'remove', path), ('branch', '-d', branch)):
             r = git(toplevel, *args)
             if r.returncode != 0:

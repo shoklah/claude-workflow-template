@@ -83,6 +83,13 @@ class Wave(unittest.TestCase):
         write(os.path.join(self.task_path(n), rel), text)
         commit(self.task_path(n), f'task {n}')
 
+    def run_in_linked_worktree(self):
+        """Move the run branch (main) into a linked worktree, the checkout going to another branch; returns its path."""
+        path = os.path.join(self.root, 'run')
+        git(self.repo, 'checkout', '-q', '-b', 'other')
+        git(self.repo, 'worktree', 'add', '-q', path, 'main')
+        return path
+
     def test_start_makes_a_worktree_per_task_from_the_base(self):
         base = self.head()
         out = self.run_script(['start', '--base', base, '--link', 'deps', '3', '4'])
@@ -213,6 +220,17 @@ class Wave(unittest.TestCase):
         self.assertEqual(git(self.repo, 'branch', '--list', 'main-task-*'), '')
         self.assertFalse(os.path.exists(self.task_path(3)))
 
+    def test_finish_from_a_linked_worktree_after_starting_in_the_main_checkout(self):
+        self.wave(3, 4)
+        self.edit(3, 'three.txt', 'three\n')
+        self.edit(4, 'four.txt', 'four\n')
+        run = self.run_in_linked_worktree()
+        self.run_script(['merge', '--repo', run, '3', '4'], cwd=self.root)
+        out = self.run_script(['finish', '--repo', run, '3', '4'], cwd=self.root)
+        self.assertEqual(self.last_rc, 0)
+        self.assertEqual([r['path'] for r in out['removed']], [self.task_path(3), self.task_path(4)])
+        self.assertEqual(self.worktrees(), 2)  # the checkout and the run's worktree
+
     def test_finish_with_a_linked_folder_keeps_the_checkouts_folder(self):
         self.run_script(['start', '--base', self.head(), '--link', 'deps', '3'])
         self.edit(3, 'three.txt', 'three\n')
@@ -244,6 +262,19 @@ class Wave(unittest.TestCase):
         self.assertIn('uncommitted', out['error'])
         self.assertEqual(self.worktrees(), 3)
         self.assertTrue(os.path.isdir(self.task_path(3)))
+
+    def test_finish_refuses_a_task_branch_no_worktree_has_and_removes_nothing(self):
+        self.wave(3, 4)
+        self.edit(3, 'three.txt', 'three\n')
+        self.edit(4, 'four.txt', 'four\n')
+        self.run_script(['merge', '3', '4'])
+        git(self.repo, 'worktree', 'remove', self.task_path(4))
+        out = self.run_script(['finish', '3', '4'])
+        self.assertEqual(self.last_rc, 1)
+        self.assertIn('main-task-4', out['error'])
+        self.assertEqual(self.worktrees(), 2)
+        self.assertEqual(git(self.repo, 'branch', '--list', '--format=%(refname:short)', 'main-task-*').split(),
+                         ['main-task-3', 'main-task-4'])
 
     def test_finish_drops_a_worktree_whose_folder_is_gone(self):
         self.wave(3)
