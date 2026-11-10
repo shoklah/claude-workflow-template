@@ -1899,6 +1899,26 @@ class HealthCheck(Report):
         self.assertEqual(self.health(),
                          ['WARN: b (2026-11-05): required skill subagent-driven-development did not run'])
 
+    def test_the_startup_hooks_using_superpowers_block_counts_as_a_load(self):
+        hook = startup_row(self.ts())
+        hook['attachment']['stdout'] = ('<using-superpowers-session-start>rules</using-superpowers-session-start>\n'
+                                        + STARTUP)
+        self.session([hook, self.said(1000)], project='proj')
+        self.assertEqual(self.json()['sessions'][0]['skills'],
+                         [{'name': 'using-superpowers', 'time': hook['timestamp'], 'outcome': 'ran'}])
+
+    def test_the_hooks_using_superpowers_block_alone_counts_as_a_load(self):
+        hook = startup_row(self.ts())
+        hook['attachment']['stdout'] = '<using-superpowers-session-start>rules</using-superpowers-session-start>\n'
+        self.session([hook, self.said(1000)], project='proj')
+        self.assertEqual([s['name'] for s in self.json()['sessions'][0]['skills']], ['using-superpowers'])
+
+    def test_a_queued_prompt_quoting_the_startup_tags_is_not_a_load(self):
+        queued = {'type': 'attachment', 'timestamp': self.ts(),
+                  'attachment': {'type': 'queued_command', 'prompt': '<using-superpowers-session-start>' + STARTUP}}
+        self.session([self.startup(), queued, self.said(1000)], project='proj')
+        self.assertEqual(self.json()['sessions'][0]['skills'], [])
+
     def test_json_carries_waves_and_the_wave_check_as_written(self):
         waves = [{'wave': 'A', 'tasks': [3, 4], 'conflicts': 0}]
         self.wave_run(waves)

@@ -280,11 +280,14 @@ FIX_ROUND_SUBJECT = 'fix: address review findings'
 FIX_GROWTH_SLACK = 20  # lines; a recorded fix_added is off when it misses git's by more than this and by over 50%
 NOT_FOUND = re.compile(r"Agent type '([^']*)' not found")
 STARTUP_TAG = b'<karpathy-guidelines-session-start>'
+# The session-start hook's using-superpowers block: the skill is in context without a Skill call.
+SUPERPOWERS_TAG = b'<using-superpowers-session-start>'
 RUN_LOG = 'workflow-log.jsonl'
 # Only lines matching this can hold a dispatch, a simplify call, a record write, the startup block, an error, a skill
-# load, a typed trigger, a spec or plan write or a session title. A typed command shows as
-# <command-name>/name</command-name>.
+# load (the hook's using-superpowers block included, which it prints alone when the karpathy file is unreadable), a
+# typed trigger, a spec or plan write or a session title. A typed command shows as <command-name>/name</command-name>.
 HEALTH_NEEDLES = (b'"Agent"', b'simplify', b'workflow-log.jsonl', b'karpathy-guidelines-session-start',
+                  b'using-superpowers-session-start',
                   b'"is_error":true', b'"is_error": true', b'Base directory for this skill', b'rill me',
                   b'command-name', b'docs/superpowers/', b'"custom-title"')
 SKILL_LOADED = 'Base directory for this skill: '
@@ -316,7 +319,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -1089,6 +1092,8 @@ def scan_events(path):
     Events are (timestamp, kind, value) in file order: ('simplify', None), ('agent', (id, input)), ('not_found',
     agent type), ('refused', GUARD_REASONS key), ('write', Bash command naming the run log), ('skill', name) for a
     skill's load, the row that follows a Skill call, a typed command or an agent's start with its preloaded skills,
+    or the session-start hook's using-superpowers block (SUPERPOWERS_TAG in a SessionStart hook row, so once per
+    start, clear or compaction),
     ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('command', name) for a typed row's slash
     command, its first text that COMMAND matches, ('wrote', path) for a Write or Edit of a spec or plan, and
     ('title', text) for a custom-title row. A row with no timestamp takes the previous row's.
@@ -1111,6 +1116,11 @@ def scan_events(path):
                 kind, content = row.get('type'), row.get('message', {}).get('content')
                 # Prompts and briefs can quote the tag; only the hook's attachment row shows the block was injected.
                 startup = startup or (kind == 'attachment' and STARTUP_TAG in line)
+                if kind == 'attachment' and SUPERPOWERS_TAG in line:
+                    # A SessionStart hook row carries the block; a queued prompt or another hook can only quote it.
+                    hook = field(field(row, 'attachment', dict, {}), 'hookName', str, '')
+                    if hook.startswith('SessionStart'):
+                        events.append((timestamp, 'skill', 'using-superpowers'))
                 if kind == 'custom-title' and isinstance(row.get('customTitle'), str):
                     events.append((timestamp, 'title', row['customTitle']))
                 if row_calls_simplify(row):
