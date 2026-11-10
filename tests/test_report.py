@@ -892,9 +892,10 @@ class HealthCheck(Report):
         return [asst('m-' + tid, content=[tool_use(tid, 'Agent', dict(inp, prompt='p'))], ts=self.ts()),
                 user([result], ts=self.ts(), **extra)]
 
-    def record_write(self, head, base='0000aaaa', started=None):
+    def record_write(self, head, base='0000aaaa', started=None, command=None):
+        """The Bash row that appends the record with head to the log: an echo of its JSON, or command when given."""
         fields = f'"base": "{base}", "head": "{head}"' + (f', "started": "{started}"' if started else '')
-        command = f'echo \'{{{fields}}}\' >> "$HOME/.claude/workflow-log.jsonl"'
+        command = command or f'echo \'{{{fields}}}\' >> "$HOME/.claude/workflow-log.jsonl"'
         return asst('w-' + head, content=[tool_use('w' + head, 'Bash', {'command': command})], ts=self.ts())
 
     def loaded(self, name):
@@ -1165,6 +1166,18 @@ class HealthCheck(Report):
     def test_run_with_no_record_write_warns(self):
         self.records([run_record(head='c0ffee01')])
         self.assertEqual(self.health(), ['WARN: b (2026-11-05): no session transcript found'])
+
+    def test_a_record_written_in_python_or_shell_quotes_still_ends_its_run(self):
+        """A record built in a Python dict or an echo "..." string quotes its values with ' or \\"."""
+        python = ('/usr/bin/python3 -c "import json; print(json.dumps({\'started\': \'2026-11-05T10:00:00Z\', '
+                  '\'head\': \'c0ffee01\'}))" >> ~/.claude/workflow-log.jsonl')
+        escaped = 'echo "{\\"head\\": \\"c0ffee02\\"}" >> ~/.claude/workflow-log.jsonl'
+        self.session([self.startup(), self.simplify(), self.record_write('c0ffee01', command=python)], project='proj')
+        self.session([self.startup(), self.simplify(), self.record_write('c0ffee02', command=escaped)], project='proj',
+                     sid='sess-2')
+        self.records([run_record(head='c0ffee01', started='2026-11-05T10:00:00Z'),
+                      run_record(head='c0ffee02', branch='b2')])
+        self.assertEqual(self.health(), ['Health: no problems'])
 
     def test_brief_shows_first_warning_and_count(self):
         self.silent_case()
@@ -1863,10 +1876,10 @@ class HealthCheck(Report):
 
     def test_a_chat_only_session_this_week_without_startup_guidelines_is_warned(self):
         self.session([user('Hello', ts=self.ts())], project='proj')
-        # last week's session, by its file's time, is not
-        self.session([user('Hello', ts='2026-10-30T10:00:00.000Z')], project='proj', sid='sess-2')
-        old = datetime.datetime(2026, 10, 30, 10, tzinfo=datetime.timezone.utc).timestamp()
-        os.utime(os.path.join(self.projects, 'proj', 'sess-2.jsonl'), (old, old))
+        # last week's session, by its rows, is not: the app rewrites old transcripts' metadata rows, so a file's time
+        # says nothing about when it ran
+        self.session([user('Hello', ts='2026-10-30T10:00:00.000Z'), {'type': 'cost-state', 'sessionId': 's'}],
+                     project='proj', sid='sess-2')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: startup guidelines missing'])
 
     def test_a_compaction_summary_quoting_grill_me_is_not_a_trigger(self):

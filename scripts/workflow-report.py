@@ -1197,12 +1197,13 @@ def run_spans(projects_root, records, now):
     """Map each record's index in records, the whole run log, to (transcript_path, start, end), as timestamps.
 
     end is the main-transcript Bash row that wrote the run's record. For a record with a "started" time, it is the
-    first whose "started" value is the record's, as written, and start is that time. Otherwise it is the first whose
-    "head" value is the run's head, since the next run's record names that head again as its base, perhaps in another
-    session, and start is the previous record-writing row in that transcript, one whose "head" value is any record's
-    head, or None for the transcript's start. So a run a report leaves out still ends where its record was written, and
-    a command that mentions the log without a record's "head" or "started" value ends nothing. A run whose record write
-    isn't found has no span, and a span ends at now at the latest, since rows after now are ignored.
+    first whose "started" value is the record's, as written, in JSON, Python or shell-escaped quotes, and start is that
+    time. Otherwise it is the first whose "head" value is the run's head, since the next run's record names that head
+    again as its base, perhaps in another session, and start is the previous record-writing row in that transcript, one
+    whose "head" value is any record's head, or None for the transcript's start. So a run a report leaves out still
+    ends where its record was written, and a command that mentions the log without a record's "head" or "started"
+    value ends nothing. A run whose record write isn't found has no span, and a span ends at now at the latest, since
+    rows after now are ignored.
     """
     heads = [(i, re.compile(r'"head"\s*:\s*"' + re.escape(r['head'])))
              for i, r in enumerate(records) if isinstance(r.get('head'), str) and r['head']]
@@ -1217,6 +1218,8 @@ def run_spans(projects_root, records, now):
         for timestamp, kind, command in transcript_events(path)[0]:
             if kind != 'write':
                 continue
+            # A record built in a Python dict or an echo "..." string quotes its values with ' or \".
+            command = command.replace('\\"', '"').replace("'", '"')
             for i, written, started in starts:
                 if written.search(command):
                     spans.setdefault(i, (path, started, min(timestamp, last)))
@@ -1821,13 +1824,13 @@ def session_warnings(projects_root, spans, now):
             if not met and t is not None and t >= week:
                 out.append((path, problem('typed_skill_not_loaded',
                                           f"session {name}: typed '{skill}' but {skill} never loaded", skill=skill)))
-        # A session with a run gets the per-run line instead. The file's time says it ran this week, since a chat-only
-        # session has no events.
+        # A session with a run gets the per-run line instead. Its rows say whether it ran this week, since a chat-only
+        # session has no events; the file's time only screens, as the app rewrites old transcripts' metadata rows.
         try:
-            this_week = os.path.getmtime(path) >= week.timestamp()
+            touched = os.path.getmtime(path) >= week.timestamp()
         except OSError:
-            this_week = False
-        if path not in covered and not startup and this_week:
+            touched = False
+        if path not in covered and not startup and touched and (file_usage(path)['last'] or '') >= stamp(week):
             out.append((path, problem('startup_missing', f'session {name}: startup guidelines missing')))
     return out
 

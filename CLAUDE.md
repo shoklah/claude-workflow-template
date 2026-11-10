@@ -32,3 +32,5 @@
 - A unit's `phases` are counted in the pass that counts its `models` and `advisor`, so they add up to them; a message's phase comes from its transcript and its row's time.
 - In `--json`, a collection whose entries can drop out between exports is a list, since the dashboard merges objects key by key and replaces lists whole.
 - A session's start, end, project and slash commands are its main transcript's, never split by run windows; start, end and project are read over the whole file, like its title, and a command is kept by name and time only, its arguments never read.
+- A run record is tied to its session only by its `started` or `head` value appearing, in JSON, Python or shell-escaped quotes, in the main-transcript Bash command that wrote it, never by time or order; a record built from shell variables stays untied.
+- When a transcript ran is decided by its rows' timestamps; the file's modification time only screens out files older than the window, since the app rewrites old transcripts' metadata rows.
