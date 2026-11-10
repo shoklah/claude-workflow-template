@@ -1444,11 +1444,11 @@ class HealthCheck(Report):
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
     def pins(self, skills=False):
-        """A fixture agents folder: final-reviewer pinned fable/high and fix-checker sonnet/medium, listing their
+        """A fixture agents folder: final-reviewer pinned opus/high and fix-checker sonnet/medium, listing their
         skills only when skills is true."""
         folder = os.path.join(self.root, 'agents')
         os.makedirs(folder, exist_ok=True)
-        for name, model, effort, listed in (('final-reviewer', 'fable', 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
+        for name, model, effort, listed in (('final-reviewer', 'opus', 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
                                             ('fix-checker', 'sonnet', 'medium', [])):
             lines = ['---', f'name: {name}', 'description: d', f'model: {model}', f'effort: {effort}']
             if skills and listed:
@@ -1738,15 +1738,23 @@ class HealthCheck(Report):
 
     def test_an_agent_off_its_pin_is_warned_unless_the_stage_allows_it(self):
         prefix = 'WARN: b (2026-11-05): '
+        after = {'date': '2026-11-11T00:00:00Z'}
         cases = (
             # (record fields, dispatch input, subagent model and effort, expected)
-            ({}, {}, ('claude-opus-5-5', 'high'),
-             [prefix + 'final-reviewer ran on claude-opus-5-5/high, pinned fable/high: Final review']),
+            ({}, {}, ('claude-opus-5-5', 'high'), ['Health: no problems']),
+            ({'risk_area': True}, {}, ('claude-opus-5-5', 'high'), ['Health: no problems']),
             ({'stage': 'out'}, {}, ('claude-opus-5-5', 'xhigh'), ['Health: no problems']),
-            ({'stage': '3'}, {'model': 'opus'}, ('claude-opus-5-5', 'high'), ['Health: no problems']),
-            ({'risk_area': True}, {'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'), ['Health: no problems']),
+            ({'stage': '3'}, {'model': 'fable'}, ('claude-fable-5-1', 'high'), ['Health: no problems']),
+            ({'risk_area': True}, {'model': 'fable', 'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'),
+             ['Health: no problems']),
             ({'risk_area': True}, {}, ('claude-fable-5-1', 'xhigh'),
-             [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned fable/high: Final review']),
+             [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned opus/high: Final review']),
+            ({}, {'model': 'fable', 'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'),
+             [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned opus/high: Final review']),
+            ({}, {}, ('claude-fable-5-1', 'high'), ['Health: no problems']),
+            (after, {}, ('claude-fable-5-1', 'high'),
+             ['WARN: b (2026-11-11): final-reviewer ran on claude-fable-5-1/high, pinned opus/high: Final review']),
+            ({'date': '2026-11-10T23:00:00Z'}, {}, ('claude-fable-5-1', 'high'), ['Health: no problems']),
         )
         for over, inp, (model, effort), expected in cases:
             with self.subTest(over=over, inp=inp):
@@ -1758,9 +1766,9 @@ class HealthCheck(Report):
                                  self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
                                                sub_model=model, sub_effort=effort, subagent_type='final-reviewer',
                                                description='Final review', **inp), **over)
-                self.assertEqual(self.health('--agents', self.pins()), expected)
-                self.assertEqual(self.kinds('--agents', self.pins()),
-                                 ['agent_off_pin'] if expected[0].startswith('WARN') else [])
+                args = ('--agents', self.pins(), '--now', '2026-11-11T12:00:00Z')
+                self.assertEqual(self.health(*args), expected)
+                self.assertEqual(self.kinds(*args), ['agent_off_pin'] if expected[0].startswith('WARN') else [])
 
     def test_a_risk_area_small_run_is_warned(self):
         self.final_run(path='small', risk_area=True)

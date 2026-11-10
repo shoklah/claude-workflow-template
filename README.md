@@ -22,7 +22,7 @@ It's a template. Read it, change the models, thresholds and wording to fit your 
 ```mermaid
 flowchart TD
     T([New task]) --> U["Read get_usage:<br/>Fable stage and all-model %"]
-    U --> R{"Touches a risk area?<br/>auth, payments, migrations or deletions,<br/>production infra, concurrency, public API"}
+    U --> R{"Touches a risk area?<br/>auth, payments, migrations or deletions,<br/>production infra, concurrency,<br/>a change that renames, removes or changes<br/>the meaning of something exported<br/>(an additive key or field is not a risk area)"}
     R -- yes --> F[Full path]
     R -- no --> K{What kind of change?}
     K -- "typo, docs, comment" --> D["Direct:<br/>the edit + automated checks"]
@@ -123,7 +123,7 @@ Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3
 | Round 3 from Opus | `implementer-escalated` | Fable | `high` |
 | Task review | `task-reviewer` | Opus 5.5 | `high` |
 | Re-check of listed findings | `fix-checker` | Sonnet 5.5 | `medium` |
-| Final review, and the Small path's reviewer | `final-reviewer` | Fable | `high`, `xhigh` in risk areas |
+| Final review, and the Small path's reviewer | `final-reviewer` | Opus 5.5; Fable in risk areas | `high`; `xhigh` in risk areas |
 | The four agents `simplify` launches | `general-purpose`, model passed at dispatch | Opus 5.5 | `high` |
 
 ### Fable stages
@@ -132,12 +132,12 @@ At task start Claude reads `get_usage`, works out the share of the week gone (`1
 
 | Stage | Trigger | Other main sessions | Design and plan | Plan review | Final review |
 |---|---|---|---|---|---|
-| 1 | Up to 15 points ahead of the week | Owner's choice, Fable allowed | Fable | Fable | Fable |
-| 2 | More than 15 points ahead | Opus 5.5 with Fable advisor | Fable | Fable | Fable |
-| 3 | 90% used or more | Opus 5.5, advisor off | Opus 5.5 | Opus 5.5 | Fable |
+| 1 | Up to 15 points ahead of the week | Owner's choice, Fable allowed | Fable | Fable | Opus 5.5; Fable at `xhigh` in risk areas |
+| 2 | More than 15 points ahead | Opus 5.5 with Fable advisor | Fable | Fable | Opus 5.5; Fable at `xhigh` in risk areas |
+| 3 | 90% used or more | Opus 5.5, advisor off | Opus 5.5 | Opus 5.5 | Opus 5.5; Fable at `xhigh` in risk areas |
 | Out | Fable unavailable | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5 at `xhigh` |
 
-The all-model limit is watched too: Claude warns when it is more than 15 points ahead of the week, and at 90% no new Full path run starts without the owner's OK. Nothing silently drops to Sonnet. A stage 3 or Out override is an explicit `model` at dispatch on the named agent. `plan-simplifier` isn't in the table: it is pinned to Opus 5.5 at `high` in every stage.
+The all-model limit is watched too: Claude warns when it is more than 15 points ahead of the week, and at 90% no new Full path run starts without the owner's OK. Nothing silently drops to Sonnet. A stage 3 or Out override is an explicit `model` at dispatch on the named agent, and so is `final-reviewer` in a risk area: `model: fable` with `effort: xhigh`. `plan-simplifier` isn't in the table: it is pinned to Opus 5.5 at `high` in every stage.
 
 ### The Fable advisor (trial)
 

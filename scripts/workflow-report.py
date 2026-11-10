@@ -231,6 +231,8 @@ PATH_PHASES = {'plan': 'design', 'full': 'coordination', 'small': 'implement'}
 STOP_SHARE = 25.0
 TRIAL_RUNS = 5
 TRIAL_WEEKS = 3
+# The day final-reviewer's Opus seat was installed: up to and on it, its pin was Fable at high.
+OPUS_FINAL_REVIEW_FROM = '2026-11-10'
 FIX_WINDOW_DAYS = 14
 NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
@@ -1646,15 +1648,19 @@ def check_steps(run, dispatches, events, pins):
         if pin is None or sub is None:
             continue
         model, effort = ran_on(sub_usage(sub))
-        # The overrides the stage allows: an explicit model in stage 3 or Out, effort xhigh for final-reviewer in a
-        # risk area, and Opus at xhigh for final-reviewer in Out. A model or effort the transcript doesn't show passes.
+        # The overrides the stage allows: an explicit model in stage 3 or Out, xhigh for final-reviewer in Out, and
+        # final-reviewer's Fable seats: at xhigh passed in a risk area, and at high in a run finished on or before the day
+        # the Opus seat was installed. A model or effort the transcript doesn't show passes.
         final = agent == 'final-reviewer'
+        fable = on_model(model or '', 'fable')
         model_ok = (not model or not pin['model'] or on_model(model, pin['model'])
                     or stage in ('3', 'out') and bool(inp.get('model')))
         effort_ok = (not effort or not pin['effort'] or effort == pin['effort']
-                     or final and run.get('risk_area') is True and inp.get('effort') == effort == 'xhigh')
-        out_ok = final and stage == 'out' and (model or '').startswith('claude-opus') and effort == 'xhigh'
-        if not (model_ok and effort_ok or out_ok):
+                     or final and stage == 'out' and effort == 'xhigh')
+        seat_ok = final and fable and (run.get('risk_area') is True and inp.get('effort') == effort == 'xhigh'
+                                       or effort == 'high' and run['_time'] is not None
+                                       and run['_time'].date().isoformat() <= OPUS_FINAL_REVIEW_FROM)
+        if not (model_ok and effort_ok or seat_ok):
             problems.append(problem('agent_off_pin', f"{agent} ran on {model}/{effort}, pinned "
                                     f"{pin['model']}/{pin['effort']}: {inp.get('description')}",
                                     step=step, agent=agent))

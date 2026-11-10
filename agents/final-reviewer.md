@@ -1,7 +1,7 @@
 ---
 name: final-reviewer
 description: Fresh review of a whole branch after simplify, for the Full path's final review and the Small path's one reviewer.
-model: fable
+model: opus
 effort: high
 disallowedTools: Edit, Write, NotebookEdit, Agent
 skills:
