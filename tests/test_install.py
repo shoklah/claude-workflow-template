@@ -19,7 +19,7 @@ CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 
 AGENTS = ['final-reviewer.md', 'fix-checker.md', 'implementer-copy.md', 'implementer-escalated.md',
-          'implementer.md', 'plan-reviewer.md', 'plan-simplifier.md', 'task-reviewer.md']
+          'implementer.md', 'plan-reviewer.md', 'plan-simplifier.md', 'sweeper.md', 'task-reviewer.md']
 SCRIPTS = ['failing-test-check.py', 'wave.py', 'workflow-report.py']
 SKILLS = ['workflow-dashboard']
 HOOK_FILES = ['guard-agent-dispatch.py', 'guard-main-commit.py', 'session-start-superpowers.sh']

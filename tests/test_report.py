@@ -20,6 +20,7 @@ SCRIPT = os.path.join(SCRIPTS_DIR, 'workflow-report.py')
 PYTHON = '/usr/bin/python3'
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 NOW = '2026-11-07T12:00:00Z'  # a Saturday; its week started Sunday 2026-11-01 07:00 UTC
+OVER_CAP = {'input_tokens': 300_001, 'output_tokens': 1}  # the usage of one call past CONTEXT_CAP
 
 # The spec's phase order, as PHASES in scripts/workflow-report.py: keep them the same.
 PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'fix_check',
@@ -255,6 +256,11 @@ class Report(unittest.TestCase):
         self.subagent('plan-simplifier', [asst('m_s', iterations=[executor(), ADVISOR])], aid='s1')
         roles = {line.strip().split(':')[0]: line for line in section(self.run_report(), 'Advisor calls by role:')[1:]}
         self.assertIn('FLAG', roles['plan-simplifier'])
+
+    def test_sweeper_should_not_consult(self):
+        self.subagent('sweeper', [asst('m_s', iterations=[executor(), ADVISOR])], aid='s1')
+        roles = {line.strip().split(':')[0]: line for line in section(self.run_report(), 'Advisor calls by role:')[1:]}
+        self.assertIn('FLAG', roles['sweeper'])
 
     def test_workflow_subagent_transcripts_are_read_with_their_role(self):
         # <project>/<session>/subagents/workflows/<id>/agent-x.jsonl, with its .meta.json beside it
@@ -677,7 +683,8 @@ class Report(unittest.TestCase):
         self.assertEqual(data['version'], 1)
         self.assertEqual(sorted(data), ['categories', 'generated', 'now', 'runs', 'sessions', 'since', 'stage_table', 'totals', 'version'])
         self.assertEqual(sorted(data['totals']),
-                         ['advisor', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills', 'weeks'])
+                         ['advisor', 'context', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills',
+                          'weeks'])
         self.assertEqual(data['now'], '2026-11-07T12:00:00+00:00')
         self.assertIsNone(data['since'])
 
@@ -892,6 +899,18 @@ class HealthCheck(Report):
         return [asst('m-' + tid, content=[tool_use(tid, 'Agent', dict(inp, prompt='p'))], ts=self.ts()),
                 user([result], ts=self.ts(), **extra)]
 
+    def handoff(self, prompt='Handoff 1: go'):
+        """A start_session call whose brief is prompt, and its result naming the session it started. The app's session
+        id never names the new session's transcript; the brief in its first user row, as briefed writes it, does."""
+        tid = f'h{self.clock}'
+        return [asst('a-' + tid, [tool_use(tid, 'mcp__ccd_session__start_session', {'prompt': prompt})], ts=self.ts()),
+                user([{'type': 'tool_result', 'tool_use_id': tid, 'content': '(session_id: local_9999, name: n)'}],
+                     ts=self.ts())]
+
+    def briefed(self, prompt='Handoff 1: go'):
+        """The first user row of a session that start_session started with the brief prompt."""
+        return user(f'Task (from the session that started this one):\n{prompt}', ts=self.ts())
+
     def record_write(self, head, base='0000aaaa', started=None, command=None):
         """The Bash row that appends the record with head to the log: an echo of its JSON, or command when given."""
         fields = f'"base": "{base}", "head": "{head}"' + (f', "started": "{started}"' if started else '')
@@ -911,17 +930,41 @@ class HealthCheck(Report):
         """The problem lines of --health. Information lines are checked by the tests about them."""
         return [line for line in self.run_report('--health', *args).splitlines() if line.startswith(('WARN', 'Health'))]
 
-    def reviewed(self, tid, report, handback=None, sub_model=None, sub_effort=None, u=None, **inp):
-        """A launched dispatch whose subagent transcript ends with report as its last text, then a SubagentHandback
-        whose message is handback when one is given. Its rows run on sub_model and sub_effort when given, and its
-        report row has usage u when given."""
+    def reviewed(self, tid, report, handback=None, sub_model=None, sub_effort=None, u=None, sid='sess-1', **inp):
+        """A launched dispatch whose subagent transcript, under the main transcript sid, ends with report as its last
+        text, then a SubagentHandback whose message is handback when one is given. Its rows run on sub_model and
+        sub_effort when given, and its report row has usage u when given."""
         ran = dict({'model': sub_model} if sub_model else {}, effort=sub_effort)
         rows = [asst('r-' + tid, content=[{'type': 'text', 'text': report}], ts=self.ts(), u=u, **ran)]
         if handback is not None:
             rows.append(asst('h-' + tid, content=[tool_use('hb' + tid, 'SubagentHandback', {'message': handback})],
                              ts=self.ts(), **ran))
-        self.subagent(inp.get('subagent_type') or 'general-purpose', rows, project='proj', aid=tid, tid=tid)
+        self.subagent(inp.get('subagent_type') or 'general-purpose', rows, project='proj', sid=sid, aid=tid, tid=tid)
         return self.agent(tid, **inp)
+
+    def handed_off(self, calls):
+        """An old session aaaa that dispatches an implementer, then makes calls, (prompt, result) pairs of
+        start_session calls whose result row is left out when result is None, then writes one more row; and a new
+        session bbbb, whose first user row holds every call's brief, that runs the final review and writes the record
+        of a run started before both."""
+        started = '2026-11-05T10:00:00Z'
+        old = [asst('a1', ts=self.ts())]
+        old += self.reviewed('im', 'DONE', sid='aaaa', subagent_type='implementer', description='Implement Task 1')
+        for n, (prompt, result) in enumerate(calls):
+            old.append(asst(f'call{n}', [tool_use(f'h{n}', 'mcp__ccd_session__start_session',
+                                                  {'prompt': prompt, 'background': 'x' * 80})], ts=self.ts()))
+            if result is not None:
+                old.append(user([{'type': 'tool_result', 'tool_use_id': f'h{n}', 'content': result}], ts=self.ts()))
+        old.append(asst('a3', ts=self.ts()))  # after the handoff: the old session's own row
+        self.session(old, project='proj', sid='aaaa')
+        new = [self.briefed('\n'.join(prompt for prompt, _ in calls))]
+        new += self.reviewed('fr', 'ok\nFindings: critical=0 important=0 minor=0 unneeded=0 strengths=0', sid='bbbb',
+                             subagent_type='final-reviewer', description='Final review')
+        new.append(self.record_write('c0ffee01', started=started))
+        self.session(new, project='proj', sid='bbbb')
+        steps = [{'step': 'final_review', 'agent_id': 'fr', 'findings': [], 'strengths': [],
+                  'counts': {'critical': 0, 'important': 0, 'minor': 0, 'unneeded': 0}}]
+        self.records([run_record(head='c0ffee01', started=started, schema=4, steps=steps)])
 
     def silent_case(self):
         rows = [self.startup(), self.simplify()]
@@ -1181,11 +1224,11 @@ class HealthCheck(Report):
 
     def test_brief_shows_first_warning_and_count(self):
         self.silent_case()
-        # last week's run shows in --health but is not counted in this week's brief
-        self.records([run_record(branch='old', head='dead0001', date='2026-10-30T12:00:00Z')])
+        # last week's run, within --health's 7 days, shows in --health but is not counted in this week's brief
+        self.records([run_record(branch='old', head='dead0001', date='2026-11-01T05:00:00Z')])
         health = self.health()
         self.assertEqual(len(health), 11)
-        self.assertIn('WARN: old (2026-10-30): no session transcript found', health)
+        self.assertIn('WARN: old (2026-11-01): no session transcript found', health)
         brief = self.run_report('--brief').splitlines()
         self.assertEqual(len(brief), 3)
         self.assertEqual(brief[2], health[0] + ' (+9 more, run --health)')
@@ -1357,6 +1400,75 @@ class HealthCheck(Report):
         self.assertEqual(self.kinds(), ['unrecorded_session', 'unrecorded_session'])
         self.assertEqual(self.run_report('--brief').splitlines()[2],
                          'WARN: session sess-1.jsonl ran workflow agents but wrote no run record (+1 more, run --health)')
+
+    def test_a_handed_off_run_reads_its_whole_chain(self):
+        self.handed_off([('Handoff 1: continue at task 2', 'Started session "n" (session_id: local_9999, name: n).')])
+        data = self.json()
+        [run] = data['runs']
+        a = os.path.join(self.projects, 'proj', 'aaaa.jsonl')
+        self.assertEqual([d['agent'] for d in run['dispatches']], ['implementer', 'final-reviewer'])
+        self.assertEqual([d['step'] for d in run['dispatches']], [None, 0])
+        # aaaa's three main calls up to the handoff call, and bbbb's dispatch and record write
+        self.assertEqual(run['context']['calls'], 5)
+        self.assertNotIn('unrecorded_session', self.kinds())
+        self.assertNotIn('step_agent_unknown', self.kinds())
+        session_a = next(s for s in data['sessions'] if s['file'] == a)
+        # only the row after the handoff is the old session's
+        self.assertEqual(session_a['models']['claude-opus-5-5']['input'], 10)
+        self.assertEqual(session_a['context']['calls'], 1)
+
+    def test_a_start_session_without_the_marker_joins_no_chain(self):
+        self.handed_off([('Implement the plan. Handoff 1: quoted in the text', '(session_id: local_9999, name: n)'),
+                         ('Handoff 2: torn', None)])
+        [run] = self.json()['runs']
+        self.assertEqual([d['agent'] for d in run['dispatches']], ['final-reviewer'])
+        # the old transcript's implementer dispatch is outside every run
+        self.assertIn('unrecorded_session', self.kinds())
+
+    def test_a_start_session_that_started_no_session_joins_no_chain(self):
+        self.handed_off([('Handoff 1: proposed', 'Proposed "x" (task_id: task_1)')])
+        [run] = self.json()['runs']
+        self.assertEqual([d['agent'] for d in run['dispatches']], ['final-reviewer'])
+        self.assertIn('unrecorded_session', self.kinds())
+
+    def test_a_predecessor_row_belongs_to_the_run_whose_window_on_it_ends_first(self):
+        # aaaa's refused dispatch, before both handoffs, is in both runs' chains but only r1's window on aaaa holds it
+        old = self.agent('gp', error='This dispatch has no model and no named agent, so it would run',
+                         subagent_type='general-purpose', description='x')
+        old += self.handoff('Handoff 1: one') + self.handoff('Handoff 2: two')
+        self.session(old, project='proj', sid='aaaa')
+        self.session([self.briefed('Handoff 1: one'), self.record_write('c0ffee01')], project='proj', sid='bbbb')
+        self.session([self.briefed('Handoff 2: two'), self.record_write('c0ffee02')], project='proj', sid='cccc')
+        self.records([run_record(branch='r1', head='c0ffee01'), run_record(branch='r2', head='c0ffee02')])
+        refusals = {r['record']['branch']: r['refusals'] for r in self.json()['runs']}
+        self.assertEqual(refusals, {'r1': {'no_model': 1}, 'r2': {}})
+
+    def test_a_session_after_a_handoff_keeps_only_its_own_rows(self):
+        old = [self.loaded('brainstorming')] + self.handoff()
+        self.session(old, project='proj', sid='aaaa')
+        self.session([self.briefed(), asst('b1', ts=self.ts())], project='proj', sid='bbbb')
+        skills = {os.path.basename(s['file']): [k['name'] for k in s['skills']] for s in self.json()['sessions']}
+        self.assertEqual(skills, {'aaaa.jsonl': ['brainstorming'], 'bbbb.jsonl': []})
+
+    def test_a_session_after_a_handoff_takes_no_phase_from_its_predecessor(self):
+        old = [self.loaded('brainstorming')] + self.handoff()
+        self.session(old, project='proj', sid='aaaa')
+        self.session([self.briefed(), asst('b1', ts=self.ts())], project='proj', sid='bbbb')
+        phases = {os.path.basename(s['file']): [p['name'] for p in s['phases']] for s in self.json()['sessions']}
+        self.assertEqual(phases['bbbb.jsonl'], ['unattributed'])
+
+    def test_a_handed_off_run_starts_after_the_last_record_its_chain_wrote(self):
+        # R0 is recorded in aaaa before the handoff; R1, recorded in bbbb with no started, starts after R0's record
+        old = self.reviewed('im', 'DONE', sid='aaaa', subagent_type='implementer', description='Implement Task 1')
+        old += [self.record_write('c0ffee00')] + self.handoff()
+        self.session(old, project='proj', sid='aaaa')
+        new = [self.briefed()]
+        new += self.reviewed('fr', 'ok', sid='bbbb', subagent_type='final-reviewer', description='Final review')
+        new.append(self.record_write('c0ffee01'))
+        self.session(new, project='proj', sid='bbbb')
+        self.records([run_record(branch='r0', head='c0ffee00'), run_record(branch='r1', head='c0ffee01')])
+        agents = {r['record']['branch']: [d['agent'] for d in r['dispatches']] for r in self.json()['runs']}
+        self.assertEqual(agents, {'r0': ['implementer'], 'r1': ['final-reviewer']})
 
     def test_planning_session_without_record_is_not_flagged(self):
         # a planning session dispatches a plan reviewer and writes no run record, by design
@@ -2027,6 +2139,7 @@ class HealthCheck(Report):
         self.assertEqual(first['warns'], ['WARN: old (2026-11-05): no session transcript found'])
         self.assertIsNone(first['dispatches'])
         self.assertIsNone(first['phases'])
+        self.assertIsNone(first['context'])
         transcript = os.path.join(self.projects, 'proj', 'sess-1.jsonl')
         self.assertEqual(second['schema'], 2)
         self.assertEqual(second['window'], {'transcript': transcript, 'start': '2026-11-05T10:00:00.000Z',
@@ -2093,6 +2206,10 @@ class HealthCheck(Report):
             'advisor': {'calls': 0, 'cost': 0.0, 'tokens': {'input': 0, 'output': 0, 'cache_read': 0, 'cache_write': 0},
                         'by_role': {}, 'failed': {}, 'weeks': []},
             'notes': {'notes': 0, 'changed': 0, 'missing': 0}, 'refusals': {},
+            'context': {'calls': 2, 'tokens': 1000010, 'median_tokens': 500005.0, 'max_tokens': 1000000,
+                        'over_cap': True, 'calls_over_cap': 1, 'handoff': None},
+            'tool_results': {'read': 0, 'edit': 0, 'run': 0, 'bash_other': 0, 'agent': 0, 'mcp': 0, 'other': 0},
+            'sweeps': {'inline': 0, 'delegated': 0},
             'warns': ['WARN: session sess-1.jsonl: startup guidelines missing'],
             'warnings': [{'text': 'WARN: session sess-1.jsonl: startup guidelines missing', 'kind': 'startup_missing',
                           'run': None, 'session': file, 'step': None, 'skill': None, 'agent': None}],
@@ -2244,6 +2361,194 @@ class HealthCheck(Report):
                       asst('same', u=usage(None, 500, 2000), ts=self.ts())], project='proj')
         [phase] = self.json()['sessions'][0]['phases']
         self.assertEqual((phase['name'], phase['models']['claude-opus-5-5']['output']), ('design', 2000))
+
+    def test_json_units_carry_context_per_main_call(self):
+        full = {'input_tokens': 100, 'cache_read_input_tokens': 199_900, 'cache_creation_input_tokens': 0,
+                'output_tokens': 10}
+        self.session([asst('m1', u=full, ts='2026-11-05T10:00:01.000Z'),
+                      asst('m2', u={'input_tokens': 50, 'output_tokens': 5}, ts='2026-11-05T10:00:02.000Z')],
+                     project='proj')
+        self.subagent('implementer', [asst('s1', u=full, ts='2026-11-05T10:00:03.000Z')], project='proj')
+        [session] = self.json()['sessions']
+        self.assertEqual(session['context'], {'calls': 2, 'tokens': 200_050, 'median_tokens': 100_025.0,
+                                              'max_tokens': 200_000, 'over_cap': False, 'calls_over_cap': 0,
+                                              'handoff': None})
+
+    def test_json_context_counts_calls_past_the_cap_until_a_handoff_or_compaction(self):
+        rows = [asst('m1', u=OVER_CAP, ts='2026-11-05T10:00:01.000Z'), asst('m2', u=OVER_CAP, ts='2026-11-05T10:00:02.000Z'),
+                asst('m3', [tool_use('h1', 'mcp__ccd_session__start_session',
+                                     {'prompt': 'Handoff 1: go', 'background': 'x' * 80})],
+                     u=OVER_CAP, ts='2026-11-05T10:00:03.000Z'),
+                user([{'type': 'tool_result', 'tool_use_id': 'h1', 'content': '(session_id: local_cccc, name: n)'}],
+                     ts='2026-11-05T10:00:04.000Z'),
+                asst('m4', u=OVER_CAP, ts='2026-11-05T10:00:05.000Z')]
+        self.session(rows, sid='aaaa')
+        self.session([asst('c1', u=OVER_CAP, ts='2026-11-05T11:00:01.000Z'),
+                      user('summary', ts='2026-11-05T11:00:02.000Z', isCompactSummary=True),
+                      asst('c2', u=OVER_CAP, ts='2026-11-05T11:00:03.000Z')], sid='dddd')
+        by_file = {os.path.basename(s['file']): s['context'] for s in self.json()['sessions']}
+        # m3 is the call at the handoff's time, so m2 and m3 are past the cap; m4 after the handoff is not
+        self.assertEqual((by_file['aaaa.jsonl']['calls_over_cap'], by_file['aaaa.jsonl']['handoff']),
+                         (2, '2026-11-05T10:00:03.000Z'))
+        self.assertEqual((by_file['dddd.jsonl']['calls_over_cap'], by_file['dddd.jsonl']['handoff']), (0, None))
+
+    def test_json_context_takes_a_handoff_made_by_the_first_call_over_the_cap(self):
+        self.session([asst('m1', ts='2026-11-05T10:00:01.000Z'),
+                      asst('m2', [tool_use('h1', 'mcp__ccd_session__start_session',
+                                           {'prompt': 'Handoff 1: go', 'background': 'x' * 80})],
+                           u=OVER_CAP, ts='2026-11-05T10:00:02.000Z'),
+                      user([{'type': 'tool_result', 'tool_use_id': 'h1',
+                             'content': '(session_id: local_cccc, name: n)'}], ts='2026-11-05T10:00:03.000Z'),
+                      asst('m3', u=OVER_CAP, ts='2026-11-05T10:00:04.000Z')])
+        [session] = self.json()['sessions']
+        self.assertEqual((session['context']['calls_over_cap'], session['context']['handoff']),
+                         (0, '2026-11-05T10:00:02.000Z'))
+
+    def test_json_context_ignores_a_subagents_compaction(self):
+        sub = [asst('sub', ts='2026-11-05T09:30:03.000Z'),
+               user('summary', ts='2026-11-05T09:30:04.000Z', isCompactSummary=True)]
+
+        def main(p):
+            return [asst(p + '1', u=OVER_CAP, ts='2026-11-05T09:30:01.000Z'),
+                    asst(p + '2', u=OVER_CAP, ts='2026-11-05T09:30:02.000Z'),
+                    asst(p + '3', u=OVER_CAP, ts='2026-11-05T09:30:05.000Z')]
+        # the same transcripts once as a session and once in a run's window, with their own message ids
+        self.session(main('p'), project='proj')
+        self.subagent('implementer', sub, project='proj')
+        self.session(main('r') + [self.record_write('c0ffee01', started='2026-11-05T09:00:00Z')], project='run')
+        self.subagent('implementer', sub, project='run')
+        self.records([run_record(head='c0ffee01', started='2026-11-05T09:00:00Z')])
+        data = self.json()
+        [run] = data['runs']
+        session = next(s for s in data['sessions'] if s['file'] == os.path.join(self.projects, 'proj', 'sess-1.jsonl'))
+        # the run's record-writing row is one more call past the cap
+        self.assertEqual((run['context']['calls_over_cap'], session['context']['calls_over_cap']), (3, 2))
+
+    def test_json_units_carry_tool_result_chars_by_class(self):
+        def call(tid, name, inp, ts):
+            return asst(tid, [tool_use(tid, name, inp)], ts=ts)
+
+        def result(tid, content, ts):
+            return user([{'type': 'tool_result', 'tool_use_id': tid, 'content': content}], ts=ts)
+        rows = [call('r1', 'Read', {'file_path': '/a'}, '2026-11-05T10:00:01.000Z'),
+                result('r1', 'seven c', '2026-11-05T10:00:02.000Z'),
+                call('b1', 'Bash', {'command': 'cd /x && cat y'}, '2026-11-05T10:00:03.000Z'),
+                result('b1', [{'type': 'text', 'text': 'abc'}], '2026-11-05T10:00:04.000Z'),
+                call('b2', 'Bash', {'command': 'git log -1'}, '2026-11-05T10:00:05.000Z'),
+                result('b2', 'xx', '2026-11-05T10:00:06.000Z'),
+                call('b5', 'Bash', {'command': 'cd /x && grep -n a f'}, '2026-11-05T10:00:06.100Z'),
+                result('b5', 'ggg', '2026-11-05T10:00:06.200Z'),
+                call('b6', 'Bash', {'command': 'git log'}, '2026-11-05T10:00:06.300Z'),
+                result('b6', 'hhhhh', '2026-11-05T10:00:06.400Z'),
+                call('b7', 'Bash', {'command': 'cat /a'}, '2026-11-05T10:00:06.500Z'),
+                result('b7', 'iiiiiiii', '2026-11-05T10:00:06.600Z'),
+                call('b3', 'Bash', {'command': 'git commit -m x'}, '2026-11-05T10:00:07.000Z'),
+                result('b3', 'y', '2026-11-05T10:00:08.000Z'),
+                call('b4', 'Bash', {'command': '/usr/bin/python3 -I t.py'}, '2026-11-05T10:00:09.000Z'),
+                result('b4', 'zzzz', '2026-11-05T10:00:10.000Z'),
+                call('w1', 'mcp__ccd_turn__wrap_up', {'recap': 'r'}, '2026-11-05T10:00:11.000Z'),
+                result('w1', 'ok', '2026-11-05T10:00:12.000Z'),
+                result('nope', 'orphan', '2026-11-05T10:00:13.000Z')]
+        self.session(rows, project='proj')
+        [session] = self.json()['sessions']
+        # read is the Read, the cat after cd, the prefixed git log, grep after cd and a prefix, the git log after a
+        # longer prefix and the prefixed read; other is the orphan result
+        self.assertEqual(session['tool_results'],
+                         {'read': 28, 'bash_other': 1, 'run': 4, 'agent': 0, 'edit': 0, 'mcp': 2, 'other': 6})
+
+    def test_json_sweeps_count_inline_runs_of_reads_and_delegated_lookups(self):
+        def read(i):
+            return asst(f'r{i}', [tool_use(f'r{i}', 'Read', {'file_path': f'/f{i}'})],
+                        ts=f'2026-11-05T10:00:{i:02d}.000Z')
+        edit_read = asst('e1', [tool_use('e1', 'Edit', {'file_path': '/f2'})], ts='2026-11-05T10:00:20.000Z')
+        edit_other = asst('e2', [tool_use('e2', 'Edit', {'file_path': '/other'})], ts='2026-11-05T10:00:40.000Z')
+        sweep = asst('a1', [tool_use('a1', 'Agent', {'subagent_type': 'sweeper', 'prompt': 'find x'})],
+                     ts='2026-11-05T10:00:50.000Z')
+        launched = user([{'type': 'tool_result', 'tool_use_id': 'a1', 'content': 'found'}], ts='2026-11-05T10:00:50.500Z')
+        notebook = [asst(f'n{i}', [tool_use(f'n{i}', 'Read', {'file_path': '/n.ipynb'})],
+                         ts=f'2026-11-05T10:00:{50 + i:02d}.000Z') for i in range(1, 6)]
+        notebook_edit = asst('ne', [tool_use('ne', 'NotebookEdit', {'notebook_path': '/n.ipynb'})],
+                             ts='2026-11-05T10:00:56.000Z')
+        # five reads then an edit of one of them, five reads then an edit of another file, four reads then a sweeper,
+        # five reads of a notebook then an edit of it
+        self.session([read(i) for i in range(1, 6)] + [edit_read] + [read(i) for i in range(21, 26)] + [edit_other]
+                     + [read(i) for i in range(41, 45)] + [sweep, launched] + notebook + [notebook_edit], project='proj')
+        [session] = self.json()['sessions']
+        self.assertEqual(session['sweeps'], {'inline': 1, 'delegated': 1})
+
+    def test_json_a_sweeper_that_never_launched_is_no_delegated_sweep(self):
+        rows = self.agent('sw1', error="Agent type 'sweeper' not found. Available agents: general-purpose",
+                          subagent_type='sweeper', description='Sweep')
+        rows += self.agent('sw2', subagent_type='sweeper', description='Sweep')
+        self.session(rows, project='proj')
+        [session] = self.json()['sessions']
+        self.assertEqual(session['sweeps'], {'inline': 0, 'delegated': 1})
+
+    def test_json_context_takes_a_messages_largest_iteration(self):
+        # an advisor consult mid-message: two executor samplings over the same prefix, each under the cap
+        self.session([asst('m1', iterations=[executor(200_000, 1), ADVISOR, executor(250_000, 1)])], project='proj')
+        context = self.json()['sessions'][0]['context']
+        self.assertEqual((context['tokens'], context['max_tokens'], context['over_cap']), (250_000, 250_000, False))
+
+    def copied_transcript(self):
+        """A transcript and its copy, each with five reads and their results, then 52 calls past the cap; the copy goes
+        on with one call of its own."""
+        rows = []
+        for i in range(1, 6):
+            rows += [asst(f'r{i}', [tool_use(f'r{i}', 'Read', {'file_path': f'/f{i}'})], ts=f'2026-11-05T10:00:{i:02d}.000Z'),
+                     user([{'type': 'tool_result', 'tool_use_id': f'r{i}', 'content': 'abcd'}],
+                          ts=f'2026-11-05T10:00:{i:02d}.500Z')]
+        rows += [asst(f'p{i}', u=OVER_CAP, ts=f'2026-11-05T11:{i // 60:02d}:{i % 60:02d}.000Z') for i in range(52)]
+        self.session(rows, sid='a-orig')
+        self.session(rows + [asst('fork', ts='2026-11-05T12:00:00.000Z')], sid='b-copy')
+
+    def test_json_a_copied_transcript_counts_its_tool_results_and_sweeps_once(self):
+        self.copied_transcript()
+        [week] = self.json()['totals']['context']
+        self.assertEqual((week['calls'], week['tool_results']['read'], week['sweeps']['inline']), (58, 20, 1))
+
+    def test_health_counts_a_copied_transcript_once(self):
+        self.copied_transcript()
+        out = self.run_report('--health', '--now', '2026-11-06T00:00:00Z')
+        self.assertEqual(out.splitlines()[-2:], ['inline sweeps: 1', 'over the cap without a handoff: 1 transcripts'])
+
+    def test_totals_context_rows_sum_units_by_week(self):
+        small = {'input_tokens': 100, 'output_tokens': 1}
+        self.session([asst('a', u=small, ts='2026-11-05T10:00:01.000Z'),
+                      asst('b', u=OVER_CAP, ts='2026-11-05T10:00:02.000Z')], sid='w1')
+        self.session([asst('c', u=small, ts='2026-11-09T10:00:01.000Z')], sid='w2')
+        rows = self.json('--now', '2026-11-10T00:00:00Z')['totals']['context']  # the default NOW, 2026-11-07, would drop w2
+        self.assertEqual([(r['week'], r['calls'], r['tokens'], r['max_tokens'], r['units_over_cap']) for r in rows],
+                         [('2026-11-01', 2, 300_101, 300_001, 1), ('2026-11-08', 1, 100, 100, 0)])
+        self.assertEqual(rows[0]['sweeps'], {'inline': 0, 'delegated': 0})
+
+    def test_html_shows_the_context_totals(self):
+        self.session([asst('a', u={'input_tokens': 100, 'output_tokens': 1}, ts='2026-10-30T10:00:01.000Z')], sid='w1')
+        self.session([asst('b', u=OVER_CAP, ts='2026-11-05T10:00:02.000Z')], sid='w2')
+        html = self.html()
+        for fact, value in (('context calls', 2), ('context tokens', 300_101), ('context max tokens', 300_001),
+                            ('units over the cap', 1), ('tool-result characters: read', 0), ('inline sweeps', 0)):
+            self.assertIn(f'<tr><td>{fact}</td><td>{value}</td></tr>', html)
+
+    def test_health_information_lines_count_sweeps_and_transcripts_over_the_cap(self):
+        reads = [asst(f'r{i}', [tool_use(f'r{i}', 'Read', {'file_path': f'/f{i}'})], ts=f'2026-11-05T10:00:{i:02d}.000Z')
+                 for i in range(1, 6)]
+        past = [asst(f'p{i}', u=OVER_CAP, ts=f'2026-11-05T11:{i // 60:02d}:{i % 60:02d}.000Z') for i in range(52)]
+        self.session(reads + past, sid='busy')
+        out = self.run_report('--health', '--now', '2026-11-06T00:00:00Z')
+        self.assertEqual(out.splitlines()[-2:], ['inline sweeps: 1', 'over the cap without a handoff: 1 transcripts'])
+
+    def test_health_and_brief_default_to_the_last_seven_days(self):
+        self.records([run_record(branch='old-branch', date='2026-10-20T12:00:00Z',
+                                 simplify={'ran': 'no', 'applied': 0, 'skipped': 0}),
+                      run_record(branch='new-branch', date='2026-11-05T12:00:00Z',
+                                 simplify={'ran': 'no', 'applied': 0, 'skipped': 0})])
+        now = '2026-11-06T00:00:00Z'
+        self.assertNotIn('old-branch', self.run_report('--health', '--now', now))
+        self.assertIn('new-branch', self.run_report('--health', '--now', now))
+        self.assertIn('old-branch', self.run_report('--health', '--now', now, '--since', '2026-10-01'))
+        self.assertIn('old-branch', json.dumps(self.json('--now', now)))
+        self.assertIn('Trial: runs 2/5', self.run_report('--brief', '--now', now))  # the trial line still counts every record
 
     def test_json_weeks_rows(self):
         rows = [self.startup(), asst('big', u=usage(None, 1000000, 0), ts=self.ts()),

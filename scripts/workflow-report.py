@@ -13,10 +13,11 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
   --cache     the parse cache and the export state (default ~/.claude/workflow-report-cache); files are written
               atomically and hold personal data
   --no-cache  read and write no cache; the output is the same
-  --since     ignore transcript rows and run records before this date (UTC)
+  --since     ignore transcript rows and run records before this date (UTC); --health and --brief default it to
+              7 days before --now, --json and --html read everything
   --brief     at most 3 lines: this week's advisor share of Fable use, the trial's progress, then this week's
               first WARN line with a count of the rest, or else the consultations with no note, then any commits on
-              main since the last template export
+              main since the last template export; the trial counts every run record
   --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
               this week's sessions with no run record, for this week's plan reviews with no plan-simplifier
               since the previous plan review, for this week's typed triggers whose skill never loaded, and for
@@ -26,22 +27,27 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               required offer with no entry, and for schema 4 records each step's agent id against the launched
               dispatches, and for schema 5 records each finding's category and validity, each review step's
               strengths and their number against its report's count line; then information lines: the "fixed,
-              not proportionate" counts, archives missing or with another Started: time, and the runs whose git
-              evidence is unavailable
+              not proportionate" counts, archives missing or with another Started: time, the runs whose git
+              evidence is unavailable, and over this week's main transcripts the inline sweeps and those that went
+              50 or more calls past the context cap with no handoff
   --schema    print the run record schema, with the finding category list under "category_list", and exit
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
               bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
               tie-break rule, validity definitions and areas), "stage_table" (the main session's recommended model and
-              effort, by path and stage), "runs" (each record in range as written, its window and what the window
-              shows: dispatches, skills, refusals, models, tokens and cost, advisor, its spend by phase, its WARN and
-              information lines, later fix commits), "sessions" (each main transcript's rows in range outside its run
-              windows, with their models, advisor and spend by phase, and its start, end, project and slash commands,
-              by name and time, never their arguments) and "totals" (scoreboard, weeks, run_time, skills, models,
-              advisor, offers, health); each WARN also as an object with its kind, run or session, step, skill and
-              agent, each session's title, each step's agent id, time and end with the dispatch and skill load tied
-              to it, and each finding's category and validity and each review step's strengths. Every transcript row
-              belongs to one run or to its transcript's session, so every total is a sum over the runs and sessions
-              exported. It holds personal data: print it, never write it into a repo
+              effort, by path and stage), "runs" (each record in range as written, its window and what the window,
+              over a handed-off run's whole chain of transcripts, shows: dispatches, skills, refusals, models, tokens
+              and cost, advisor, its spend by phase, its main calls' context, tool-result characters by call class and
+              inline and delegated sweeps, its WARN and information lines, later fix commits), "sessions" (each main
+              transcript's rows in range outside its run windows, with their models, advisor, spend by phase, main
+              calls' context, tool-result characters and sweeps, and its start, end, project and slash commands, by
+              name and time, never their arguments) and
+              "totals" (scoreboard, weeks, context (the units' context, tool-result characters and sweeps by week),
+              run_time, skills, models, advisor, offers, health); each WARN also as an
+              object with its kind, run or session, step, skill and agent, each session's title, each step's agent
+              id, time and end with the dispatch and skill load tied to it, and each finding's category and validity
+              and each review step's strengths. Every transcript row belongs to one run or to its transcript's
+              session, so every total is a sum over the runs and sessions exported. It holds personal data: print
+              it, never write it into a repo
   --changed-since CURSOR  with --json: print only the runs and sessions whose entry changed since the export that
               gave CURSOR, the keys removed since, and a new cursor; 0 or an unknown cursor exports everything; refused
               with --since or --no-cache
@@ -234,7 +240,7 @@ TRIAL_WEEKS = 3
 # The day final-reviewer's Opus seat was installed: up to and on it, its pin was Fable at high.
 OPUS_FINAL_REVIEW_FROM = '2026-11-10'
 FIX_WINDOW_DAYS = 14
-NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker')
+NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
 VERDICTS = ('fixed', 'not_proportionate', 'open')
 # Each dispatched step kind's report: its name in WARN lines, its count line and that line's keys.
@@ -254,6 +260,28 @@ SIMPLIFY_RAN = ('agents', 'inline', 'no')
 NOTE_RE = re.compile(r'^Advisor: .+ \| changed: (yes|no) \| .*$', re.M)
 SCRIPT_RE = re.compile(r'([^/\s"\']+\.(?:py|sh))')
 WRAP_UP = 'mcp__ccd_turn__wrap_up'
+START_SESSION = 'mcp__ccd_session__start_session'
+# A start_session brief that starts with this hands its run off to the new session, when its result names a session;
+# the new session's first user row holds the brief.
+HANDOFF_MARKER = re.compile(r'^Handoff \d+:')
+SESSION_ID = re.compile(r'session_id: local_([0-9a-f-]+)')
+# The context cap in claude-md/agentic-workflow.md's **Context cap** bullet: keep them the same.
+CONTEXT_CAP = 300_000
+OVER_CAP_CALLS = 50
+SWEEP_READS = 5
+# A tool call's class, which its result's characters count under: tool_class gives it.
+TOOL_CLASSES = ('read', 'edit', 'run', 'bash_other', 'agent', 'mcp', 'other')
+SWEEP_KINDS = ('inline', 'delegated')
+GIT_READ = ('log', 'diff', 'status', 'show', 'branch', 'rev-parse', 'worktree', 'ls-files', 'blame', 'remote',
+            'describe', 'stash', 'tag', 'merge-base', 'rev-list', 'shortlog', 'cat-file', 'check-ignore')
+READ_VERBS = ('cat', 'sed', 'grep', 'rg', 'ls', 'find', 'head', 'tail', 'wc', 'stat', 'which', 'echo', 'tree', 'diff',
+              'jq', 'awk', 'sort', 'uniq', 'file', 'du', 'df', 'date', 'realpath', 'basename', 'dirname', 'cut', 'tr',
+              'printf', 'type', 'gh', 'curl', 'read')
+RUN_VERBS = ('python', 'python3', '/usr/bin/python3', 'pytest', 'npm', 'pnpm', 'node', 'npx', 'make', 'uv', 'cargo',
+             'go', 'php', 'composer', 'docker', 'bash', 'sh', 'zsh', 'timeout')
+# What a Bash command is classed after: any leading cd.
+BASH_PREFIX = re.compile(r'^(?:cd\s+[^;&]*?\s*(?:&&|;)\s*)*')
+HEALTH_DAYS = 7
 GIT_TIMEOUT = 30
 
 # Copied from hooks/guard-agent-dispatch.py, since scripts can't import each other: keep them the same.
@@ -287,11 +315,13 @@ SUPERPOWERS_TAG = b'<using-superpowers-session-start>'
 RUN_LOG = 'workflow-log.jsonl'
 # Only lines matching this can hold a dispatch, a simplify call, a record write, the startup block, an error, a skill
 # load (the hook's using-superpowers block included, which it prints alone when the karpathy file is unreadable), a
-# typed trigger, a spec or plan write or a session title. A typed command shows as <command-name>/name</command-name>.
+# typed trigger, a spec or plan write, a session title, a handoff or a compaction. A typed command shows as
+# <command-name>/name</command-name>.
 HEALTH_NEEDLES = (b'"Agent"', b'simplify', b'workflow-log.jsonl', b'karpathy-guidelines-session-start',
                   b'using-superpowers-session-start',
                   b'"is_error":true', b'"is_error": true', b'Base directory for this skill', b'rill me',
-                  b'command-name', b'docs/superpowers/', b'"custom-title"')
+                  b'command-name', b'docs/superpowers/', b'"custom-title"', b'start_session',
+                  b'isCompactSummary')
 SKILL_LOADED = 'Base directory for this skill: '
 SPECS_AND_PLANS = {'spec': 'docs/superpowers/specs/', 'plan': 'docs/superpowers/plans/'}
 
@@ -299,6 +329,26 @@ SPECS_AND_PLANS = {'spec': 'docs/superpowers/specs/', 'plan': 'docs/superpowers/
 def command_re(name):
     """A typed /name command, in SIMPLIFY_COMMAND's shape; name is a pattern, spliced in as it is."""
     return re.compile(SIMPLIFY_COMMAND.pattern.replace('/simplify', '/' + name), re.S)
+
+
+def tool_class(name, inp):
+    """A tool call's TOOL_CLASSES class, from its name and its input dict. A Bash call is classed by its first command
+    after BASH_PREFIX: a git one by its subcommand, else by its first word."""
+    if name in ('Read', 'Grep', 'Glob'):
+        return 'read'
+    if name in ('Edit', 'Write', 'NotebookEdit'):
+        return 'edit'
+    if name == 'Agent':
+        return 'agent'
+    if isinstance(name, str) and name.startswith('mcp__'):
+        return 'mcp'
+    if name != 'Bash':
+        return 'other'
+    words = BASH_PREFIX.sub('', field(inp, 'command', str, '').lstrip()).split()
+    first = words[0] if words else ''
+    if first == 'git':
+        return 'read' if words[1:2] and words[1] in GIT_READ else 'bash_other'
+    return 'read' if first in READ_VERBS else 'run' if first in RUN_VERBS else 'bash_other'
 
 
 # What a typed row can hold that calls for a skill, and that skill. A command pattern is tried with match, a phrase
@@ -321,7 +371,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 3
+CACHE_VERSION = 6
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -394,6 +444,12 @@ def cost(u, model):
     return None if kinds is None else sum(kinds.values())
 
 
+def context_tokens(own):
+    """The context of a call: the input, cache-read and cache-write tokens of the largest of its own iterations own,
+    each of which samples over the whole prefix."""
+    return max((sum(num(i.get(name)) for label, name in TOKENS if label != 'output') for i in own), default=0)
+
+
 def read_jsonl(path, stats):
     """Yield the JSON objects in a file, counting lines that don't parse as objects."""
     try:
@@ -423,9 +479,9 @@ def usage_iterations(msg):
 class Transcripts:
     def __init__(self, since, now, keep=None, shared=None, phase_of=None):
         """A row counts when it is in since..now and keep is None or keep(its timestamp) is true. With shared, the
-        message ids and advisor failures already counted are shared's, so each counts once across the instances. With
-        phase_of(path, timestamp), the phase of a message counted from a row of the transcript at path, each message
-        also counts in its phase."""
+        message ids, tool call and result ids and advisor failures already counted are shared's, so each counts once
+        across the instances. With phase_of(path, timestamp), the phase of a message counted from a row of the
+        transcript at path, each message also counts in its phase."""
         self.since = since
         self.now = now
         self.keep = keep
@@ -446,8 +502,13 @@ class Transcripts:
         self.week_advisor = {}
         self.week_fable = {}
         self.hooks = {}
-        self.tool_ids = set()
+        self.tool_ids = shared.tool_ids if shared else set()
+        self.result_ids = shared.result_ids if shared else set()
         self.main_calls = 0
+        self.contexts = []  # (timestamp, context_tokens) of each counted message of a main transcript, in file order
+        self.tool_results = dict.fromkeys(TOOL_CLASSES, 0)  # main transcript tool results' characters, by call class
+        self.calls = []  # (class, file) of each main transcript tool call, in file order
+        self.call_class = {}  # a main transcript tool call's id -> its class
         self.typed = 0
         self.ask_user = 0
         self.wrap_up_ask = 0
@@ -480,7 +541,7 @@ class Transcripts:
             kept = in_range and (self.keep is None or self.keep(row['timestamp']))
             phase = self.phase_of(path, row['timestamp']) if kept and kind == 'assistant' and self.phase_of else None
             if kind == 'assistant':
-                self.pick_spend(row, t, kept, file_spend, phase)
+                self.pick_spend(row, kept, file_spend, phase, main)
             if not kept:
                 continue
             if kind == 'assistant':
@@ -488,15 +549,23 @@ class Transcripts:
                 file_calls += self.assistant(row, t, role, main, file_notes, phase)
             elif kind == 'attachment':
                 self.hook(row.get('attachment'))
+            elif kind == 'user' and main and 'results' in row:
+                for result in row['results']:
+                    tid = result['tool_use_id']
+                    if tid:
+                        if tid in self.result_ids:
+                            continue
+                        self.result_ids.add(tid)
+                    self.tool_results[self.call_class.get(tid, 'other')] += result['chars']
             elif kind == 'user' and main:
                 if row['human']:
                     typed_human += 1
                 else:
                     typed_plain += 1
-        for mid, (_, model, own, t, kept, phase) in file_spend.items():
+        for mid, (_, model, own, kept, phase, timestamp) in file_spend.items():
             if kept and mid not in self.spent_ids:
                 self.spent_ids.add(mid)
-                self.spend(model, own, week_start(t) if t is not None else None, phase)
+                self.count(model, own, phase, main, timestamp)
         # Transcripts since Claude Code 2.1.187 mark typed rows origin.kind "human"; rows without it there are
         # injected (reminders, task notifications, resumes). Older transcripts have no origin at all.
         self.typed += typed_human if has_origin else typed_plain
@@ -504,9 +573,18 @@ class Transcripts:
         self.changed += sum(1 for _, _, changed in file_notes if changed == 'yes')
         self.missing += max(0, file_calls - len(file_notes))
 
-    def pick_spend(self, row, t, kept, file_spend, phase):
-        """Count an assistant row's own iterations now, in phase, when it has no message id and kept is true, else keep
-        it in file_spend when it is its message's row with the most output tokens so far."""
+    def count(self, model, own, phase, main, timestamp):
+        """Spend a message's own iterations in phase, in the week of its timestamp, and in a main transcript add its
+        context."""
+        t = parse_time(timestamp)
+        self.spend(model, own, week_start(t) if t is not None else None, phase)
+        if main:
+            self.contexts.append((timestamp, context_tokens(own)))
+
+    def pick_spend(self, row, kept, file_spend, phase, main):
+        """Count an assistant row's own iterations now, in phase, and in a main transcript its context, when it has no
+        message id and kept is true, else keep it in file_spend when it is its message's row with the most output
+        tokens so far."""
         msg = row.get('message')
         if not isinstance(msg, dict):
             return
@@ -515,13 +593,14 @@ class Transcripts:
         usage, iterations = usage_iterations(msg)
         # The executor's own sampling; advisor and fallback iterations are counted apart.
         own = [i for i in iterations if i.get('type') == 'message'] if iterations else [usage]
+        timestamp = field(row, 'timestamp', str, None)
         if not mid:
             if kept:
-                self.spend(model, own, week_start(t) if t is not None else None, phase)
+                self.count(model, own, phase, main, timestamp)
             return
         output = sum(num(i.get('output_tokens')) for i in own)
         if mid not in file_spend or output > file_spend[mid][0]:
-            file_spend[mid] = (output, model, own, t, kept, phase)
+            file_spend[mid] = (output, model, own, kept, phase, timestamp)
 
     def assistant(self, row, t, role, main, file_notes, phase):
         msg = row.get('message')
@@ -628,7 +707,9 @@ class Transcripts:
             if tid in self.tool_ids:
                 return
             self.tool_ids.add(tid)
+            self.call_class[tid] = block['cls']
         self.main_calls += 1
+        self.calls.append((block['cls'], block['file']))
         name = block.get('name')
         inp = field(block, 'input', dict, {})
         if name == 'AskUserQuestion':
@@ -679,7 +760,8 @@ class Transcripts:
 
 def usage_rows(path):
     """What Transcripts.read_file reads of the transcript at path, in one pass: {'rows', 'has_origin', 'last',
-    'first', 'cwd', 'skipped'}. A row keeps only the fields read_file reads, a text block only its notes, and a row it
+    'first', 'cwd', 'skipped'}. A row keeps only the fields read_file reads, a text block only its notes, a tool_use
+    block also its tool_class and its file, a user row's tool_result blocks their id and characters, and a row it
     ignores is dropped; has_origin is whether any row has an origin, last the greatest row timestamp, first the least,
     cwd the cwd of the first row with a string one, and skipped the lines that are not objects."""
     stats = {'skipped': 0}
@@ -710,7 +792,11 @@ def usage_rows(path):
                     name, inp = block.get('name'), field(block, 'input', dict, {})
                     ask = inp.get('ask')
                     content.append({'type': btype, 'id': block.get('id'), 'name': name,
-                                    'input': {'ask': ask} if name == WRAP_UP and isinstance(ask, str) else {}})
+                                    'input': {'ask': ask} if name == WRAP_UP and isinstance(ask, str) else {},
+                                    'cls': tool_class(name, inp),
+                                    'file': field(inp, 'notebook_path' if name == 'NotebookEdit' else 'file_path',
+                                                  str, None)
+                                    if name in ('Read', 'Edit', 'Write', 'NotebookEdit') else None})
             rows.append({'type': kind, 'timestamp': timestamp, 'effort': row.get('effort'),
                          'message': {'id': msg.get('id'), 'model': msg.get('model'), 'usage': msg.get('usage'),
                                      'content': content}})
@@ -720,6 +806,13 @@ def usage_rows(path):
                          'attachment': {key: att.get(key) for key in ('type', 'stdout', 'command', 'hookName')}})
         elif kind == 'user' and Transcripts.typed_by_owner(row):
             rows.append({'type': kind, 'timestamp': timestamp, 'human': isinstance(row.get('origin'), dict)})
+        elif kind == 'user' and isinstance(msg, dict):
+            results = [{'type': 'tool_result', 'tool_use_id': field(block, 'tool_use_id', str, None),
+                        'chars': sum(map(len, result_texts(block.get('content'))))}
+                       for block in field(msg, 'content', list, [])
+                       if isinstance(block, dict) and block.get('type') == 'tool_result']
+            if results:
+                rows.append({'type': kind, 'timestamp': timestamp, 'results': results})
     return {'rows': rows, 'has_origin': has_origin, 'last': last, 'first': first, 'cwd': cwd,
             'skipped': stats['skipped']}
 
@@ -764,6 +857,46 @@ def event_key(event):
 def unit_notes(tr):
     """The advisor notes of one Transcripts: how many, how many changed something, and the consultations with none."""
     return {'notes': tr.notes, 'changed': tr.changed, 'missing': tr.missing}
+
+
+def context_facts(contexts, events):
+    """The context of a unit's main calls, contexts as Transcripts collects them: how many, their sum, median and
+    largest, whether one is over CONTEXT_CAP, the calls after the first one over it timed at or before the first handoff
+    or compact event at or after it, and that first handoff's time; None with no call. events are the main
+    transcripts' own, so a subagent's compaction ends nothing."""
+    if not contexts:
+        return None
+    tokens = [n for _, n in contexts]
+    over = next((i for i, n in enumerate(tokens) if n > CONTEXT_CAP), None)
+    calls_over_cap, handoff = 0, None
+    if over is not None:
+        start = contexts[over][0] or ''
+        later = [(timestamp, kind) for timestamp, kind, _ in events
+                 if kind in ('handoff', 'compact') and timestamp >= start]
+        end = min((timestamp for timestamp, _ in later), default=None)
+        handoff = min((timestamp for timestamp, kind in later if kind == 'handoff'), default=None)
+        calls_over_cap = sum(1 for timestamp, _ in contexts[over + 1:] if end is None or (timestamp or '') <= end)
+    return {'calls': len(tokens), 'tokens': sum(tokens), 'median_tokens': statistics.median(tokens),
+            'max_tokens': max(tokens), 'over_cap': over is not None, 'calls_over_cap': calls_over_cap,
+            'handoff': handoff}
+
+
+def sweep_counts(calls, events, launched):
+    """A unit's sweeps: inline, the runs of SWEEP_READS or more consecutive read calls, calls as Transcripts.calls
+    holds them, ended by the next call of another class or the end, but not by an edit of one of the run's files; and
+    delegated, its Agent dispatches to a sweeper or Explore agent among the launched ids. events are the main
+    transcripts' own."""
+    inline, files = 0, []
+    for cls, file in calls + [(None, None)]:
+        if cls == 'read':
+            files.append(file)
+            continue
+        if len(files) >= SWEEP_READS and not (cls == 'edit' and file is not None and file in files):
+            inline += 1
+        files = []
+    delegated = sum(1 for _, kind, value in events if kind == 'agent' and value[0] in launched
+                    and value[1].get('subagent_type') in ('sweeper', 'Explore'))
+    return {'inline': inline, 'delegated': delegated}
 
 
 def unit_advisor(tr):
@@ -1081,11 +1214,15 @@ def launched_ids(row, ids):
             if block.get('type') == 'tool_result' and block.get('tool_use_id') in ids and block.get('is_error') is not True]
 
 
-def result_text(block):
-    content = block.get('content')
+def result_texts(content):
+    """A tool result's texts: its content when it is a string, else its blocks' string texts."""
     if isinstance(content, list):
-        return ' '.join(c.get('text', '') for c in content if isinstance(c, dict) and isinstance(c.get('text'), str))
-    return content if isinstance(content, str) else ''
+        return [c['text'] for c in content if isinstance(c, dict) and isinstance(c.get('text'), str)]
+    return [content] if isinstance(content, str) else []
+
+
+def result_text(block):
+    return ' '.join(result_texts(block.get('content')))
 
 
 @functools.lru_cache(maxsize=None)
@@ -1104,12 +1241,15 @@ def scan_events(path):
     or the session-start hook's using-superpowers block (SUPERPOWERS_TAG in a SessionStart hook row, so once per
     start, clear or compaction),
     ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('command', name) for a typed row's slash
-    command, its first text that COMMAND matches, ('wrote', path) for a Write or Edit of a spec or plan, and
-    ('title', text) for a custom-title row. A row with no timestamp takes the previous row's.
-    Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of dispatches still waiting for one.
+    command, its first text that COMMAND matches, ('wrote', path) for a Write or Edit of a spec or plan, ('title',
+    text) for a custom-title row, ('handoff', brief) at the time of a START_SESSION call whose brief starts with
+    HANDOFF_MARKER, added when its result names a session, and ('compact', None) for a compaction's summary row.
+    A row with no timestamp takes the previous row's.
+    Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of calls still waiting for one.
     """
     events, launched, startup, timestamp = [], {}, False, ''
-    pending = {}  # tool_use id -> its bytes, for Agent dispatches with no result yet
+    pending = {}  # tool_use id -> its bytes, for Agent dispatches and handoff calls with no result yet
+    handoffs = {}  # tool_use id -> its call's timestamp and brief, for the handoff calls among pending
     try:
         f = open(path, 'rb')
     except OSError:
@@ -1132,6 +1272,8 @@ def scan_events(path):
                         events.append((timestamp, 'skill', 'using-superpowers'))
                 if kind == 'custom-title' and isinstance(row.get('customTitle'), str):
                     events.append((timestamp, 'title', row['customTitle']))
+                if kind == 'user' and row.get('isCompactSummary') is True:
+                    events.append((timestamp, 'compact', None))
                 if row_calls_simplify(row):
                     events.append((timestamp, 'simplify', None))
                 # Only the load's own row counts, never a tool result quoting it or an attachment re-listing it.
@@ -1158,15 +1300,25 @@ def scan_events(path):
                             kept = {k: field(inp, k, str, None) for k in ('subagent_type', 'model', 'effort',
                                                                            'description')}
                             events.append((timestamp, 'agent', (block['id'], kept)))
+                        elif (block.get('name') == START_SESSION and isinstance(block.get('id'), str)
+                              and HANDOFF_MARKER.match(field(inp, 'prompt', str, ''))):
+                            pending[block['id']] = block['id'].encode()
+                            handoffs[block['id']] = (timestamp, inp['prompt'])
                         elif block.get('name') == 'Bash' and RUN_LOG in str(inp.get('command')):
                             events.append((timestamp, 'write', inp['command']))
                         elif (block.get('name') in ('Write', 'Edit') and isinstance(inp.get('file_path'), str)
                               and any(folder in inp['file_path'] for folder in SPECS_AND_PLANS.values())):
                             events.append((timestamp, 'wrote', inp['file_path']))
                 elif kind == 'user' and isinstance(content, list):
-                    launched.update(launched_ids(row, pending))
+                    launched.update(launched_ids(row, pending.keys() - handoffs.keys()))
                     for block in content:
                         if block.get('type') != 'tool_result':
+                            continue
+                        if block.get('tool_use_id') in handoffs:
+                            pending.pop(block['tool_use_id'])
+                            called, brief = handoffs.pop(block['tool_use_id'])
+                            if SESSION_ID.search(result_text(block)):
+                                events.append((called, 'handoff', brief))
                             continue
                         # Only an Agent call's own error says its agent type was not found or the guard refused it.
                         dispatch = pending.pop(block.get('tool_use_id'), None)
@@ -1189,6 +1341,53 @@ def transcript_title(path):
 
 def main_transcripts(projects_root):
     return sorted(glob.glob(os.path.join(glob.escape(projects_root), '*', '*.jsonl')))
+
+
+@functools.lru_cache(maxsize=None)
+def first_user_text(path):
+    """The texts of the transcript's first user row whose content is a string or holds text blocks, joined by newlines,
+    reading no further; '' when it has none."""
+    for row in read_jsonl(path, {'skipped': 0}):
+        msg = row.get('message')
+        texts = result_texts(msg.get('content')) if row.get('type') == 'user' and isinstance(msg, dict) else []
+        if texts:
+            return '\n'.join(texts)
+    return ''
+
+
+@functools.lru_cache(maxsize=None)
+def handoff_map(projects_root):
+    """{successor path: (predecessor path, timestamp)} for each handoff in the main transcripts: a main transcript
+    whose first user row holds a handoff's brief is that handoff's successor, its predecessor the transcript that made
+    the call, at the call's time; the first handoff found for a successor wins."""
+    mains = main_transcripts(projects_root)
+    found = {}
+    for path in mains:
+        for timestamp, kind, brief in transcript_events(path)[0]:
+            if kind == 'handoff':
+                for successor in mains:
+                    if brief in first_user_text(successor):
+                        found.setdefault(successor, (path, timestamp))
+    return found
+
+
+def chain_paths(path):
+    """[..., (predecessor, cutoff), (path, None)]: each transcript that handed off to the one after it, with the time
+    of its handoff call, after which its rows are no longer the chain's, then the main transcript path, oldest first.
+    It stops at a transcript no handoff started, or at one already in the chain."""
+    handoffs = handoff_map(os.path.dirname(os.path.dirname(path)))
+    chain = [(path, None)]
+    while True:
+        found = handoffs.get(chain[-1][0])
+        if found is None or any(p == found[0] for p, _ in chain):
+            return chain[::-1]
+        chain.append(found)
+
+
+def chain_windows(path, end):
+    """(transcript, end) for each transcript of path's chain_paths, oldest first, its end the window's clipped to its
+    cutoff."""
+    return [(p, min(end, cutoff) if cutoff else end) for p, cutoff in chain_paths(path)]
 
 
 def in_range(timestamp, since, now):
@@ -1222,18 +1421,20 @@ def run_spans(projects_root, records, now):
     whose "head" value is any record's head, or None for the transcript's start. So a run a report leaves out still
     ends where its record was written, and a command that mentions the log without a record's "head" or "started"
     value ends nothing. A run whose record write isn't found has no span, and a span ends at now at the latest, since
-    rows after now are ignored.
+    rows after now are ignored. A handed-off run starts no earlier than the last record-writing row in each earlier
+    transcript of its chain_paths, up to that one's handoff, so the window never holds an earlier run's rows.
     """
     heads = [(i, re.compile(r'"head"\s*:\s*"' + re.escape(r['head'])))
              for i, r in enumerate(records) if isinstance(r.get('head'), str) and r['head']]
     starts = [(i, re.compile(r'"started"\s*:\s*"' + re.escape(r['started']) + '"'), stamp(r['_started']))
               for i, r in enumerate(records) if r['_started'] is not None]
     by_start = {i for i, _, _ in starts}
-    spans, last = {}, stamp(now)
+    spans, last, writes = {}, stamp(now), {}
     if not heads and not starts:
         return spans
     for path in main_transcripts(projects_root):
         start = None
+        writes[path] = []  # the times of its record-writing rows
         for timestamp, kind, command in transcript_events(path)[0]:
             if kind != 'write':
                 continue
@@ -1248,9 +1449,15 @@ def run_spans(projects_root, records, now):
                     spans.setdefault(i, (path, start, min(timestamp, last)))
             if owners:
                 start = timestamp
+                writes[path].append(timestamp)
+    for i, (path, start, end) in spans.items():
+        earlier = [t for p, cutoff in chain_paths(path)[:-1] for t in writes.get(p, []) if t <= cutoff]
+        if earlier:
+            spans[i] = (path, max(earlier + ([start] if start else [])), end)
     return spans
 
 
+@functools.lru_cache(maxsize=None)
 def subagent_transcripts(path):
     """The subagent transcripts of the main transcript path, workflow subagents included."""
     folder = glob.escape(path[:-len('.jsonl')])
@@ -1258,14 +1465,16 @@ def subagent_transcripts(path):
 
 
 @functools.lru_cache(maxsize=None)
-def span_events(path, start, end):
+def span_events(path, start, end, chained=True):
     """(events, {launched id: its agent id or None}) of the rows timed in (start, end] of the main transcript path and
-    its subagents."""
+    its subagents, and when chained of every earlier transcript of its chain_paths and their subagents, each up to its
+    cutoff. A session reads its own transcript only, unchained."""
     launched, per_file = {}, []
-    for p in [path] + subagent_transcripts(path):
-        events, file_launched, _ = transcript_events(p)
-        launched.update(file_launched)
-        per_file.append([e for e in events if in_window(e[0], start, end)])
+    for main, main_end in chain_windows(path, end) if chained else [(path, end)]:
+        for p in [main] + subagent_transcripts(main):
+            events, file_launched, _ = transcript_events(p)
+            launched.update(file_launched)
+            per_file.append([e for e in events if in_window(e[0], start, main_end)])
     # Rows from several transcripts merge by timestamp, as in the dispatch hook.
     return list(heapq.merge(*per_file, key=lambda e: e[0])), launched
 
@@ -1301,7 +1510,7 @@ def span_reports(path, start, end):
     else the subagent transcript's agent-<id>.jsonl name, else None."""
     events, launched = span_events(path, start, end)
     files = {}
-    for p in subagent_transcripts(path):
+    for p in (sub for main, _ in chain_paths(path) for sub in subagent_transcripts(main)):
         tid = subagent_meta(p).get('toolUseId')
         if isinstance(tid, str):
             files[tid] = p
@@ -1781,11 +1990,12 @@ def is_workflow_agent(tool_input):
 
 def unrecorded_sessions(projects_root, spans, now):
     """(transcript path, problem) for each main transcript that launched a workflow agent this week, up to now,
-    outside every run's span."""
+    outside every run's span, a span covering each transcript of its chain up to that one's cutoff."""
     week = week_start(now)
     covered = {}
     for path, start, end in spans.values():
-        covered.setdefault(path, []).append((start, end))
+        for p, p_end in chain_windows(path, end):
+            covered.setdefault(p, []).append((start, p_end))
     out = []
     for path in main_transcripts(projects_root):
         events, launched, _ = transcript_events(path)
@@ -1847,9 +2057,9 @@ def shared_triggers(events_by_path):
 def session_warnings(projects_root, spans, now):
     """(transcript path, problem) for each typed trigger the main transcripts hold this week, up to now, that no later
     load of its skill meets, on the first transcript holding it, and for each main transcript written this week with
-    no run's span and no startup block."""
+    no run's span, over its chain, and no startup block."""
     week = week_start(now)
-    covered = {path for path, _, _ in spans.values()}
+    covered = {p for path, _, _ in spans.values() for p, _ in chain_paths(path)}
     read = {path: transcript_events(path) for path in main_transcripts(projects_root)}
     triggers = shared_triggers({path: [e for e in events if in_range(e[0], None, now)]
                                 for path, (events, _, _) in read.items()})
@@ -1872,6 +2082,24 @@ def session_warnings(projects_root, spans, now):
         if path not in covered and not startup and touched and (file_usage(path)['last'] or '') >= stamp(week):
             out.append((path, problem('startup_missing', f'session {name}: startup guidelines missing')))
     return out
+
+
+def context_info(projects_root, now):
+    """The information lines on the main transcripts written this week, up to now: their inline sweeps, and how many
+    went OVER_CAP_CALLS or more calls past the cap with no handoff; each left out when its count is 0."""
+    week = stamp(week_start(now))
+    inline = over = 0
+    seen = Transcripts(None, None)  # a copied transcript's messages and calls count once
+    for path in main_transcripts(projects_root):
+        if (file_usage(path)['last'] or '') < week:
+            continue
+        tr = usage_of([path], [], None, now, {'skipped': 0}, shared=seen)
+        events = [e for e in transcript_events(path)[0] if in_window(e[0], None, stamp(now))]
+        inline += sweep_counts(tr.calls, events, ())['inline']
+        context = context_facts(tr.contexts, events)
+        over += context is not None and context['calls_over_cap'] >= OVER_CAP_CALLS and context['handoff'] is None
+    return ([f'inline sweeps: {inline}'] if inline else []) + (
+        [f'over the cap without a handoff: {over} transcripts'] if over else [])
 
 
 def archive_line(run):
@@ -1912,6 +2140,7 @@ def health(projects_root, runs, now, records, pins, spans):
         per_run.append((own_warns, own_info, usable))
     if unavailable:
         info.append(f'Git evidence unavailable for {unavailable} runs')
+    info += context_info(projects_root, now)
     sessions = [warning(p, session=path) for path, p in
                 unrecorded_sessions(projects_root, spans, now) + unsimplified_plan_reviews(projects_root, now)
                 + session_warnings(projects_root, spans, now)]
@@ -2072,7 +2301,7 @@ def brief_report(tr, runs, now, records, projects_root, pins, spans, stamp_path)
     return '\n'.join([
         "Advisor share of this week's Fable use: " + share_text(tr.week_advisor.get(week, 0.0),
                                                                tr.week_fable.get(week, 0.0)),
-        f'Trial: {trial(runs, now)}',
+        f'Trial: {trial(records, now)}',
         last,
     ])
 
@@ -2108,21 +2337,27 @@ def skill_entries(events, main_events, run):
     return entries
 
 
-def unit_phases(path, start, end, unit_path, run_ends=()):
+def unit_phases(path, start, end, unit_path, run_ends=(), chained=True):
     """The phase function of a run or session whose main transcript is path, over the window (start, end]: a run's,
     on path unit_path, or a session's, with unit_path None and run_ends the ends of its transcript's run windows.
 
-    The main session's phase changes at each of its own events in the window: a skill load named in SKILL_PHASES, a
-    simplify call, which starts the simplify span, and a launched final review or a run window's end, which ends it.
-    A subagent transcript takes its dispatch's step kind, else implement for an implementer, else the main session's
-    phase at its launch; one that no dispatch in the window launched is unattributed.
+    The main session's phase changes at each of its own events in the window, and when chained over every transcript
+    of path's chain_paths, each up to its cutoff (a session reads its own transcript only, unchained): a skill load
+    named in SKILL_PHASES, a simplify call, which starts the simplify span, and a launched final review or a run
+    window's end, which ends it. A subagent transcript takes its dispatch's step kind, else implement for an
+    implementer, else the main session's phase at its launch; one that no dispatch in the window launched is
+    unattributed.
     """
-    events, launched, _ = transcript_events(path)
+    chain = chain_windows(path, end) if chained else [(path, end)]
+    mains, launched, own = {p for p, _ in chain}, {}, []
+    for main, main_end in chain:
+        events, main_launched, _ = transcript_events(main)
+        launched.update(main_launched)
+        own += [e for e in events if in_window(e[0], start, main_end)]
     first = PATH_PHASES.get(unit_path, 'unattributed')
     times, phases, loaded, in_simplify = [], [], first, False
     # A run's end sorts after the events at its time, so a simplify call or skill load at that time is the run's.
-    marks = sorted([e for e in events if in_window(e[0], start, end)]
-                   + [(t, 'run_end', None) for t in run_ends if in_window(t, start, end)], key=lambda e: e[0])
+    marks = sorted(own + [(t, 'run_end', None) for t in run_ends if in_window(t, start, end)], key=lambda e: e[0])
     for timestamp, kind, value in marks:
         if kind == 'skill' and value in SKILL_PHASES:
             loaded = SKILL_PHASES[value]
@@ -2145,7 +2380,7 @@ def unit_phases(path, start, end, unit_path, run_ends=()):
 
     def phase_of(transcript, timestamp):
         nonlocal subs
-        if transcript == path:
+        if transcript in mains:
             return main_phase(timestamp)
         if subs is None:  # read the dispatches only for a unit that counts a subagent row
             subs = {}
@@ -2158,11 +2393,11 @@ def unit_phases(path, start, end, unit_path, run_ends=()):
     return phase_of
 
 
-def run_entry(r, span, warns, info, pins, seen, keep, events, typed, git_evidence):
-    """A run's record and what its window shows; the window's facts are None when it has no window. keep says whether
-    a row's timestamp is the run's, its window being the first to end among those holding it; seen is the Transcripts
-    whose message ids every unit shares, events the window's events the run owns, typed the run's typed triggers and
-    git_evidence check_git's usable."""
+def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evidence):
+    """A run's record and what its window shows; the window's facts are None when it has no window. keep_of(main
+    transcript path) says whether a row's timestamp in that transcript or its subagents is the run's, its window being
+    the first to end among those holding it; seen is the Transcripts whose message ids every unit shares, events the
+    window's events the run owns over its chain, typed the run's typed triggers and git_evidence check_git's usable."""
     known = r['_time'] is not None and r['_started'] is not None
     entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': [dict(s, time=None, end=None) for s in r['steps']],
              'final_findings': r['final_findings'],
@@ -2176,17 +2411,23 @@ def run_entry(r, span, warns, info, pins, seen, keep, events, typed, git_evidenc
              'typed': typed, 'git_evidence': git_evidence,
              'key': unit_key('|'.join(field(r, k, str, '') for k in ('date', 'project', 'branch')))}
     entry.update(dict.fromkeys(('dispatches', 'skills', 'missing_skills', 'refusals', 'models', 'phases', 'efforts',
-                                'advisor', 'notes', 'main', 'title')))
+                                'advisor', 'notes', 'main', 'title', 'context', 'tool_results', 'sweeps')))
     if span is None:
         return entry
     path, start, end = span
-    # The main transcript is read first, so its model and effort are known before the subagents are added.
-    tr = Transcripts(None, None, keep=keep, shared=seen,
-                     phase_of=unit_phases(path, start, end, field(r, 'path', str, None)))
-    tr.read_file(path, None, {'skipped': 0})
+    chain = chain_windows(path, end)
+    mains = [p for p, _ in chain]
+    # The main transcripts are read first, oldest first, so their model and effort are known before the subagents are
+    # added. Each file is read with its own main transcript's keep.
+    tr = Transcripts(None, None, shared=seen, phase_of=unit_phases(path, start, end, field(r, 'path', str, None)))
+    for main in mains:
+        tr.keep = keep_of(main)
+        tr.read_file(main, None, {'skipped': 0})
     model, effort = ran_on(tr)
-    for sub in subagent_transcripts(path):
-        tr.read_file(sub, field(subagent_meta(sub), 'agentType', str, '') or 'subagent', {'skipped': 0})
+    for main in mains:
+        tr.keep = keep_of(main)
+        for sub in subagent_transcripts(main):
+            tr.read_file(sub, field(subagent_meta(sub), 'agentType', str, '') or 'subagent', {'skipped': 0})
     span_ds = span_dispatches(*span)
     # The required-skill checks run only on schema 2 records.
     missing = [skill for skill, _ in missing_skills(r, events, span_ds, pins)] if r['schema'] >= 2 else None
@@ -2211,12 +2452,20 @@ def run_entry(r, span, warns, info, pins, seen, keep, events, typed, git_evidenc
     simplify_step = simplify_steps[0] if len(simplify_steps) == len(simplify_calls) == 1 else None
     if simplify_step is not None:
         entry['steps'][simplify_step]['time'] = simplify_calls[0]
+    # The main transcripts' own events, all of them and those the run's keep holds.
+    main_events, own_events = [], []
+    for main in mains:
+        keep, file_events = keep_of(main), transcript_events(main)[0]
+        main_events += file_events
+        own_events += [e for e in file_events if keep(e[0])]
     skills = [dict(s, step=simplify_step if s['name'] == 'simplify' else None)
-              for s in skill_entries(events, transcript_events(path)[0], r)]
+              for s in skill_entries(events, main_events, r)]
     entry.update(dispatches=dispatches, skills=skills,
                  missing_skills=missing, refusals=refusal_counts(events), models=tr.models, phases=tr.phase_list(),
                  efforts=tr.efforts, advisor=unit_advisor(tr), notes=unit_notes(tr),
-                 main={'model': model, 'effort': effort}, title=transcript_title(path))
+                 main={'model': model, 'effort': effort}, title=transcript_title(path),
+                 context=context_facts(tr.contexts, own_events), tool_results=tr.tool_results,
+                 sweeps=sweep_counts(tr.calls, own_events, span_events(*span)[1]))
     return entry
 
 
@@ -2331,6 +2580,27 @@ def week_rows(runs, entries):
     return rows
 
 
+def context_rows(runs, entries, sessions):
+    """One row per week, from Sunday 07:00 UTC, of the units with a context, a run by its record's time and a session
+    by its start: their summed calls, tokens and tool-result characters by class, their largest context, how many went
+    over the cap, and their summed sweeps."""
+    weeks = {}
+    units = [(r['_time'], entry) for r, entry in zip(runs, entries)]
+    units += [(parse_time(s['start']), s) for s in sessions]
+    for t, unit in units:
+        if t is not None and unit['context'] is not None:
+            weeks.setdefault(week_start(t), []).append(unit)
+    rows = []
+    for week, group in sorted(weeks.items()):
+        rows.append({'week': week.date().isoformat(), 'calls': sum(u['context']['calls'] for u in group),
+                     'tokens': sum(u['context']['tokens'] for u in group),
+                     'max_tokens': max(u['context']['max_tokens'] for u in group),
+                     'units_over_cap': sum(u['context']['over_cap'] for u in group),
+                     'tool_results': {cls: sum(u['tool_results'][cls] for u in group) for cls in TOOL_CLASSES},
+                     'sweeps': {k: sum(u['sweeps'][k] for u in group) for k in SWEEP_KINDS}})
+    return rows
+
+
 def run_time(runs, entries):
     """Full runs with waves and without: how many, how many have a run time, and their median minutes."""
     groups = {'with_waves': [], 'without_waves': []}
@@ -2413,10 +2683,14 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
     index_of = {id(r): i for i, r in enumerate(records)}
     # Only the exported runs' windows, so each row in range belongs to one exported unit.
     exported_runs = {index_of[id(r)] for r in runs}
+    # A run's window holds each transcript of its chain, up to that one's cutoff.
     windows = {}
-    for i, (path, start, end) in sorted(spans.items(), key=lambda item: (item[1][2], item[0])):
+    for i, (path, start, end) in spans.items():
         if i in exported_runs:
-            windows.setdefault(path, []).append((start, end, i))
+            for p, p_end in chain_windows(path, end):
+                windows.setdefault(p, []).append((start, p_end, i))
+    for path_windows in windows.values():
+        path_windows.sort(key=lambda w: (w[1], w[2]))
 
     def owned_by(path, owner):
         """Whether a row's timestamp in the transcript path is owner's: a record index, or None for its session."""
@@ -2432,9 +2706,17 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
 
     def unit_events(span, owner):
         """The events in the window span that are owner's, a record index or None for its session, each unclaimed one
-        claimed for the transcript here; an event another transcript's unit claimed first is left out."""
-        path, keep = span[0], owned_by(span[0], owner)
-        return [e for e in span_events(*span)[0] if keep(e[0]) and owner_of.setdefault(event_key(e), path) == path]
+        claimed for the transcript holding it; an event another transcript's unit claimed first is left out. A run
+        reads each transcript of its chain with that transcript's own windows, so a predecessor's rows are claimed as
+        the predecessor's, and its session keeps its commands; a session reads its own transcript only."""
+        path, start, end = span
+        chain = chain_windows(path, end) if owner is not None else [(path, end)]
+        per_main = []
+        for main, main_end in chain:
+            keep = owned_by(main, owner)
+            per_main.append([e for e in span_events(main, start, main_end, chained=False)[0]
+                             if keep(e[0]) and owner_of.setdefault(event_key(e), main) == main])
+        return list(heapq.merge(*per_main, key=lambda e: e[0]))
 
     def held(path, event):
         """Whether a unit of the transcript path claimed event, through unit_events."""
@@ -2455,17 +2737,20 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
     for r, (own_warns, own_info, git_evidence) in zip(runs, per_run):
         i = index_of[id(r)]
         path = spans[i][0] if i in spans else None
-        entries.append(run_entry(r, spans.get(i), own_warns, own_info, pins, seen, owned_by(path, i),
-                                 run_events.get(i, []), unit_typed(path, i) if i in spans else [], git_evidence))
+        run_typed = [t for p, _ in chain_paths(path) for t in unit_typed(p, i)] if path else []
+        entries.append(run_entry(r, spans.get(i), own_warns, own_info, pins, seen, lambda p: owned_by(p, i),
+                                 run_events.get(i, []), run_typed, git_evidence))
     sessions = []
     for path, main_events in events.items():
         keep = owned_by(path, None)
         tr_session = usage_of([path], subagent_transcripts(path), since, now, {'skipped': 0}, keep, seen,
-                              unit_phases(path, start, end, None, [w[1] for w in windows.get(path, [])]))
+                              unit_phases(path, start, end, None, [w[1] for w in windows.get(path, [])],
+                                          chained=False))
         own = per_session.get(path, [])
         if path not in windows and not tr_session.assistant_rows and not own:
             continue
         rest = unit_events((path, start, end), None)
+        own_events = [e for e in main_events if keep(e[0])]
         whole = file_usage(path)
         sessions.append({'file': path, 'start': whole['first'], 'end': whole['last'], 'project': whole['cwd'],
                          'commands': [{'name': v, 'time': t} for t, k, v in main_events
@@ -2475,6 +2760,9 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
                          'models': tr_session.models, 'phases': tr_session.phase_list(), 'efforts': tr_session.efforts,
                          'advisor': unit_advisor(tr_session), 'notes': unit_notes(tr_session),
                          'refusals': refusal_counts(rest),
+                         'context': context_facts(tr_session.contexts, own_events),
+                         'tool_results': tr_session.tool_results,
+                         'sweeps': sweep_counts(tr_session.calls, own_events, transcript_events(path)[1]),
                          'startup': transcript_events(path)[2], 'warns': texts(own), 'warnings': own,
                          'title': transcript_title(path), 'key': unit_key(path)})
     units = entries + sessions
@@ -2491,7 +2779,8 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         'runs': entries,
         'sessions': sessions,
         'totals': {'scoreboard': scoreboard(runs, entries, sessions, advisor),
-                   'weeks': week_rows(runs, entries), 'run_time': run_time(runs, entries),
+                   'weeks': week_rows(runs, entries), 'context': context_rows(runs, entries, sessions),
+                   'run_time': run_time(runs, entries),
                    'skills': skill_totals(units),
                    'models': model_totals(runs, entries), 'advisor': advisor, 'offers': offer_totals(runs),
                    'health': {'warns': texts(warns), 'warnings': warns, 'info': info}},
@@ -2657,6 +2946,12 @@ def render_html(data):
     weeks = [(w['week'], pairs(w['runs']), w['tasks'], pairs(w['findings']), w['fix_rounds'], w['stops'],
               w['fable_points'], w['all_points'], usd(w['cost']), whole(w['minutes_per_run']), w['later_fixes'])
              for w in totals['weeks']]
+    ctx = totals['context']
+    context = [('context calls', sum(w['calls'] for w in ctx)), ('context tokens', sum(w['tokens'] for w in ctx)),
+               ('context max tokens', max((w['max_tokens'] for w in ctx), default=None)),
+               ('units over the cap', sum(w['units_over_cap'] for w in ctx))]
+    context += [(f'tool-result characters: {cls}', sum(w['tool_results'][cls] for w in ctx)) for cls in TOOL_CLASSES]
+    context += [(f'{k} sweeps', sum(w['sweeps'][k] for w in ctx)) for k in SWEEP_KINDS]
     skills = [(name, s['runs'], s['last'], pairs(s['outcomes']), s['missing'])
               for name, s in sorted(totals['skills'].items())]
     agents = sorted(totals['models']['agents'].items())
@@ -2686,6 +2981,7 @@ def render_html(data):
             table(('Full runs', 'runs', 'with a run time', 'median minutes'),
                   [(name.replace('_', ' '), t['runs'], t['timed'], whole(t['median_minutes']))
                    for name, t in totals['run_time'].items()]),
+            table(('fact', 'value'), context),
             '<h2>Skills</h2>', table(('skill', 'runs', 'last', 'outcomes', 'required but missing'), skills),
             '<h2>Models</h2>',
             table(('agent', 'requested', 'actual', 'mismatches'),
@@ -2758,6 +3054,8 @@ def main():
     now = parse_time(args.now) if args.now else datetime.datetime.now(datetime.timezone.utc)
     if now is None:
         ap.error('--now must be an ISO 8601 time')
+    if since is None and (args.health or args.brief):
+        since = now - datetime.timedelta(days=HEALTH_DAYS)
     stats = {'skipped': 0}
     records = [r for r in read_runs(args.log, stats) if r['_time'] is None or r['_time'] <= now]
     runs = [r for r in records if since is None or r['_time'] is None or r['_time'] >= since]

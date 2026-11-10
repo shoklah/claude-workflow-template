@@ -29,6 +29,7 @@ ROLES = {
     'task-reviewer': ('opus', 'high', REVIEWER_TOOLS, [GUIDELINES]),
     'fix-checker': ('sonnet', 'medium', REVIEWER_TOOLS, None),
     'final-reviewer': ('opus', 'high', REVIEWER_TOOLS, [GUIDELINES]),
+    'sweeper': ('haiku', 'medium', REVIEWER_TOOLS, None),
 }
 
 
