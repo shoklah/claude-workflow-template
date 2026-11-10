@@ -31,15 +31,17 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
   --schema    print the run record schema, with the finding category list under "category_list", and exit
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
               bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
-              tie-break rule, validity definitions and areas), "runs" (each record in range as written, its window
-              and what the window shows: dispatches, skills, refusals, models, tokens and cost, advisor, its WARN and
-              information lines, later fix commits), "sessions" (each main transcript's rows in range outside its run
-              windows) and "totals" (scoreboard, weeks, run_time, skills, models, advisor, offers, health); each WARN
-              also as an object with its kind, run or session, step, skill and agent, each session's title, each
-              step's agent id, time and end with the dispatch and skill load tied to it, and each finding's category
-              and validity and each review step's strengths. Every transcript row belongs to one run or to its
-              transcript's session, so every total is a sum over the runs and sessions exported. It holds personal
-              data: print it, never write it into a repo
+              tie-break rule, validity definitions and areas), "stage_table" (the main session's recommended model and
+              effort, by path and stage), "runs" (each record in range as written, its window and what the window
+              shows: dispatches, skills, refusals, models, tokens and cost, advisor, its WARN and information lines,
+              later fix commits), "sessions" (each main transcript's rows in range outside its run windows, with its
+              start, end, project and slash commands, by name and time, never their arguments) and "totals"
+              (scoreboard, weeks, run_time, skills, models, advisor, offers, health); each WARN also as an object with
+              its kind, run or session, step, skill and agent, each session's title, each step's agent id, time and
+              end with the dispatch and skill load tied to it, and each finding's category and validity and each
+              review step's strengths. Every transcript row belongs to one run or to its transcript's session, so
+              every total is a sum over the runs and sessions exported. It holds personal data: print it, never write
+              it into a repo
   --changed-since CURSOR  with --json: print only the runs and sessions whose entry changed since the export that
               gave CURSOR, the keys removed since, and a new cursor; 0 or an unknown cursor exports everything; refused
               with --since or --no-cache
@@ -281,7 +283,7 @@ SPECS_AND_PLANS = {'spec': 'docs/superpowers/specs/', 'plan': 'docs/superpowers/
 
 
 def command_re(name):
-    """A typed /name command, in SIMPLIFY_COMMAND's shape."""
+    """A typed /name command, in SIMPLIFY_COMMAND's shape; name is a pattern, spliced in as it is."""
     return re.compile(SIMPLIFY_COMMAND.pattern.replace('/simplify', '/' + name), re.S)
 
 
@@ -291,6 +293,8 @@ TYPED_TRIGGERS = (
     (re.compile(r'\bgrill me\b', re.I), 'grill-me'),
     (command_re('grill-me'), 'grill-me'),
 )
+# A typed slash command, tried with match: its name only, never its arguments.
+COMMAND = command_re(r'(?P<name>[^<]+)')
 # The skills a schema 2 record's run window must load, by its path.
 REQUIRED_SKILLS = (('plan', 'brainstorming'), ('plan', 'writing-plans'), ('full', 'subagent-driven-development'))
 # What shows a skill's outcome: a spec or plan written, the record's simplify counts or failing-test results, or a run
@@ -303,7 +307,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -619,16 +623,18 @@ class Transcripts:
 
 def usage_rows(path):
     """What Transcripts.read_file reads of the transcript at path, in one pass: {'rows', 'has_origin', 'last',
-    'skipped'}. A row keeps only the fields read_file reads, a text block only its notes, and a row it ignores is
-    dropped; has_origin is whether any row has an origin, last the greatest row timestamp, skipped the lines that are
-    not objects."""
+    'first', 'cwd', 'skipped'}. A row keeps only the fields read_file reads, a text block only its notes, and a row it
+    ignores is dropped; has_origin is whether any row has an origin, last the greatest row timestamp, first the least,
+    cwd the cwd of the first row with a string one, and skipped the lines that are not objects."""
     stats = {'skipped': 0}
-    rows, has_origin, last = [], False, None
+    rows, has_origin, last, first, cwd = [], False, None, None, None
     for row in read_jsonl(path, stats):
         has_origin = has_origin or isinstance(row.get('origin'), dict)
         timestamp = row.get('timestamp')
-        if isinstance(timestamp, str) and (last is None or timestamp > last):
-            last = timestamp
+        if isinstance(timestamp, str):
+            last, first = max(last or timestamp, timestamp), min(first or timestamp, timestamp)
+        if cwd is None and isinstance(row.get('cwd'), str):
+            cwd = row['cwd']
         kind, msg, att = row.get('type'), row.get('message'), row.get('attachment')
         if kind == 'assistant' and isinstance(msg, dict):
             content = []
@@ -658,7 +664,8 @@ def usage_rows(path):
                          'attachment': {key: att.get(key) for key in ('type', 'stdout', 'command', 'hookName')}})
         elif kind == 'user' and Transcripts.typed_by_owner(row):
             rows.append({'type': kind, 'timestamp': timestamp, 'human': isinstance(row.get('origin'), dict)})
-    return {'rows': rows, 'has_origin': has_origin, 'last': last, 'skipped': stats['skipped']}
+    return {'rows': rows, 'has_origin': has_origin, 'last': last, 'first': first, 'cwd': cwd,
+            'skipped': stats['skipped']}
 
 
 @functools.lru_cache(maxsize=None)
@@ -1026,8 +1033,9 @@ def scan_events(path):
     Events are (timestamp, kind, value) in file order: ('simplify', None), ('agent', (id, input)), ('not_found',
     agent type), ('refused', GUARD_REASONS key), ('write', Bash command naming the run log), ('skill', name) for a
     skill's load, the row that follows a Skill call, a typed command or an agent's start with its preloaded skills,
-    ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('wrote', path) for a Write or Edit of a
-    spec or plan, and ('title', text) for a custom-title row. A row with no timestamp takes the previous row's.
+    ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('command', name) for a typed row's slash
+    command, its first text that COMMAND matches, ('wrote', path) for a Write or Edit of a spec or plan, and
+    ('title', text) for a custom-title row. A row with no timestamp takes the previous row's.
     Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of dispatches still waiting for one.
     """
     events, launched, startup, timestamp = [], {}, False, ''
@@ -1062,6 +1070,9 @@ def scan_events(path):
                     found = [skill for pattern, skill in TYPED_TRIGGERS for text in texts
                              if (pattern.match if '<command-name>' in pattern.pattern else pattern.search)(text)]
                     events.extend((timestamp, 'typed', skill) for skill in dict.fromkeys(found))
+                    command = next((m.group('name') for m in map(COMMAND.match, texts) if m), None)
+                    if command is not None:
+                        events.append((timestamp, 'command', command))
                 if kind == 'assistant':
                     for block in content or []:
                         inp = block.get('input')
@@ -2285,7 +2296,10 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         if path not in windows and not tr_session.assistant_rows and not own:
             continue
         rest = [e for e in span_events(path, stamp(since) if since else None, stamp(now))[0] if keep(e[0])]
-        sessions.append({'file': path, 'skills': skill_entries(rest, main_events, None),
+        whole = file_usage(path)
+        sessions.append({'file': path, 'start': whole['first'], 'end': whole['last'], 'project': whole['cwd'],
+                         'commands': [{'name': v, 'time': t} for t, k, v in main_events if k == 'command'],
+                         'skills': skill_entries(rest, main_events, None),
                          'typed': typed.get((path, None), []),
                          'models': tr_session.models, 'efforts': tr_session.efforts,
                          'advisor': unit_advisor(tr_session), 'notes': unit_notes(tr_session),
@@ -2302,6 +2316,7 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         'since': since.isoformat() if since else None,
         'now': now.isoformat(),
         'categories': category_list(),
+        'stage_table': RECOMMENDED,
         'runs': entries,
         'sessions': sessions,
         'totals': {'scoreboard': scoreboard(runs, entries, sessions, advisor),

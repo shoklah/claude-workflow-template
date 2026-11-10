@@ -640,11 +640,16 @@ class Report(unittest.TestCase):
     def test_json_has_its_version_and_top_level_keys(self):
         data = self.json()
         self.assertEqual(data['version'], 1)
-        self.assertEqual(sorted(data), ['categories', 'generated', 'now', 'runs', 'sessions', 'since', 'totals', 'version'])
+        self.assertEqual(sorted(data), ['categories', 'generated', 'now', 'runs', 'sessions', 'since', 'stage_table', 'totals', 'version'])
         self.assertEqual(sorted(data['totals']),
                          ['advisor', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills', 'weeks'])
         self.assertEqual(data['now'], '2026-11-07T12:00:00+00:00')
         self.assertIsNone(data['since'])
+
+    def test_json_exports_the_stage_table_once(self):
+        data = self.json()
+        self.assertEqual(data['stage_table'],
+                         {path: row['recommended'] for path, row in data['totals']['models']['main'].items()})
 
     def test_html_page_is_self_contained_and_escaped(self):
         step = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
@@ -759,6 +764,60 @@ class Report(unittest.TestCase):
         p.stderr.close()
         self.assertEqual(p.wait(timeout=60), 0, stderr)
         self.assertEqual(stderr, b'')
+
+    def test_a_session_has_its_transcripts_start_end_and_project(self):
+        self.session([user('hi', ts='2026-11-05T10:00:00.000Z', cwd=None),
+                      user('hi', ts='2026-11-05T10:00:01.000Z', cwd='/home/dev/demo'),
+                      dict(asst('m1', ts='2026-11-05T10:01:00.000Z'), cwd='/home/dev/demo/.claude/worktrees/w1'),
+                      {'type': 'queue-operation', 'timestamp': '2026-10-30T09:00:00.000Z'},  # out of order, before --since
+                      dict(user('later', ts='2026-11-08T09:00:00.000Z'), cwd='/home/dev/other')])  # after --now
+        self.session([asst('m2', ts=None)], sid='sess-2')
+        facts = {os.path.basename(s['file']): {k: s[k] for k in ('start', 'end', 'project')}
+                 for s in self.json('--since', '2026-11-01')['sessions']}
+        self.assertEqual(facts, {'sess-1.jsonl': {'start': '2026-10-30T09:00:00.000Z', 'end': '2026-11-08T09:00:00.000Z',
+                                                  'project': '/home/dev/demo'},
+                                 'sess-2.jsonl': {'start': None, 'end': None, 'project': None}})
+
+    def test_a_sessions_slash_commands_are_kept_by_name_and_time_only(self):
+        human = {'origin': {'kind': 'human'}}
+        at = lambda m: f'2026-11-05T10:{m:02d}:00.000Z'
+        self.session([
+            user('<command-name>/model</command-name>\n<command-message>model</command-message>\n'
+                 '<command-args>secret-arg-text</command-args>', ts=at(0)),  # a built-in: no origin
+            user('<command-message>demo-skill</command-message>\n<command-name>/demo-skill</command-name>', ts=at(2),
+                 **human),
+            user([{'type': 'text', 'text': '<command-name>/listed</command-name>'}], ts=at(3), **human),
+            user('please run <command-name>/quoted</command-name>', ts=at(4), **human),
+            user('<command-name>/meta</command-name>', ts=at(5), isMeta=True),
+            user('<command-name>/summary</command-name>', ts=at(6), isCompactSummary=True),
+            user('<command-name>/injected</command-name>', ts=at(7), origin={'kind': 'task-notification'}),
+            user('<command-name>noslash</command-name>', ts=at(8), **human),
+            asst('m1', content=[{'type': 'text', 'text': '<command-name>/echoed</command-name>'}], ts=at(10)),
+            {'type': 'api-request-blob', 'timestamp': at(11),
+             'message': {'role': 'user', 'content': '<command-name>/blob</command-name>'}},
+            user('<command-name>/late</command-name>', ts='2026-11-08T09:00:00.000Z', **human),  # after --now
+        ])
+        out = self.run_report('--json')
+        self.assertEqual(json.loads(out)['sessions'][0]['commands'],
+                         [{'name': 'model', 'time': at(0)}, {'name': 'demo-skill', 'time': at(2)},
+                          {'name': 'listed', 'time': at(3)}])
+        self.assertNotIn('secret-arg-text', out)
+        for path in glob.glob(os.path.join(self.root, 'cache', '**', '*.json'), recursive=True):
+            with open(path) as f:
+                self.assertNotIn('secret-arg-text', f.read())
+
+    def test_a_cache_written_before_session_facts_is_read_again(self):
+        self.session([dict(asst('m1'), cwd='/home/dev/demo')])
+        self.json()
+        for entry in glob.glob(os.path.join(self.root, 'cache', 'transcripts', '*-usage.json')):
+            with open(entry) as f:
+                stored = json.load(f)
+            stored['version'] = 1  # CR6's, before these facts
+            for name in ('first', 'cwd'):
+                stored['value'].pop(name)
+            with open(entry, 'w') as f:
+                json.dump(stored, f)
+        self.assertEqual(self.json()['sessions'][0]['project'], '/home/dev/demo')
 
 
 STARTUP = '<karpathy-guidelines-session-start>guidelines</karpathy-guidelines-session-start>'
@@ -1920,7 +1979,8 @@ class HealthCheck(Report):
         self.assertEqual(data['runs'], [])
         file = os.path.join(self.projects, 'proj', 'sess-1.jsonl')
         self.assertEqual(data['sessions'], [{
-            'file': file, 'skills': [], 'typed': [],
+            'file': file, 'start': '2026-11-05T10:00:01.000Z', 'end': '2026-11-05T10:00:02.000Z', 'project': None,
+            'commands': [], 'skills': [], 'typed': [],
             'models': {'claude-haiku-4-5-20251001': {'input': 1000000, 'output': 0, 'cache_read': 0, 'cache_write': 0,
                                                      'cost': 1.0},
                        'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0,
@@ -2165,6 +2225,23 @@ class HealthCheck(Report):
         self.assertEqual(covered['typed'], [])
         self.assertEqual(run['refusals'], {})
         self.assertEqual(covered['refusals'], {'no_simplify': 2})  # one in the main transcript, one in its subagent
+
+    def test_a_session_holding_a_run_keeps_its_whole_transcripts_facts(self):
+        data = self.partition_fixture()
+        run = data['runs'][0]
+        covered = next(s for s in data['sessions'] if s['file'] == run['window']['transcript'])
+        self.assertLess(covered['start'], run['window']['start'])
+        self.assertGreater(covered['end'], run['window']['end'])
+        self.assertFalse({'start', 'end', 'project', 'commands'} & set(run))
+
+    def test_commands_typed_inside_a_run_window_stay_on_its_session(self):
+        rows = [self.startup(), user('<command-name>/demo-skill</command-name>', ts=self.ts()),
+                self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'), asst('after', ts=self.ts())]
+        self.session(rows, project='proj')
+        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:00Z', steps=[])])
+        data = self.json()
+        self.assertEqual(data['sessions'][0]['commands'], [{'name': 'demo-skill', 'time': rows[1]['timestamp']}])
+        self.assertLess(data['runs'][0]['window']['start'], rows[1]['timestamp'])
 
     def test_the_advisor_totals_are_the_sums_over_the_units(self):
         data = self.partition_fixture()
