@@ -1864,6 +1864,21 @@ class HealthCheck(Report):
                 self.assertEqual(self.health(), expected)
                 self.assertEqual(self.kinds(), ['typed_skill_not_loaded'] if expected == warned else [])
 
+    def test_a_forks_copied_typed_trigger_warns_once_and_not_when_the_fork_loads_the_skill(self):
+        # A fork copies its parent's trigger row, so the row warns once, on the first transcript by path, and not when
+        # either transcript loads the skill after it.
+        for later, fork in (((), 'sess-0'), ((), 'sess-2'), (('grill-me',), 'sess-0'), (('grill-me',), 'sess-2')):
+            with self.subTest(later=later, fork=fork):
+                self.tearDown()
+                self.setUp()
+                rows = [self.startup(), user('grill me', ts=self.ts()), asst('shared', ts=self.ts())]
+                self.session(rows, project='proj')
+                self.session(rows + [self.loaded(name) for name in later] + [asst('own', ts=self.ts())],
+                             project='proj', sid=fork)
+                first = min(fork, 'sess-1')
+                self.assertEqual(self.health(), ['Health: no problems'] if later else
+                                 [f"WARN: session {first}.jsonl: typed 'grill-me' but grill-me never loaded"])
+
     def test_a_session_with_no_run_and_no_startup_guidelines_is_warned(self):
         rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
         rows += self.agent('pr', subagent_type='plan-reviewer', description='Plan review')
@@ -2511,6 +2526,68 @@ class HealthCheck(Report):
         other = next(s for s in data['sessions'] if s['file'].endswith('sess-2.jsonl'))
         self.assertEqual(other['models'], {})  # its copy of the shared message counted in the run
         self.assertEqual(sum(m['output'] for u in self.units(data) for m in u['models'].values()), 20)
+
+    def test_a_forked_sessions_copied_events_count_once(self):
+        # A fork copies its parent's rows, timestamps included; the parent's session is read first and keeps them.
+        shared = [self.startup(), self.loaded('systematic-debugging'), user('grill me', ts=self.ts()),
+                  user('<command-name>/demo-skill</command-name>', ts=self.ts()), asst('shared', ts=self.ts())]
+        self.session(shared, project='proj')
+        self.session(shared + [self.loaded('grill-me'), asst('own', ts=self.ts())], project='proj', sid='sess-2')
+        plain = self.outputs('--no-cache')
+        data = plain[0]
+        parent, fork = (next(s for s in data['sessions'] if s['file'].endswith(name))
+                        for name in ('sess-1.jsonl', 'sess-2.jsonl'))
+        self.assertEqual([s['name'] for s in parent['skills']], ['systematic-debugging'])
+        self.assertEqual([s['name'] for s in fork['skills']], ['grill-me'])
+        # The parent's copy of the trigger is met by the fork's later load: the row was typed once.
+        self.assertEqual([(t['skill'], t['met']) for t in parent['typed']], [('grill-me', True)])
+        self.assertEqual(fork['typed'], [])
+        self.assertEqual([c['name'] for c in parent['commands']], ['demo-skill'])
+        self.assertEqual(fork['commands'], [])
+        self.assertEqual({name: (row['runs'], row['missing']) for name, row in data['totals']['skills'].items()},
+                         {'systematic-debugging': (1, 0), 'grill-me': (1, 0)})
+        self.assertEqual(self.outputs(), plain)
+
+    def test_a_forked_sessions_copied_events_count_in_the_parents_run(self):
+        rows = [self.startup(), self.loaded('systematic-debugging'), user('grill me', ts=self.ts()),
+                user('<command-name>/demo-skill</command-name>', ts=self.ts()),
+                self.record_write('c0ffee01', started='2026-11-05T10:00:00Z')]
+        self.session(rows, project='proj')
+        self.session(rows + [asst('own', ts=self.ts())], project='proj', sid='sess-2')
+        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:00Z', steps=[])])
+        data = self.json()
+        run = data['runs'][0]
+        parent, fork = (next(s for s in data['sessions'] if s['file'].endswith(name))
+                        for name in ('sess-1.jsonl', 'sess-2.jsonl'))
+        self.assertTrue(run['window']['transcript'].endswith('sess-1.jsonl'))
+        self.assertEqual([s['name'] for s in run['skills']], ['systematic-debugging'])
+        self.assertEqual([t['skill'] for t in run['typed']], ['grill-me'])
+        self.assertEqual([c['name'] for c in parent['commands']], ['demo-skill'])  # the transcript's, as ever
+        self.assertEqual((fork['skills'], fork['typed'], fork['commands']), ([], [], []))
+
+    def test_a_fork_sorting_before_its_parent_keeps_the_copied_events(self):
+        shared = [self.startup(), self.loaded('systematic-debugging'), user('grill me', ts=self.ts()),
+                  user('<command-name>/demo-skill</command-name>', ts=self.ts()), asst('shared', ts=self.ts())]
+        self.session(shared, project='proj')
+        self.session(shared + [asst('own', ts=self.ts())], project='proj', sid='sess-0')
+        data = self.json()
+        fork, parent = (next(s for s in data['sessions'] if s['file'].endswith(name))
+                        for name in ('sess-0.jsonl', 'sess-1.jsonl'))
+        self.assertEqual([s['name'] for s in fork['skills']], ['systematic-debugging'])
+        self.assertEqual([t['skill'] for t in fork['typed']], ['grill-me'])
+        self.assertEqual([c['name'] for c in fork['commands']], ['demo-skill'])
+        self.assertEqual((parent['skills'], parent['typed'], parent['commands']), ([], [], []))
+
+    def test_a_skipped_transcripts_typed_trigger_counts_in_its_fork(self):
+        # The parent has no assistant row, and its trigger is older than this week, so it is no unit and warns nothing.
+        trigger = user('grill me', ts='2026-10-30T09:00:00.000Z')
+        self.session([trigger], project='proj')
+        self.session([trigger, self.loaded('grill-me'), asst('own', ts=self.ts())], project='proj', sid='sess-2')
+        data = self.json()
+        self.assertEqual([os.path.basename(s['file']) for s in data['sessions']], ['sess-2.jsonl'])
+        self.assertEqual(data['sessions'][0]['typed'],
+                         [{'skill': 'grill-me', 'time': trigger['timestamp'], 'met': True}])
+        self.assertEqual(data['totals']['skills']['grill-me']['missing'], 0)
 
     def test_a_message_split_across_a_window_end_counts_once_from_its_fullest_row(self):
         rows = [self.startup(), asst('M', u=usage(None, 10, 5), ts=self.ts()),

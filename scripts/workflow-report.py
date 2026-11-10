@@ -752,6 +752,13 @@ def window_owner(windows, timestamp):
     return next((owner for start, end, owner in windows if in_window(timestamp, start, end)), None)
 
 
+def event_key(event):
+    """What identifies an event across transcripts: its time, kind and value, a dispatch by its tool_use id. A forked
+    session copies its parent's rows, timestamps included, so the copies share a key."""
+    timestamp, kind, value = event
+    return timestamp, kind, value[0] if kind == 'agent' else value
+
+
 def unit_notes(tr):
     """The advisor notes of one Transcripts: how many, how many changed something, and the consultations with none."""
     return {'notes': tr.notes, 'changed': tr.changed, 'missing': tr.missing}
@@ -1819,19 +1826,35 @@ def typed_triggers(events):
             for i, (timestamp, kind, skill) in enumerate(events) if kind == 'typed']
 
 
+def shared_triggers(events_by_path):
+    """Each typed trigger in the main transcripts' events, given in path order, by its time and skill: [the first
+    transcript holding it, whether any transcript holding it loads the skill later]. A forked session copies its
+    parent's rows, so the copies are one trigger, typed once."""
+    triggers = {}
+    for path, events in events_by_path.items():
+        for timestamp, skill, met in typed_triggers(events):
+            entry = triggers.setdefault((timestamp, skill), [path, False])
+            entry[1] = entry[1] or met
+    return triggers
+
+
 def session_warnings(projects_root, spans, now):
-    """(transcript path, problem) for each typed trigger a main transcript holds this week, up to now, that no later
-    load of its skill meets, and for each main transcript written this week with no run's span and no startup block."""
+    """(transcript path, problem) for each typed trigger the main transcripts hold this week, up to now, that no later
+    load of its skill meets, on the first transcript holding it, and for each main transcript written this week with
+    no run's span and no startup block."""
     week = week_start(now)
     covered = {path for path, _, _ in spans.values()}
+    read = {path: transcript_events(path) for path in main_transcripts(projects_root)}
+    triggers = shared_triggers({path: [e for e in events if in_range(e[0], None, now)]
+                                for path, (events, _, _) in read.items()})
     out = []
-    for path in main_transcripts(projects_root):
-        events, _, startup = transcript_events(path)
-        events = [e for e in events if in_range(e[0], None, now)]
+    for path, (_, _, startup) in read.items():
         name = os.path.basename(path)
-        for timestamp, skill, met in typed_triggers(events):
+        for (timestamp, skill), (first, met) in triggers.items():
+            if first != path or met:
+                continue
             t = parse_time(timestamp)
-            if not met and t is not None and t >= week:
+            if t is not None and t >= week:
                 out.append((path, problem('typed_skill_not_loaded',
                                           f"session {name}: typed '{skill}' but {skill} never loaded", skill=skill)))
         # A session with a run gets the per-run line instead. Its rows say whether it ran this week, since a chat-only
@@ -2129,10 +2152,11 @@ def unit_phases(path, start, end, unit_path, run_ends=()):
     return phase_of
 
 
-def run_entry(r, span, warns, info, pins, seen, keep, typed, git_evidence):
+def run_entry(r, span, warns, info, pins, seen, keep, events, typed, git_evidence):
     """A run's record and what its window shows; the window's facts are None when it has no window. keep says whether
     a row's timestamp is the run's, its window being the first to end among those holding it; seen is the Transcripts
-    whose message ids every unit shares, typed the run's typed triggers and git_evidence check_git's usable."""
+    whose message ids every unit shares, events the window's events the run owns, typed the run's typed triggers and
+    git_evidence check_git's usable."""
     known = r['_time'] is not None and r['_started'] is not None
     entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': [dict(s, time=None, end=None) for s in r['steps']],
              'final_findings': r['final_findings'],
@@ -2150,7 +2174,6 @@ def run_entry(r, span, warns, info, pins, seen, keep, typed, git_evidence):
     if span is None:
         return entry
     path, start, end = span
-    events = [e for e in span_events(*span)[0] if keep(e[0])]
     # The main transcript is read first, so its model and effort are known before the subagents are added.
     tr = Transcripts(None, None, keep=keep, shared=seen,
                      phase_of=unit_phases(path, start, end, field(r, 'path', str, None)))
@@ -2395,11 +2418,31 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
 
     events = {path: [e for e in transcript_events(path)[0] if in_range(e[0], since, now)]
               for path in main_transcripts(projects_root)}
-    typed = {}
-    for path, main_events in events.items():
-        for timestamp, skill, met in typed_triggers(main_events):
-            owner = window_owner(windows.get(path, []), timestamp)
-            typed.setdefault((path, owner), []).append({'skill': skill, 'time': timestamp, 'met': met})
+    triggers = shared_triggers(events)
+    start, end = stamp(since) if since else None, stamp(now)
+    # A forked session copies its parent's rows, so an event two transcripts hold counts once, in the first unit read
+    # that holds it, as a message id does: the runs are read first, then the sessions by path.
+    owner_of = {}
+
+    def unit_events(span, owner):
+        """The events in the window span that are owner's, a record index or None for its session, each unclaimed one
+        claimed for the transcript here; an event another transcript's unit claimed first is left out."""
+        path, keep = span[0], owned_by(span[0], owner)
+        return [e for e in span_events(*span)[0] if keep(e[0]) and owner_of.setdefault(event_key(e), path) == path]
+
+    def held(path, event):
+        """Whether a unit of the transcript path claimed event, through unit_events."""
+        return owner_of.get(event_key(event)) == path
+
+    def unit_typed(path, owner):
+        """The typed triggers of the unit owner in the transcript path, after unit_events claimed its events; met when
+        a later event of any transcript holding the trigger loads the skill."""
+        keep = owned_by(path, owner)
+        return [{'skill': skill, 'time': timestamp, 'met': triggers[(timestamp, skill)][1]}
+                for timestamp, skill, _ in typed_triggers(events[path])
+                if keep(timestamp) and held(path, (timestamp, 'typed', skill))]
+
+    run_events = {i: unit_events(spans[i], i) for i in (index_of[id(r)] for r in runs) if i in spans}
     # The runs are read first, so a message a run shares with a session counts in the run.
     seen = Transcripts(None, None)
     entries = []
@@ -2407,9 +2450,8 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         i = index_of[id(r)]
         path = spans[i][0] if i in spans else None
         entries.append(run_entry(r, spans.get(i), own_warns, own_info, pins, seen, owned_by(path, i),
-                                 typed.get((path, i), []), git_evidence))
+                                 run_events.get(i, []), unit_typed(path, i) if i in spans else [], git_evidence))
     sessions = []
-    start, end = stamp(since) if since else None, stamp(now)
     for path, main_events in events.items():
         keep = owned_by(path, None)
         tr_session = usage_of([path], subagent_transcripts(path), since, now, {'skipped': 0}, keep, seen,
@@ -2417,12 +2459,13 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         own = per_session.get(path, [])
         if path not in windows and not tr_session.assistant_rows and not own:
             continue
-        rest = [e for e in span_events(path, start, end)[0] if keep(e[0])]
+        rest = unit_events((path, start, end), None)
         whole = file_usage(path)
         sessions.append({'file': path, 'start': whole['first'], 'end': whole['last'], 'project': whole['cwd'],
-                         'commands': [{'name': v, 'time': t} for t, k, v in main_events if k == 'command'],
+                         'commands': [{'name': v, 'time': t} for t, k, v in main_events
+                                      if k == 'command' and held(path, (t, k, v))],
                          'skills': skill_entries(rest, main_events, None),
-                         'typed': typed.get((path, None), []),
+                         'typed': unit_typed(path, None),
                          'models': tr_session.models, 'phases': tr_session.phase_list(), 'efforts': tr_session.efforts,
                          'advisor': unit_advisor(tr_session), 'notes': unit_notes(tr_session),
                          'refusals': refusal_counts(rest),
