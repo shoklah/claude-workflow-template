@@ -20,17 +20,20 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               schema 2 runs it also checks the steps against the launched agents, their count lines, the agents'
               pinned model, effort and skills, and the skills the run's path requires, for schema 3 plan runs a
               required offer with no entry, and for schema 4 records each step's agent id against the launched
-              dispatches; then information lines: the "fixed, not proportionate" counts, archives missing or with
-              another Started: time, and the runs whose git evidence is unavailable
-  --schema    print the run record schema and exit
+              dispatches, and for schema 5 records each finding's category and validity, each review step's
+              strengths and their number against its report's count line; then information lines: the "fixed,
+              not proportionate" counts, archives missing or with another Started: time, and the runs whose git
+              evidence is unavailable
+  --schema    print the run record schema, with the finding category list under "category_list", and exit
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
-              bumps it), "generated", "since", "now", "runs" (each record in range as written, its window and what
-              the window shows: dispatches, skills, refusals, models, tokens and cost, advisor, its WARN and
+              bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
+              tie-break rule, validity definitions and areas), "runs" (each record in range as written, its window
+              and what the window shows: dispatches, skills, refusals, models, tokens and cost, advisor, its WARN and
               information lines, later fix commits), "sessions" (main sessions in range with no run window) and
               "totals" (scoreboard, weeks, run_time, skills, models, advisor, offers, health); each WARN also as an
-              object with its kind, run or session, step, skill and agent, each session's title, and each step's
-              agent id, time and end with the dispatch and skill load tied to it. It holds personal data: print it,
-              never write it into a repo
+              object with its kind, run or session, step, skill and agent, each session's title, each step's agent
+              id, time and end with the dispatch and skill load tied to it, and each finding's category and validity
+              and each review step's strengths. It holds personal data: print it, never write it into a repo
   --html      write the same data as one self-contained HTML page, with no script and nothing loaded from outside,
               to FILE (default ~/.claude/workflow-dashboard.html), and print "Wrote FILE". It holds personal data:
               never write it into a repo
@@ -58,8 +61,79 @@ OFFER_OUTCOMES = ('accepted', 'skipped', 'not_offered', 'updated')
 REQUIRED_OFFERS = ('grill-me',)
 STEP_KINDS = ('plan_simplify', 'plan_review', 'task_review', 'fix_check', 'simplify', 'final_review', 'final_fix_check')
 
+# The finding category list: its version, its tie-break rule, the validity definitions and a list per area. An id is
+# permanent: a new version adds ids, retires one (kept and marked) or rewords text, and never reuses, renames or removes
+# one; any change bumps the version. The reviewer agents carry their area's copy: keep them the same.
+CATEGORIES = {
+    'version': 1,
+    'rule': 'Name the problem, not its fix. A wrong exit code is `error_handling` even when the fix adds a test; a '
+            'finding is `tests` only when the code is right and its tests are missing or wrong. When two categories '
+            'still fit, pick the more specific one.',
+    'validity': {
+        'valid': 'The problem the finding names is really there in the code or the plan, whether or not the brief '
+                 'covers it; a real problem outside the brief is valid and declined as out of scope. For simplify, '
+                 'the cleanup really applies.',
+        'invalid': "The problem isn't there, or the reviewer misread the brief or the code.",
+        'unclear': "The session can't tell without more work than the finding is worth.",
+    },
+    'plan': [
+        {'id': 'scope', 'label': 'Scope', 'means': "The plan's work differs from the spec's: work missing, work the "
+         "spec doesn't ask for (including new code where existing code would do), or a step that contradicts the "
+         "spec."},
+        {'id': 'task_split', 'label': 'Task split and order', 'means': "Tasks too big or too small, in the wrong "
+         "order, depending on each other when they shouldn't, or grouped into a wave that breaks its rules."},
+        {'id': 'spec_gap', 'label': 'Spec gap', 'means': 'The spec itself leaves out or gets wrong something the '
+         'plan needs, so the plan has to guess.'},
+        {'id': 'risk_missed', 'label': 'Risk missed', 'means': "A failure mode, edge case or risk area the plan "
+         "doesn't handle or test."},
+        {'id': 'test_plan', 'label': 'Test plan', 'means': 'Planned tests that are missing, wrong, test the wrong '
+         'thing, or outweigh the code they test.'},
+        {'id': 'code_facts', 'label': 'Code facts', 'means': "The plan's claims about the existing code are wrong: "
+         "files, functions, signatures, commands or behaviour."},
+    ],
+    'implementation': [
+        {'id': 'correctness', 'label': 'Correctness', 'means': 'The code does the wrong thing for some input, state '
+         'or sequence.'},
+        {'id': 'error_handling', 'label': 'Error handling', 'means': "A failure isn't caught, reported or recovered "
+         "from as it should be: exit codes, bad input, timeouts."},
+        {'id': 'data_safety', 'label': 'Data safety', 'means': 'Data can be lost, corrupted, overwritten or written '
+         'in the wrong place.'},
+        {'id': 'security_privacy', 'label': 'Security and privacy', 'means': 'Secrets, personal data or permissions '
+         'are exposed, or untrusted input is trusted.'},
+        {'id': 'reuse', 'label': 'Reuse and duplication', 'means': 'The change duplicates, bypasses or departs from '
+         'an existing helper or pattern.'},
+        {'id': 'conventions', 'label': 'Conventions', 'means': "The change contradicts a `## Code conventions` entry or "
+         "the codebase's style, or leaves a decision it relies on unrecorded there."},
+        {'id': 'simplicity', 'label': 'Simplicity', 'means': "More structure, options or code than the requirement "
+         "needs, or something the spec doesn't require."},
+        {'id': 'tests', 'label': 'Tests', 'means': 'Tests missing, weak, wrong, or heavier than the code they test.'},
+        {'id': 'naming', 'label': 'Naming and clarity', 'means': 'Names, comments or structure that make the code '
+         'hard to read.'},
+        {'id': 'performance', 'label': 'Performance', 'means': 'Needless work, slowness or resource use.'},
+        {'id': 'docs', 'label': 'Docs', 'means': 'README, help text, CLAUDE.md or other docs missing, wrong or '
+         'stale.'},
+    ],
+}
+# Area, the step kinds whose findings it labels, the CATEGORIES list it uses.
+AREAS = (('plan', ('plan_simplify', 'plan_review'), 'plan'),
+         ('implementation', ('task_review', 'final_review'), 'implementation'),
+         ('cleanup', ('simplify',), 'implementation'))
+STRENGTH_STEPS = ('plan_simplify', 'plan_review', 'task_review', 'final_review')
+VALIDITY = tuple(CATEGORIES['validity'])
+
+
+def area_ids(kind):
+    """The category ids of the list the step kind's area uses, or an empty set for a kind with no area."""
+    return {c['id'] for _, kinds, key in AREAS if kind in kinds for c in CATEGORIES[key]}
+
+
+def category_list():
+    """The finding category list as --schema prints it under "category_list" and --json as "categories"."""
+    return {'version': CATEGORIES['version'], 'rule': CATEGORIES['rule'], 'validity': CATEGORIES['validity'],
+            'areas': [{'area': area, 'steps': list(kinds), 'list': CATEGORIES[key]} for area, kinds, key in AREAS]}
+
 SCHEMA = {
-    'schema': 'int, record format: 4; a record without it is 1',
+    'schema': 'int, record format: 5; a record without it is 1',
     'date': 'ISO 8601 time the run finished',
     'started': 'ISO 8601 time the session named the run\'s path and stage, in its first message',
     'project': 'absolute path of the project',
@@ -96,13 +170,19 @@ SCHEMA = {
              'applied, skipped}, "findings" (every step but fix-checks): [{"id": "F7", "severity" (or "kind": '
              '"cut"|"flag" for plan_simplify), "summary", '
              '"outcome": ' + '|'.join(f'"{o}"' for o in OUTCOMES)
-             + ', "reason" (required for declined and ruled), "closed_round": N, "verdicts": the fix-checker verdicts '
-             'in order}]}',
+             + ', "reason" (required for declined and ruled), "closed_round": N, "category": an id from its step\'s '
+             'area list in "category_list", the reviewer\'s, "validity": "valid"|"invalid"|"unclear", the '
+             'session\'s, by the definitions in "category_list" (schema 5), "verdicts": the fix-checker verdicts in '
+             'order}], '
+             '"strengths" (plan_simplify, plan_review, task_review and final_review; schema 5): [{"category", '
+             '"summary"}], [] for none; "counts" never holds "strengths"}',
     'waves': 'list of {"wave": "A", "tasks": [N, ...], "conflicts": N}, one per wave in order; absent on a run with no '
              'waves. tasks still counts plan tasks, fix_rounds includes the waves\' rounds and stops counts a wave stop',
     'offers': 'list of {"skill", "outcome": ' + '|'.join(f'"{o}"' for o in OFFER_OUTCOMES)
               + ', "reason" (required for not_offered)}, one per offer answered before the record is written; plan '
               'records carry ' + ' and '.join(REQUIRED_OFFERS) + '. Schema 3; absent on older records',
+    'categories': 'int, the version of the finding category list the labels use, as "category_list" below prints it '
+                  '(schema 5)',
 }
 
 # List prices, dollars per million tokens: input, output, cache read, 5-minute cache write, 1-hour cache write.
@@ -528,6 +608,12 @@ def subagent_meta(path):
     return read_json_dict(path[:-len('.jsonl')] + '.meta.json')
 
 
+def read_category(obj, ids):
+    """obj's category when it is a string among ids, else None."""
+    value = field(obj, 'category', str, None)
+    return value if value in ids else None
+
+
 def read_steps(rec):
     """The record's steps, cleaned: a step that isn't a dict of a known kind is dropped, other bad values read as
     absent."""
@@ -535,7 +621,14 @@ def read_steps(rec):
     for step in field(rec, 'steps', list, []):
         if not isinstance(step, dict) or step.get('step') not in STEP_KINDS:
             continue
+        ids = area_ids(step['step'])
+        strengths = field(step, 'strengths', list, None) if step['step'] in STRENGTH_STEPS else None
+        if strengths is not None:
+            strengths = [{'category': read_category(s, ids), 'summary': field(s, 'summary', str, None)}
+                         for s in strengths if isinstance(s, dict)]
         findings = [{'id': field(f, 'id', str, None), 'severity': field(f, 'severity', str, None),
+                     'category': read_category(f, ids),
+                     'validity': f.get('validity') if f.get('validity') in VALIDITY else None,
                      'kind': field(f, 'kind', str, None), 'summary': field(f, 'summary', str, None),
                      'outcome': f.get('outcome') if f.get('outcome') in OUTCOMES else None,
                      'reason': field(f, 'reason', str, None), 'closed_round': field(f, 'closed_round', int, None),
@@ -547,7 +640,7 @@ def read_steps(rec):
                       'model': field(step, 'model', str, None), 'effort': field(step, 'effort', str, None),
                       'agent_id': field(step, 'agent_id', str, None),
                       'counts': {k: num(v) for k, v in field(step, 'counts', dict, {}).items()},
-                      'findings': findings})
+                      'strengths': strengths, 'findings': findings})
     return steps
 
 
@@ -581,6 +674,7 @@ def read_runs(log, stats):
         rec['steps'] = read_steps(rec)
         rec['waves'] = read_waves(rec)
         rec['offers'] = read_offers(rec)
+        rec['categories'] = field(rec, 'categories', int, None)
         rec['advisor'] = rec.get('advisor') is True
         findings = field(rec, 'final_findings', dict, {})
         rec['final_findings'] = {k: num(findings.get(k)) for k in FINDINGS}
@@ -1226,6 +1320,10 @@ def check_steps(run, dispatches, events, pins):
                 problems.append(problem('step_counts_differ',
                                         f"{kind} step {n} counts {findings_text(step['counts'])} differ from its "
                                         f"report's {findings_text(line)}", step=step))
+            if (run['schema'] >= 5 and line is not None and 'strengths' in line and step['strengths'] is not None
+                    and len(step['strengths']) != line['strengths']):
+                problems.append(problem('step_counts_differ', f"{kind} step {n} has {len(step['strengths'])} "
+                                        f"strengths, its report's count line says {line['strengths']}", step=step))
     for kind, (count_of, keys) in ADDS_UP.items():
         for n, step in enumerate(steps[kind], 1):
             tally = dict.fromkeys(keys, 0)
@@ -1234,6 +1332,18 @@ def check_steps(run, dispatches, events, pins):
             if tally != {k: step['counts'].get(k, 0) for k in keys}:
                 problems.append(problem('findings_dont_add_up', f"{kind} step {n} findings don't add up to its counts",
                                         step=step))
+    if run['schema'] >= 5:
+        for i, step in enumerate(run['steps']):
+            kind = step['step']
+            unlabelled = [f['id'] or '?' for f in step['findings'] if f['category'] is None or f['validity'] is None]
+            if unlabelled:
+                problems.append(problem('findings_unlabelled', f"{kind} step {nth[i]} findings {', '.join(unlabelled)} "
+                                        f"have no category or validity", step=step))
+            strengths = step['strengths']
+            if kind in STRENGTH_STEPS and (strengths is None or len(strengths) > 3 or any(
+                    s['category'] is None or s['summary'] is None for s in strengths)):
+                problems.append(problem('strengths_unrecorded', f'{kind} step {nth[i]} strengths are missing, more '
+                                        f'than three, or lack a category or summary', step=step))
     verdicts = dict.fromkeys(VERDICTS, 0)
     for step in run['steps']:
         for finding in step['findings']:
@@ -1700,7 +1810,7 @@ def run_entry(r, span, warns, info, pins):
     known = r['_time'] is not None and r['_started'] is not None
     entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': [dict(s, time=None, end=None) for s in r['steps']],
              'final_findings': r['final_findings'],
-             'simplify': r['simplify'], 'waves': r['waves'], 'offers': r['offers'],
+             'simplify': r['simplify'], 'waves': r['waves'], 'offers': r['offers'], 'categories': r['categories'],
              'fable_points': run_points(r, 'fable_start', 'fable_end'),
              'all_points': run_points(r, 'all_start', 'all_end'),
              'minutes': (r['_time'] - r['_started']).total_seconds() / 60 if known else None,
@@ -1969,6 +2079,7 @@ def report_data(projects_root, records, runs, tr, spans, pins, now, since):
         'generated': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'since': since.isoformat() if since else None,
         'now': now.isoformat(),
+        'categories': category_list(),
         'runs': entries,
         'sessions': sessions,
         'totals': {'scoreboard': scoreboard(runs, entries, advisor, projects_root, since, now, startup),
@@ -2010,19 +2121,27 @@ def table(head, rows, marked=()):
 
 
 def run_steps(run):
-    """A run's waves, steps and findings, each finding with its outcome; a schema 1 run's totals, marked "before
-    steps"."""
+    """A run's waves, steps and findings, each finding with its category, validity and outcome, and its strengths;
+    a schema 1 run's totals, marked "before steps"."""
     head = ('step', 'task', 'round', 'agent', 'model', 'effort', 'counts')
     if run['schema'] < 2:
         simplify = dict(run['simplify'], ran=run['simplify']['ran'] or 'unknown')
         return '<p>before steps</p>\n' + table(head, [
             ('final review', None, None, None, None, None, pairs(run['final_findings'])),
             ('simplify', None, None, None, None, None, pairs(simplify))])
-    steps = table(head, [(s['step'].replace('_', ' '), 'wave ' + s['wave'] if s['wave'] else s['task'], s['round'],
+    def where(s):
+        return 'wave ' + s['wave'] if s['wave'] else s['task']
+
+    steps = table(head, [(s['step'].replace('_', ' '), where(s), s['round'],
                           s['agent'], s['model'], s['effort'], pairs(s['counts'])) for s in run['steps']])
-    findings = [(s['step'].replace('_', ' '), f['id'], f['severity'] or f['kind'], f['summary'], f['outcome'],
-                 f['reason']) for s in run['steps'] for f in s['findings']]
-    parts = [steps, table(('step', 'finding', 'severity or kind', 'summary', 'outcome', 'reason'), findings)]
+    findings = [(s['step'].replace('_', ' '), f['id'], f['severity'] or f['kind'], f['category'], f['summary'],
+                 f['outcome'], f['validity'], f['reason']) for s in run['steps'] for f in s['findings']]
+    parts = [steps, table(('step', 'finding', 'severity or kind', 'category', 'summary', 'outcome', 'validity',
+                           'reason'), findings)]
+    strengths = [(s['step'].replace('_', ' '), where(s), g['category'],
+                  g['summary']) for s in run['steps'] for g in s['strengths'] or ()]
+    if strengths:
+        parts.append(table(('step', 'task', 'category', 'strength'), strengths))
     if run['waves']:
         parts.insert(0, table(('wave', 'tasks', 'conflicts'),
                               [(w['wave'], ' '.join(map(str, w['tasks'])), w['conflicts']) for w in run['waves']]))
@@ -2145,7 +2264,7 @@ def main():
                       const=os.path.expanduser('~/.claude/workflow-dashboard.html'))
     args = ap.parse_args()
     if args.schema:
-        print(json.dumps(SCHEMA, indent=2))
+        print(json.dumps(dict(SCHEMA, category_list=category_list()), indent=2))
         return 0
     since = parse_time(args.since)
     if args.since and since is None:

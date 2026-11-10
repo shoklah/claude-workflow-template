@@ -443,7 +443,7 @@ class Report(unittest.TestCase):
         schema = json.loads(self.run_report('--schema'))
         self.assertLessEqual(set(run_record()), set(schema))
         self.assertEqual(sorted(set(schema) - set(run_record())),
-                         ['archive', 'offers', 'plan', 'schema', 'started', 'steps', 'waves'])
+                         ['archive', 'categories', 'category_list', 'offers', 'plan', 'schema', 'started', 'steps', 'waves'])
 
     def test_schema_lists_the_schema_2_fields_and_outcomes(self):
         schema = json.loads(self.run_report('--schema'))
@@ -473,7 +473,7 @@ class Report(unittest.TestCase):
     def test_schema_4_steps_carry_the_agent_id(self):
         out = self.run_report('--schema')
         schema = json.loads(out)
-        self.assertEqual(schema['schema'], 'int, record format: 4; a record without it is 1')
+        self.assertEqual(schema['schema'], 'int, record format: 5; a record without it is 1')
         self.assertIn('"agent_id"', schema['steps'])
         self.assertIn('every kind but simplify', schema['steps'])
 
@@ -483,6 +483,58 @@ class Report(unittest.TestCase):
                  {'step': 'simplify', 'counts': {}, 'findings': []}]
         self.records([run_record(schema=4, steps=steps)])
         self.assertEqual([s['agent_id'] for s in self.json()['runs'][0]['steps']], ['abc123', None, None])
+
+    def test_schema_5_labels_are_cleaned_and_reach_json(self):
+        steps = [
+            {'step': 'plan_review', 'counts': {'findings': 3}, 'strengths': [
+                {'category': 'scope', 'summary': 's'}, 'x', {'category': ['scope'], 'summary': 3}],
+             'findings': [{'id': 'F1', 'category': 'code_facts', 'validity': 'valid'},
+                          {'id': 'F2', 'category': 'correctness', 'validity': 'maybe'},
+                          {'id': 'F3', 'category': {'a': 1}, 'validity': ['valid']}]},
+            {'step': 'task_review', 'task': 1, 'round': 0, 'counts': {}, 'strengths': 'not a list',
+             'findings': [{'id': 'F4', 'category': 'nope', 'validity': 'invalid'}]},
+            {'step': 'simplify', 'counts': {}, 'strengths': [{'category': 'reuse', 'summary': 's'}],
+             'findings': [{'id': 'F5', 'category': 'reuse', 'validity': 'unclear'}]},
+            {'step': 'fix_check', 'task': 1, 'round': 1, 'counts': {},
+             'findings': [{'id': 'F6', 'category': 'tests', 'validity': 'valid'}]}]
+        self.records([run_record(schema=5, categories=1, steps=steps),
+                      run_record(branch='old', schema=4, steps=[{'step': 'task_review', 'findings': [{'id': 'F1'}]}]),
+                      run_record(branch='odd', schema=5, categories=True, steps=[])])
+        runs = {r['record']['branch']: r for r in self.json()['runs']}
+        new = runs['b']
+        self.assertEqual(new['categories'], 1)
+        self.assertEqual([[(f['category'], f['validity']) for f in s['findings']] for s in new['steps']],
+                         [[('code_facts', 'valid'), (None, None), (None, None)], [(None, 'invalid')],
+                          [('reuse', 'unclear')], [(None, 'valid')]])
+        self.assertEqual([s['strengths'] for s in new['steps']],
+                         [[{'category': 'scope', 'summary': 's'}, {'category': None, 'summary': None}], None, None, None])
+        old = runs['old']['steps'][0]
+        self.assertEqual((old['strengths'], old['findings'][0]['category'], old['findings'][0]['validity']),
+                         (None, None, None))
+        self.assertIsNone(runs['old']['categories'])
+        self.assertIsNone(runs['odd']['categories'])
+
+    def test_json_carries_the_category_list(self):
+        cats = self.json()['categories']
+        self.assertEqual((cats['version'], sorted(cats['validity'])), (1, ['invalid', 'unclear', 'valid']))
+        self.assertTrue(cats['rule'].startswith('Name the problem, not its fix'))
+        self.assertEqual([(a['area'], a['steps']) for a in cats['areas']],
+                         [('plan', ['plan_simplify', 'plan_review']), ('implementation', ['task_review', 'final_review']),
+                          ('cleanup', ['simplify'])])
+        plan, implementation, cleanup = (a['list'] for a in cats['areas'])
+        self.assertEqual([c['id'] for c in plan],
+                         ['scope', 'task_split', 'spec_gap', 'risk_missed', 'test_plan', 'code_facts'])
+        self.assertEqual([c['id'] for c in implementation],
+                         ['correctness', 'error_handling', 'data_safety', 'security_privacy', 'reuse', 'conventions',
+                          'simplicity', 'tests', 'naming', 'performance', 'docs'])
+        self.assertEqual(cleanup, implementation)
+        self.assertTrue(all(sorted(c) == ['id', 'label', 'means'] for c in plan + implementation))
+
+    def test_schema_5_documents_the_labels_and_prints_the_list(self):
+        schema = json.loads(self.run_report('--schema'))
+        for name in ('"category"', '"validity"', '"strengths"'):
+            self.assertIn(name, schema['steps'])
+        self.assertEqual(schema['category_list'], self.json()['categories'])
 
     def test_schema_lists_simplify_ran_and_fix_growth(self):
         schema = json.loads(self.run_report('--schema'))
@@ -576,7 +628,7 @@ class Report(unittest.TestCase):
     def test_json_has_its_version_and_top_level_keys(self):
         data = self.json()
         self.assertEqual(data['version'], 1)
-        self.assertEqual(sorted(data), ['generated', 'now', 'runs', 'sessions', 'since', 'totals', 'version'])
+        self.assertEqual(sorted(data), ['categories', 'generated', 'now', 'runs', 'sessions', 'since', 'totals', 'version'])
         self.assertEqual(sorted(data['totals']),
                          ['advisor', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills', 'weeks'])
         self.assertEqual(data['now'], '2026-11-07T12:00:00+00:00')
@@ -598,6 +650,7 @@ class Report(unittest.TestCase):
         self.assertIn('&lt;b&gt;x&lt;/b&gt; &amp; &quot;y&quot;', html)
         self.assertIn('a&amp;b', html)
         self.assertIn('before steps', html)
+        self.assertNotIn('<th>strength</th>', html)
         self.assertEqual(html.count('<details class="run"'), 2)
         titles = ('Rules and steps', 'Whole workflow', 'Skills', 'Models', 'Advisor', 'Runs', 'Health')
         positions = [html.index(f'<h2>{title}</h2>') for title in titles]
@@ -649,6 +702,17 @@ class Report(unittest.TestCase):
         self.assertIn('<td>ran=agents applied=0 skipped=1</td>', html)
         self.assertNotIn('critical=2', html)
         self.assertNotIn('applied=3', html)
+
+    def test_html_shows_categories_validity_and_strengths(self):
+        step = {'step': 'task_review', 'wave': 'A', 'round': 0, 'counts': {'critical': 0, 'important': 0, 'minor': 1},
+                'findings': [{'id': 'F1', 'severity': 'minor', 'summary': 's', 'outcome': 'deferred',
+                              'category': 'correctness', 'validity': 'valid'}],
+                'strengths': [{'category': 'tests', 'summary': '<i>pinned</i>'}]}
+        self.records([run_record(schema=5, categories=1, steps=[step])])
+        html = self.html()
+        self.assertIn('<th>category</th><th>summary</th><th>outcome</th><th>validity</th><th>reason</th>', html)
+        self.assertIn('<td>correctness</td><td>s</td><td>deferred</td><td>valid</td>', html)
+        self.assertIn('<tr><td>task review</td><td>wave A</td><td>tests</td><td>&lt;i&gt;pinned&lt;/i&gt;</td></tr>', html)
 
     def test_missing_inputs_give_an_empty_report(self):
         shutil.rmtree(self.projects)
@@ -1382,6 +1446,48 @@ class HealthCheck(Report):
         kinds = {w['kind']: w for w in run['warnings']}
         self.assertEqual(kinds['step_agent_mismatch']['step'], {'step': 'fix_check', 'task': 1, 'round': 1, 'wave': None})
         self.assertEqual(kinds['step_agent_mismatch']['agent'], 'task-reviewer')
+
+    def labelled_run(self, task_strengths, task_line, final_strengths, final_line, findings=None):
+        """A schema 5 run: one task review with one minor finding and a final review, tied by agent id."""
+        finding = {'id': 'F1', 'severity': 'minor', 'summary': 's', 'outcome': 'deferred', 'category': 'tests',
+                   'validity': 'valid'}
+        task = {'step': 'task_review', 'wave': 'A', 'round': 0, 'agent_id': 'tr',
+                'counts': {'critical': 0, 'important': 0, 'minor': 1}, 'findings': findings or [finding]}
+        final = dict(FINAL_STEP, agent_id='fr')
+        if task_strengths is not None:
+            task['strengths'] = task_strengths
+        if final_strengths is not None:
+            final['strengths'] = final_strengths
+        rows = self.reviewed('tr', task_line, subagent_type='task-reviewer', description='Review wave A')
+        rows += self.reviewed('fr', final_line, subagent_type='final-reviewer', description='Final review')
+        self.schema2_run([task, SIMPLIFY_STEP, final], rows, schema=5, categories=1)
+
+    def test_a_labelled_schema_5_run_is_healthy(self):
+        strength = {'category': 'correctness', 'summary': 's'}
+        self.labelled_run([], 'Findings: critical=0 important=0 minor=1 strengths=0',
+                          [strength], 'Findings: critical=0 important=0 minor=0 unneeded=0')
+        self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_a_strength_with_no_summary_is_warned(self):
+        self.labelled_run([{'category': 'tests'}], 'Findings: critical=0 important=0 minor=1 strengths=1',
+                          [], 'Findings: critical=0 important=0 minor=0 unneeded=0 strengths=0')
+        self.assertIn('WARN: b (2026-11-05): task_review step 1 strengths are missing, more than three, or lack a '
+                      'category or summary', self.health())
+
+    def test_schema_5_label_and_strength_gaps_are_warned(self):
+        unlabelled = [{'id': 'F1', 'severity': 'minor', 'summary': 's', 'outcome': 'deferred', 'category': 'nope',
+                       'validity': 'valid'}]
+        self.labelled_run([{'category': 'tests', 'summary': 's'}] * 4, 'Findings: critical=0 important=0 minor=1 strengths=2',
+                          None, 'Findings: critical=0 important=0 minor=0 unneeded=0 strengths=0', findings=unlabelled)
+        prefix = 'WARN: b (2026-11-05): '
+        self.assertEqual(sorted(l for l in self.health() if 'strength' in l or 'categor' in l), sorted([
+            prefix + 'task_review step 1 findings F1 have no category or validity',
+            prefix + 'task_review step 1 strengths are missing, more than three, or lack a category or summary',
+            prefix + "task_review step 1 has 4 strengths, its report's count line says 2",
+            prefix + 'final_review step 1 strengths are missing, more than three, or lack a category or summary']))
+        kinds = {w['kind']: w for w in self.json()['runs'][0]['warnings']}
+        self.assertEqual(kinds['findings_unlabelled']['step'], {'step': 'task_review', 'task': None, 'round': 0, 'wave': 'A'})
+        self.assertIn('strengths_unrecorded', kinds)
 
     def mismatched_run(self, loads=('subagent-driven-development',)):
         """A plan simplify with no Findings: line, a task review whose counts differ, a fix-check with no Verdicts:

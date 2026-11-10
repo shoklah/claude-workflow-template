@@ -2,12 +2,18 @@
 
 Run with: /usr/bin/python3 -I tests/test_workflow_files.py
 """
+import json
 import os
+import re
+import subprocess
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..')
 AGENTS_DIR = os.path.join(ROOT, 'agents')
+# Copied from tests/test_report.py, since tests can't import each other: keep them the same.
+PYTHON = '/usr/bin/python3'
+CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 
 GUIDELINES = 'andrej-karpathy-skills:karpathy-guidelines'
 TDD = 'test-driven-development'
@@ -70,13 +76,49 @@ class AgentFiles(unittest.TestCase):
 
     def test_checked_agents_end_with_their_count_line(self):
         lines = {'fix-checker': '`Verdicts: fixed=N not_proportionate=N open=N`',
-                 'plan-simplifier': '`Findings: cuts=N flags=N`',
-                 'plan-reviewer': '`Findings: findings=N`'}
+                 'plan-simplifier': '`Findings: cuts=N flags=N strengths=N`',
+                 'plan-reviewer': '`Findings: findings=N strengths=N`',
+                 'task-reviewer': '`Findings: critical=N important=N minor=N strengths=N`',
+                 'final-reviewer': '`Findings: critical=N important=N minor=N unneeded=N strengths=N`'}
         for name, line in lines.items():
             with self.subTest(agent=name):
                 _, body = frontmatter(read(os.path.join('agents', name + '.md')))
                 self.assertIn(line, body)
                 self.assertIn('End your report with this line', body)
+
+    def schema_categories(self):
+        script = os.path.join(ROOT, 'scripts', 'workflow-report.py')
+        out = subprocess.run([PYTHON, '-I', script, '--schema'], capture_output=True, text=True, check=True,
+                             env=CLEAN_ENV, timeout=60)
+        return json.loads(out.stdout)['category_list']
+
+    def test_reviewers_carry_their_areas_category_list(self):
+        cats = self.schema_categories()
+        lists = {a['area']: a['list'] for a in cats['areas']}
+        for name, area in (('plan-reviewer', 'plan'), ('plan-simplifier', 'plan'),
+                           ('task-reviewer', 'implementation'), ('final-reviewer', 'implementation')):
+            with self.subTest(agent=name):
+                _, body = frontmatter(read(os.path.join('agents', name + '.md')))
+                lines = body.splitlines()
+                start = next(i for i, l in enumerate(lines) if l.startswith('**Categories:**'))
+                self.assertIn(f"version {cats['version']}; keep them the same", lines[start])
+                self.assertIn(cats['rule'], lines[start])
+                copied = []
+                for line in lines[start + 1:]:
+                    m = re.match(r'- `(\w+)`: (.*)$', line)
+                    if not m:
+                        break
+                    copied.append((m.group(1), m.group(2)))
+                self.assertEqual(copied, [(c['id'], c['means']) for c in lists[area]])
+
+    def test_reviewers_report_categories_and_guarded_strengths(self):
+        for name in ('plan-reviewer', 'plan-simplifier', 'task-reviewer', 'final-reviewer'):
+            with self.subTest(agent=name):
+                _, body = frontmatter(read(os.path.join('agents', name + '.md')))
+                for must in ('one category id from the list below', 'at most three strengths',
+                             'never lowers, replaces or offsets a finding', '`Strengths: none`'):
+                    self.assertIn(must, body)
+                self.assertLess(body.index('**Strengths:**'), body.index('End your report with this line'))
 
     def test_section_stays_short_and_holds_the_exact_contract(self):
         text = read('claude-md/agentic-workflow.md')
@@ -85,7 +127,7 @@ class AgentFiles(unittest.TestCase):
                      'workflow-report.py --schema', 'Advisor: ', '**Failing-test check:** exempt:',
                      '/advisor fable', '/advisor off', 'workflow-archive', 'Started:', '"plan"', 'F1',
                      '**Wave:**', '/usr/bin/python3 -I ~/.claude/scripts/wave.py', '**Offers:**', 'grill-me',
-                     'offers', 'agent_id'):
+                     'offers', 'agent_id', 'validity', 'S1', 'category_list'):
             with self.subTest(must=must):
                 self.assertIn(must, text)
 
