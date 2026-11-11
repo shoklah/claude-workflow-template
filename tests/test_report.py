@@ -220,8 +220,9 @@ class Report(unittest.TestCase):
         self.assertEqual(sum(p['advisor']['calls'] for p in unit['phases']), unit['advisor']['calls'])
         self.assertAlmostEqual(sum(p['advisor']['cost'] for p in unit['phases']), unit['advisor']['cost'], delta=1e-6)
 
-    def kinds(self, *args):
-        return [w['kind'] for w in self.json(*args)['totals']['health']['warnings']]
+    def kinds(self, *args, data=None):
+        """The kinds of the warnings in the JSON of args, or in data when a test already has it."""
+        return [w['kind'] for w in (self.json(*args) if data is None else data)['totals']['health']['warnings']]
 
     def html(self):
         page = os.path.join(self.root, 'page.html')
@@ -863,6 +864,13 @@ class Report(unittest.TestCase):
                 json.dump(stored, f)
         self.assertEqual(self.json()['sessions'][0]['project'], '/home/dev/demo')
 
+    def test_a_sessions_project_skips_an_empty_cwd(self):
+        # Claude Code writes absolute paths; an empty one would export project '' against "null, never empty".
+        self.session([dict(asst('m1'), cwd=''), dict(asst('m2'), cwd='/home/dev/demo')])
+        self.session([dict(asst('m3'), cwd='')], sid='sess-2')
+        projects = {os.path.basename(s['file']): s['project'] for s in self.json()['sessions']}
+        self.assertEqual(projects, {'sess-1.jsonl': '/home/dev/demo', 'sess-2.jsonl': None})
+
 
 STARTUP = '<karpathy-guidelines-session-start>guidelines</karpathy-guidelines-session-start>'
 NOT_FOUND = "Agent type 'final-reviewer' not found. Available agents: general-purpose, Explore"
@@ -872,7 +880,7 @@ SIMPLIFY_STEP = {'step': 'simplify', 'counts': {'applied': 0, 'skipped': 0}, 'fi
 FINAL_STEP = {'step': 'final_review', 'counts': {'critical': 0, 'important': 0, 'minor': 0, 'unneeded': 0},
               'findings': []}
 CLEAN = 'Findings: critical=0 important=0 minor=0 unneeded=0'
-AFTER_CUTOVER = {'date': '2026-11-11T00:00:00Z'}  # after OPUS_FINAL_REVIEW_FROM, so a Fable/high review passes on no other ground
+AFTER_CUTOVER = {'date': '2026-11-11T00:00:00Z'}  # a run dated on PAIRS_FROM; the test puts its rows past final-reviewer's PAST_PINS row too, so a Fable/high review passes on no other ground
 PAIR_NOW = ('--now', '2026-11-11T12:00:00Z')
 
 
@@ -882,10 +890,11 @@ class HealthCheck(Report):
     def setUp(self):
         super().setUp()
         self.clock = 0
+        self.day = '2026-11-05'
 
     def ts(self):
         self.clock += 1
-        return f'2026-11-05T10:{self.clock // 60:02d}:{self.clock % 60:02d}.000Z'
+        return f'{self.day}T10:{self.clock // 60:02d}:{self.clock % 60:02d}.000Z'
 
     def startup(self):
         return startup_row(self.ts())
@@ -1597,12 +1606,13 @@ class HealthCheck(Report):
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
     def pins(self, skills=False):
-        """A fixture agents folder: final-reviewer pinned opus/high and fix-checker sonnet/medium, listing their
-        skills only when skills is true."""
+        """A fixture agents folder: final-reviewer pinned opus/high, fix-checker sonnet/medium and implementer
+        opus/medium, listing their skills only when skills is true."""
         folder = os.path.join(self.root, 'agents')
         os.makedirs(folder, exist_ok=True)
         for name, model, effort, listed in (('final-reviewer', 'opus', 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
-                                            ('fix-checker', 'sonnet', 'medium', [])):
+                                            ('fix-checker', 'sonnet', 'medium', []),
+                                            ('implementer', 'opus', 'medium', [])):
             lines = ['---', f'name: {name}', 'description: d', f'model: {model}', f'effort: {effort}']
             if skills and listed:
                 lines += ['skills:'] + [f'  - {skill}' for skill in listed]
@@ -1617,6 +1627,7 @@ class HealthCheck(Report):
         self.records([run_record(head='c0ffee01', schema=schema, started='2026-11-05T10:00:00Z', steps=steps, **over)])
 
     def test_a_pairs_fable_half_is_no_step_and_keeps_the_checks_quiet(self):
+        self.day = PAIRS_FROM
         final = dict(FINAL_STEP, agent_id='fr')
         fix = {'step': 'final_fix_check', 'counts': {'fixed': 0, 'not_proportionate': 0, 'open': 0}, 'agent_id': 'fc'}
         rows = self.pair(fable_report='Findings: critical=0 important=2 minor=0 unneeded=0')
@@ -1649,6 +1660,7 @@ class HealthCheck(Report):
             with self.subTest(name=name):
                 self.tearDown()
                 self.setUp()
+                self.day = PAIRS_FROM
                 self.schema2_run([SIMPLIFY_STEP, dict(FINAL_STEP, agent_id='fr')], rows(), schema=4, **AFTER_CUTOVER)
                 kinds = set(self.kinds('--agents', self.pins(), *PAIR_NOW))
                 self.assertLessEqual(expected, kinds, name)
@@ -1931,12 +1943,16 @@ class HealthCheck(Report):
 
     def test_an_agent_off_its_pin_is_warned_unless_the_stage_allows_it(self):
         prefix = 'WARN: b (2026-11-05): '
-        after = {'date': '2026-11-11T00:00:00Z'}
         cases = (
             # (record fields, dispatch input, subagent model and effort, expected)
             ({}, {}, ('claude-opus-5-5', 'high'), ['Health: no problems']),
             ({'risk_area': True}, {}, ('claude-opus-5-5', 'high'), ['Health: no problems']),
             ({'stage': 'out'}, {}, ('claude-opus-5-5', 'xhigh'), ['Health: no problems']),
+            # Out's xhigh seat is Opus: another model passed explicitly at xhigh is off the pin, in a risk area too
+            ({'stage': 'out'}, {'model': 'fable', 'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'),
+             [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned opus/high: Final review']),
+            ({'stage': 'out', 'risk_area': True}, {'model': 'fable', 'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'),
+             [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned opus/high: Final review']),
             ({'stage': '3'}, {'model': 'fable'}, ('claude-fable-5-1', 'high'), ['Health: no problems']),
             ({'risk_area': True}, {'model': 'fable', 'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'),
              ['Health: no problems']),
@@ -1944,10 +1960,7 @@ class HealthCheck(Report):
              [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned opus/high: Final review']),
             ({}, {'model': 'fable', 'effort': 'xhigh'}, ('claude-fable-5-1', 'xhigh'),
              [prefix + 'final-reviewer ran on claude-fable-5-1/xhigh, pinned opus/high: Final review']),
-            ({}, {}, ('claude-fable-5-1', 'high'), ['Health: no problems']),
-            (after, {}, ('claude-fable-5-1', 'high'),
-             ['WARN: b (2026-11-11): final-reviewer ran on claude-fable-5-1/high, pinned opus/high: Final review']),
-            ({'date': '2026-11-10T23:00:00Z'}, {}, ('claude-fable-5-1', 'high'), ['Health: no problems']),
+            ({}, {}, ('claude-fable-5-1', 'high'), ['Health: no problems']),  # the old pin, dispatched before it moved
         )
         for over, inp, (model, effort), expected in cases:
             with self.subTest(over=over, inp=inp):
@@ -1960,6 +1973,37 @@ class HealthCheck(Report):
                                                sub_model=model, sub_effort=effort, subagent_type='final-reviewer',
                                                description='Final review', **inp), **over)
                 args = ('--agents', self.pins(), '--now', '2026-11-11T12:00:00Z')
+                self.assertEqual(self.health(*args), expected)
+                self.assertEqual(self.kinds(*args), ['agent_off_pin'] if expected[0].startswith('WARN') else [])
+
+    def test_a_moved_seats_old_pin_passes_for_dispatches_up_to_its_day(self):
+        # PAST_PINS: the implementer was opus/high up to and on 2026-11-11, final-reviewer fable/high up to 2026-11-10.
+        # The dispatch's own day decides, not the run's finish: a run in flight across the move warns nothing.
+        prefix = 'WARN: b (2026-11-12): '
+        cases = (
+            ('implementer', '2026-11-11', 'claude-opus-5-5', 'high', ['Health: no problems']),
+            ('implementer', '2026-11-12', 'claude-opus-5-5', 'high',
+             [prefix + 'implementer ran on claude-opus-5-5/high, pinned opus/medium: Implement Task 1']),
+            ('implementer', '2026-11-12', 'claude-opus-5-5', 'medium', ['Health: no problems']),
+            ('implementer', '2026-11-11', 'claude-fable-5-1', 'high',  # the old pin is a model and effort pair
+             [prefix + 'implementer ran on claude-fable-5-1/high, pinned opus/medium: Implement Task 1']),
+            ('final-reviewer', '2026-11-11', 'claude-fable-5-1', 'high',
+             [prefix + 'final-reviewer ran on claude-fable-5-1/high, pinned opus/high: Final review']),
+        )
+        for agent, day, model, effort, expected in cases:
+            with self.subTest(agent=agent, day=day, effort=effort):
+                self.tearDown()
+                self.setUp()
+                self.day = day
+                if agent == 'implementer':
+                    rows = self.reviewed('im', 'DONE', sub_model=model, sub_effort=effort, subagent_type=agent,
+                                         description='Implement Task 1')
+                    rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+                else:
+                    rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', sub_model=model,
+                                         sub_effort=effort, subagent_type=agent, description='Final review')
+                self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, date='2026-11-12T12:00:00Z')
+                args = ('--agents', self.pins(), '--now', '2026-11-13T12:00:00Z')
                 self.assertEqual(self.health(*args), expected)
                 self.assertEqual(self.kinds(*args), ['agent_off_pin'] if expected[0].startswith('WARN') else [])
 
@@ -2079,6 +2123,10 @@ class HealthCheck(Report):
                 first = min(fork, 'sess-1')
                 self.assertEqual(self.health(), ['Health: no problems'] if later else
                                  [f"WARN: session {first}.jsonl: typed 'grill-me' but grill-me never loaded"])
+                data = self.json()
+                self.assertEqual(self.kinds(data=data), [] if later else ['typed_skill_not_loaded'])
+                # the JSON's missing count is the health's unmet typed triggers: one for the row typed once
+                self.assertEqual(data['totals']['skills']['grill-me']['missing'], 0 if later else 1)
 
     def test_a_session_with_no_run_and_no_startup_guidelines_is_warned(self):
         rows = self.agent('ps', subagent_type='plan-simplifier', description='Plan simplify')
@@ -2955,9 +3003,13 @@ class HealthCheck(Report):
                         for name in ('sess-1.jsonl', 'sess-2.jsonl'))
         self.assertTrue(run['window']['transcript'].endswith('sess-1.jsonl'))
         self.assertEqual([s['name'] for s in run['skills']], ['systematic-debugging'])
-        self.assertEqual([t['skill'] for t in run['typed']], ['grill-me'])
+        self.assertEqual([(t['skill'], t['met']) for t in run['typed']], [('grill-me', False)])
         self.assertEqual([c['name'] for c in parent['commands']], ['demo-skill'])  # the transcript's, as ever
         self.assertEqual((fork['skills'], fork['typed'], fork['commands']), ([], [], []))
+        # the unmet trigger the run owns warns once, on the run's transcript, and the totals count it once
+        typed = [w for w in data['totals']['health']['warnings'] if w['kind'] == 'typed_skill_not_loaded']
+        self.assertEqual([os.path.basename(w['session']) for w in typed], ['sess-1.jsonl'])
+        self.assertEqual(data['totals']['skills']['grill-me']['missing'], 1)
 
     def test_a_fork_sorting_before_its_parent_keeps_the_copied_events(self):
         shared = [self.startup(), self.loaded('systematic-debugging'), user('grill me', ts=self.ts()),

@@ -2,7 +2,7 @@
 name: implementer
 description: Implements one task of an approved plan; the default implementer in subagent-driven-development.
 model: opus
-effort: high
+effort: medium
 disallowedTools: Agent
 skills:
   - andrej-karpathy-skills:karpathy-guidelines

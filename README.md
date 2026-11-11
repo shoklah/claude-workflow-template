@@ -118,7 +118,7 @@ Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3
 | Plan simplify | `plan-simplifier` | Opus 5.5 | `high` |
 | Plan review | `plan-reviewer` | Fable | `high` |
 | Session running implementation | main session | Opus 5.5 | `medium` |
-| Implementer | `implementer` | Opus 5.5 | `high` |
+| Implementer | `implementer` | Opus 5.5 | `medium` |
 | Implementer when the plan holds the code | `implementer-copy` | Sonnet 5.5 | `medium` |
 | Round 3 from Opus | `implementer-escalated` | Fable | `high` |
 | Task review | `task-reviewer` | Opus 5.5 | `high` |

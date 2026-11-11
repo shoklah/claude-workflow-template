@@ -40,8 +40,9 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               and cost, advisor, its spend by phase, its main calls' context, tool-result characters by call class and
               inline and delegated sweeps, its WARN and information lines, later fix commits), "sessions" (each main
               transcript's rows in range outside its run windows, with their models, advisor, spend by phase, main
-              calls' context, tool-result characters and sweeps, and its start, end, project and slash commands, by
-              name and time, never their arguments) and
+              calls' context, tool-result characters and sweeps, and its start, end and project over the whole
+              transcript, and its slash commands, never split by run windows, by name and time, never their
+              arguments) and
               "totals" (scoreboard, weeks, context (the units' context, tool-result characters and sweeps by week),
               run_time, skills, models, advisor, offers, health); each WARN also as an
               object with its kind, run or session, step, skill and agent, each session's title, each step's agent
@@ -238,8 +239,11 @@ PATH_PHASES = {'plan': 'design', 'full': 'coordination', 'small': 'implement'}
 STOP_SHARE = 25.0
 TRIAL_RUNS = 5
 TRIAL_WEEKS = 3
-# The day final-reviewer's Opus seat was installed: up to and on it, its pin was Fable at high.
-OPUS_FINAL_REVIEW_FROM = '2026-11-10'
+# Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
+# day passes on the old pin too, since the check reads today's pins. The day is the one the new seat was installed,
+# set in the change that merges with it. A row is never removed.
+PAST_PINS = {'final-reviewer': [('2026-11-10', 'fable', 'high')],
+             'implementer': [('2026-11-11', 'opus', 'high')]}
 # PAIRS is the ten pairs of claude-md/agentic-workflow.md's **Measure (pairs)** bullet, and PAIRS_FROM, the day the
 # pair measure was installed, is copied in tests/test_report.py: keep them the same.
 PAIRS = 10
@@ -376,7 +380,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -768,7 +772,7 @@ def usage_rows(path):
     'first', 'cwd', 'skipped'}. A row keeps only the fields read_file reads, a text block only its notes, a tool_use
     block also its tool_class and its file, a user row's tool_result blocks their id and characters, and a row it
     ignores is dropped; has_origin is whether any row has an origin, last the greatest row timestamp, first the least,
-    cwd the cwd of the first row with a string one, and skipped the lines that are not objects."""
+    cwd the cwd of the first row with a non-empty string one, and skipped the lines that are not objects."""
     stats = {'skipped': 0}
     rows, has_origin, last, first, cwd = [], False, None, None, None
     for row in read_jsonl(path, stats):
@@ -776,7 +780,7 @@ def usage_rows(path):
         timestamp = row.get('timestamp')
         if isinstance(timestamp, str):
             last, first = max(last or timestamp, timestamp), min(first or timestamp, timestamp)
-        if cwd is None and isinstance(row.get('cwd'), str):
+        if cwd is None and isinstance(row.get('cwd'), str) and row['cwd']:
             cwd = row['cwd']
         kind, msg, att = row.get('type'), row.get('message'), row.get('attachment')
         if kind == 'assistant' and isinstance(msg, dict):
@@ -1892,6 +1896,7 @@ def check_steps(run, dispatches, events, pins):
     problems += [problem('required_skill_missing', f'required skill {skill} did not run', skill=skill)
                  for skill, d in missing if d is None]
     stage = run.get('stage')
+    run_day = run['_time'].date().isoformat() if run['_time'] is not None else None
     for d, step in zip(dispatches, dispatch_steps(run, dispatches)):
         inp, sub = d['inp'], d['sub']
         agent = inp.get('subagent_type')
@@ -1899,21 +1904,23 @@ def check_steps(run, dispatches, events, pins):
         if pin is None or sub is None:
             continue
         model, effort = ran_on(sub_usage(sub))
-        # The overrides the stage allows: an explicit model in stage 3 or Out, xhigh for final-reviewer in Out, and
-        # final-reviewer's Fable seats: at xhigh passed in a risk area, at high in a run finished on or before the day
-        # the Opus seat was installed, and the pair's second half at high. A model or effort the transcript doesn't
-        # show passes.
+        # The overrides the stage allows: an explicit model in stage 3 or Out, final-reviewer's seats (Opus at xhigh
+        # in Out, Fable outside Out at xhigh passed in a risk area, and Fable at high as a pair's second half) and,
+        # for a dispatch on or before the day a seat moved, the agent's old pin from PAST_PINS. A model or effort the
+        # transcript doesn't show passes.
         final = agent == 'final-reviewer'
         fable = on_model(model or '', 'fable')
+        day = d['time'][:10] if d['time'] else run_day
         model_ok = (not model or not pin['model'] or on_model(model, pin['model'])
                     or stage in ('3', 'out') and bool(inp.get('model')))
-        effort_ok = (not effort or not pin['effort'] or effort == pin['effort']
-                     or final and stage == 'out' and effort == 'xhigh')
-        seat_ok = final and fable and (run.get('risk_area') is True and inp.get('effort') == effort == 'xhigh'
-                                       or effort == 'high' and run['_time'] is not None
-                                       and run['_time'].date().isoformat() <= OPUS_FINAL_REVIEW_FROM
-                                       or d['pair'] and effort == 'high')
-        if not (model_ok and effort_ok or seat_ok):
+        effort_ok = not effort or not pin['effort'] or effort == pin['effort']
+        seat_ok = final and (stage == 'out' and effort == 'xhigh' and (not model or on_model(model, 'opus'))
+                             or fable and stage != 'out' and run.get('risk_area') is True
+                             and inp.get('effort') == effort == 'xhigh'
+                             or fable and d['pair'] and effort == 'high')
+        old_ok = any(day is not None and day <= last and not off_request(model, effort, old_model, old_effort)
+                     for last, old_model, old_effort in PAST_PINS.get(agent, ()))
+        if not (model_ok and effort_ok or seat_ok or old_ok):
             problems.append(problem('agent_off_pin', f"{agent} ran on {model}/{effort}, pinned "
                                     f"{pin['model']}/{pin['effort']}: {inp.get('description')}",
                                     step=step, agent=agent))

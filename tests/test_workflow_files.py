@@ -21,7 +21,7 @@ REVIEWER_TOOLS = 'Edit, Write, NotebookEdit, Agent'
 
 # Each agent's model, effort, disallowed tools and preloaded skills, as the README's model table sets them.
 ROLES = {
-    'implementer': ('opus', 'high', 'Agent', [GUIDELINES, TDD]),
+    'implementer': ('opus', 'medium', 'Agent', [GUIDELINES, TDD]),
     'implementer-copy': ('sonnet', 'medium', 'Agent', [GUIDELINES, TDD]),
     'implementer-escalated': ('fable', 'high', 'Agent', [GUIDELINES, TDD]),
     'plan-reviewer': ('fable', 'high', REVIEWER_TOOLS, [GUIDELINES]),
