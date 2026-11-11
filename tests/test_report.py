@@ -2110,8 +2110,8 @@ class HealthCheck(Report):
                 self.assertEqual(self.kinds(), ['typed_skill_not_loaded'] if expected == warned else [])
 
     def test_a_forks_copied_typed_trigger_warns_once_and_not_when_the_fork_loads_the_skill(self):
-        # A fork copies its parent's trigger row, so the row warns once, on the first transcript by path, and not when
-        # either transcript loads the skill after it.
+        # A fork copies its parent's trigger row, so the row warns once, on the first transcript by path when no run
+        # holds it, and not when either transcript loads the skill after it.
         for later, fork in (((), 'sess-0'), ((), 'sess-2'), (('grill-me',), 'sess-0'), (('grill-me',), 'sess-2')):
             with self.subTest(later=later, fork=fork):
                 self.tearDown()
@@ -3007,6 +3007,19 @@ class HealthCheck(Report):
         self.assertEqual([c['name'] for c in parent['commands']], ['demo-skill'])  # the transcript's, as ever
         self.assertEqual((fork['skills'], fork['typed'], fork['commands']), ([], [], []))
         # the unmet trigger the run owns warns once, on the run's transcript, and the totals count it once
+        typed = [w for w in data['totals']['health']['warnings'] if w['kind'] == 'typed_skill_not_loaded']
+        self.assertEqual([os.path.basename(w['session']) for w in typed], ['sess-1.jsonl'])
+        self.assertEqual(data['totals']['skills']['grill-me']['missing'], 1)
+
+    def test_a_forks_copied_typed_trigger_warns_on_the_transcript_whose_run_holds_it(self):
+        # The fork sorts before its parent by path, but the parent's run span holds the trigger row, so the warning
+        # names the parent, and the missing total still counts the row once.
+        shared = [self.startup(), user('grill me', ts=self.ts())]
+        self.session(shared + [self.record_write('c0ffee01', started='2026-11-05T10:00:00Z')], project='proj')
+        self.session(shared + [asst('own', ts=self.ts())], project='proj', sid='sess-0')
+        self.records([run_record(head='c0ffee01', schema=2, started='2026-11-05T10:00:00Z', steps=[])])
+        data = self.json()
+        self.assertTrue(data['runs'][0]['window']['transcript'].endswith('sess-1.jsonl'))
         typed = [w for w in data['totals']['health']['warnings'] if w['kind'] == 'typed_skill_not_loaded']
         self.assertEqual([os.path.basename(w['session']) for w in typed], ['sess-1.jsonl'])
         self.assertEqual(data['totals']['skills']['grill-me']['missing'], 1)

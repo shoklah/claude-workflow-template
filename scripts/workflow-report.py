@@ -2041,14 +2041,21 @@ def is_workflow_agent(tool_input):
             and 'implement' in description.lower())
 
 
-def unrecorded_sessions(projects_root, spans, now):
-    """(transcript path, problem) for each main transcript that launched a workflow agent this week, up to now,
-    outside every run's span, a span covering each transcript of its chain up to that one's cutoff."""
-    week = week_start(now)
-    covered = {}
+def span_windows(spans):
+    """{transcript: [(start, end), ...]} for run_spans' spans: a span covers each transcript of its chain, from the
+    span's start up to that transcript's cutoff."""
+    windows = {}
     for path, start, end in spans.values():
         for p, p_end in chain_windows(path, end):
-            covered.setdefault(p, []).append((start, p_end))
+            windows.setdefault(p, []).append((start, p_end))
+    return windows
+
+
+def unrecorded_sessions(projects_root, spans, now):
+    """(transcript path, problem) for each main transcript that launched a workflow agent this week, up to now,
+    outside every run's span."""
+    week = week_start(now)
+    covered = span_windows(spans)
     out = []
     for path in main_transcripts(projects_root):
         events, launched, _ = transcript_events(path)
@@ -2096,31 +2103,36 @@ def typed_triggers(events):
 
 
 def shared_triggers(events_by_path):
-    """Each typed trigger in the main transcripts' events, given in path order, by its time and skill: [the first
-    transcript holding it, whether any transcript holding it loads the skill later]. A forked session copies its
+    """Each typed trigger in the main transcripts' events, given in path order, by its time and skill: [the
+    transcripts holding it, in that order, whether any of them loads the skill later]. A forked session copies its
     parent's rows, so the copies are one trigger, typed once."""
     triggers = {}
     for path, events in events_by_path.items():
         for timestamp, skill, met in typed_triggers(events):
-            entry = triggers.setdefault((timestamp, skill), [path, False])
+            entry = triggers.setdefault((timestamp, skill), [[], False])
+            entry[0].append(path)
             entry[1] = entry[1] or met
     return triggers
 
 
 def session_warnings(projects_root, spans, now):
     """(transcript path, problem) for each typed trigger the main transcripts hold this week, up to now, that no later
-    load of its skill meets, on the first transcript holding it, and for each main transcript written this week with
-    no run's span, over its chain, and no startup block."""
+    load of its skill meets, on the transcript whose run span holds its row, else on the first transcript holding it,
+    and for each main transcript written this week with no run's span, over its chain, and no startup block."""
     week = week_start(now)
-    covered = {p for path, _, _ in spans.values() for p, _ in chain_paths(path)}
+    covered = span_windows(spans)
     read = {path: transcript_events(path) for path in main_transcripts(projects_root)}
     triggers = shared_triggers({path: [e for e in events if in_range(e[0], None, now)]
                                 for path, (events, _, _) in read.items()})
+    # A trigger warns on the holder whose run span holds its row, else on the first holder by path.
+    owners = {key: next((p for p in holders if any(in_window(key[0], start, end) for start, end in covered.get(p, []))),
+                        holders[0])
+              for key, (holders, _) in triggers.items()}
     out = []
     for path, (_, _, startup) in read.items():
         name = os.path.basename(path)
-        for (timestamp, skill), (first, met) in triggers.items():
-            if first != path or met:
+        for (timestamp, skill), (_, met) in triggers.items():
+            if owners[(timestamp, skill)] != path or met:
                 continue
             t = parse_time(timestamp)
             if t is not None and t >= week:
