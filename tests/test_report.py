@@ -25,6 +25,8 @@ OVER_CAP = {'input_tokens': 300_001, 'output_tokens': 1}  # the usage of one cal
 # The spec's phase order, as PHASES in scripts/workflow-report.py: keep them the same.
 PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'fix_check',
           'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
+# PAIRS_FROM in scripts/workflow-report.py, the day the pair measure was installed: keep them the same.
+PAIRS_FROM = '2026-11-11'
 
 
 # Copied from scripts/workflow-report.py's unit_key, since tests can't import the script: keep them the same.
@@ -869,6 +871,9 @@ RAN_NO = {'ran': 'no', 'applied': 0, 'skipped': 0}
 SIMPLIFY_STEP = {'step': 'simplify', 'counts': {'applied': 0, 'skipped': 0}, 'findings': []}
 FINAL_STEP = {'step': 'final_review', 'counts': {'critical': 0, 'important': 0, 'minor': 0, 'unneeded': 0},
               'findings': []}
+CLEAN = 'Findings: critical=0 important=0 minor=0 unneeded=0'
+AFTER_CUTOVER = {'date': '2026-11-11T00:00:00Z'}  # after OPUS_FINAL_REVIEW_FROM, so a Fable/high review passes on no other ground
+PAIR_NOW = ('--now', '2026-11-11T12:00:00Z')
 
 
 class HealthCheck(Report):
@@ -941,6 +946,42 @@ class HealthCheck(Report):
                              ts=self.ts(), **ran))
         self.subagent(inp.get('subagent_type') or 'general-purpose', rows, project='proj', sid=sid, aid=tid, tid=tid)
         return self.agent(tid, **inp)
+
+    def pair(self, fable_report=CLEAN, fable_effort='high', between=lambda: [], sid='sess-1'):
+        """An Opus final review fr of 70000 input tokens, the rows between() builds once it is written (so their times
+        follow its rows), then a Fable one fp of 50000, launched as a final-reviewer with model fable and effort
+        fable_effort."""
+        return (self.reviewed('fr', CLEAN, sub_model='claude-opus-5-5', sub_effort='high', u=usage(None, 70000, 0),
+                              sid=sid, subagent_type='final-reviewer', description='Final review')
+                + between()
+                + self.reviewed('fp', fable_report, sub_model='claude-fable-5-1', sub_effort=fable_effort,
+                                u=usage(None, 50000, 0), sid=sid, subagent_type='final-reviewer',
+                                description='Final review', model='fable', effort=fable_effort))
+
+    def pair_session(self, sid, day=PAIRS_FROM):
+        """A main transcript sid holding a startup, a simplify and a pair, its rows timed on day (YYYY-MM-DD)."""
+        rows = [self.startup(), self.simplify()] + self.pair(sid=sid)
+        self.session([dict(row, timestamp=day + row['timestamp'][10:]) for row in rows], project='proj', sid=sid)
+
+    def test_brief_counts_pairs_from_the_measure_start_whatever_since_says(self):
+        start = datetime.date.fromisoformat(PAIRS_FROM)
+        later = (start + datetime.timedelta(days=2)).isoformat()
+        now = ('--now', later + 'T12:00:00Z')
+        self.pair_session('before', day=(start - datetime.timedelta(days=1)).isoformat())
+        self.assertNotIn('pairs:', self.run_report('--brief', *now))
+        self.pair_session('one')
+        self.pair_session('two')
+        brief = self.run_report('--brief', *now).splitlines()
+        self.assertEqual(len(brief), 4)
+        self.assertEqual(brief[2], 'pairs: 2 of 10')
+        self.assertEqual(self.run_report('--brief', *now, '--since', later).splitlines()[2], 'pairs: 2 of 10')
+        # a forked session copies the rows, timestamps and ids included: the pair counts once
+        folder = os.path.join(self.projects, 'proj')
+        shutil.copy(os.path.join(folder, 'two.jsonl'), os.path.join(folder, 'two-fork.jsonl'))
+        self.assertEqual(self.run_report('--brief', *now).splitlines()[2], 'pairs: 2 of 10')
+        for n in range(8):
+            self.pair_session(f'p{n}')
+        self.assertEqual(self.run_report('--brief', *now).splitlines()[2], 'pairs: 10 of 10 CHECKPOINT')
 
     def handed_off(self, calls):
         """An old session aaaa that dispatches an implementer, then makes calls, (prompt, result) pairs of
@@ -1574,6 +1615,46 @@ class HealthCheck(Report):
         rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
         self.session(rows, project='proj')
         self.records([run_record(head='c0ffee01', schema=schema, started='2026-11-05T10:00:00Z', steps=steps, **over)])
+
+    def test_a_pairs_fable_half_is_no_step_and_keeps_the_checks_quiet(self):
+        final = dict(FINAL_STEP, agent_id='fr')
+        fix = {'step': 'final_fix_check', 'counts': {'fixed': 0, 'not_proportionate': 0, 'open': 0}, 'agent_id': 'fc'}
+        rows = self.pair(fable_report='Findings: critical=0 important=2 minor=0 unneeded=0')
+        rows += self.reviewed('fc', 'Verdicts: fixed=0 not_proportionate=0 open=0', sub_model='claude-sonnet-5-5',
+                              sub_effort='medium', subagent_type='fix-checker', description='Fix-check final findings')
+        self.schema2_run([SIMPLIFY_STEP, final, fix], rows, schema=4, **AFTER_CUTOVER)
+        args = ('--agents', self.pins(), *PAIR_NOW)
+        self.assertEqual(self.health(*args), ['Health: no problems'])
+        self.assertEqual(self.kinds(*args), [])
+        data = self.json(*args)
+        run = data['runs'][0]
+        self.assertEqual([(d['agent'], d['kind'], d['pair'], d['step']) for d in run['dispatches']],
+                         [('final-reviewer', 'final_review', False, 1), ('final-reviewer', 'final_review', True, None),
+                          ('fix-checker', 'final_fix_check', False, 2)])
+        self.assertEqual(phase_inputs(run)['final_review'], 120000)
+        self.assertEqual(data['totals']['scoreboard']['final_review']['tokens']['input'], 70000)
+
+    def test_a_fable_review_that_is_no_pair_is_warned(self):
+        fable = {'subagent_type': 'final-reviewer', 'description': 'Final review', 'model': 'fable', 'effort': 'high'}
+        cases = {
+            'a simplify between the halves': (lambda: self.pair(between=lambda: [self.simplify()]),
+                                              {'step_count_differs', 'agent_off_pin'}),
+            'an errored Opus half': (lambda: self.agent('fx', error=NOT_FOUND, subagent_type='final-reviewer',
+                                                        description='Final review')
+                                     + self.reviewed('fp', CLEAN, sub_model='claude-fable-5-1', sub_effort='high', **fable),
+                                     {'agent_off_pin'}),
+            'the Fable half at xhigh': (lambda: self.pair(fable_effort='xhigh'), {'agent_off_pin'}),
+        }
+        for name, (rows, expected) in cases.items():
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.schema2_run([SIMPLIFY_STEP, dict(FINAL_STEP, agent_id='fr')], rows(), schema=4, **AFTER_CUTOVER)
+                kinds = set(self.kinds('--agents', self.pins(), *PAIR_NOW))
+                self.assertLessEqual(expected, kinds, name)
+                self.assertNotIn('final_review_without_simplify', kinds)  # each launched review had its simplify
+                if name == 'the Fable half at xhigh':
+                    self.assertNotIn('step_count_differs', kinds)  # a pair's second half is no step
 
     def test_steps_match_launched_agents_and_count_lines(self):
         final = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},

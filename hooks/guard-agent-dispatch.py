@@ -4,7 +4,8 @@ Denies a dispatch with no model when subagent_type is missing or general-purpose
 the main session's model. Then two ordering rules, each needing its own unlock per review:
 - a final review is denied when the session's transcript shows no simplify call since the last final review that
   launched. A final review is a final-reviewer dispatch, or a general-purpose or untyped one whose description says
-  final review.
+  final review. The exception is a pair's second half: a final-reviewer passing a Fable model is allowed when exactly
+  one final review, not passing a Fable model, launched since the last simplify.
 - a plan review is denied when the transcript shows no launched plan simplify since the last plan review that
   launched. A plan review is a plan-reviewer dispatch, or a general-purpose or untyped one whose description says plan
   review; a plan simplify is a plan-simplifier dispatch, or a general-purpose or untyped one with a model whose
@@ -71,6 +72,11 @@ def is_plan_simplify(tool_input):
             and bool(PLAN_SIMPLIFY_DESCRIPTION.search(description)) and not NOT_FINAL_REVIEW.search(description))
 
 
+def passes_fable(tool_input):
+    model = tool_input.get('model')
+    return isinstance(model, str) and model.startswith(('fable', 'claude-fable'))
+
+
 def row_calls_simplify(row):
     content = row.get('message', {}).get('content')
     if row.get('type') == 'user':
@@ -83,25 +89,26 @@ def row_calls_simplify(row):
     return False
 
 
-def dispatch_ids(row, is_kind):
-    """The tool_use ids of the Agent dispatches in this row whose input is_kind accepts."""
+def dispatch_calls(row, is_kind):
+    """(call_id, tool_input) for the Agent dispatches in this row whose input is_kind accepts."""
     if row.get('type') != 'assistant':
         return []
-    return [block['id'] for block in row.get('message', {}).get('content') or []
+    return [(block['id'], block['input']) for block in row.get('message', {}).get('content') or []
             if block.get('type') == 'tool_use' and block.get('name') == 'Agent' and isinstance(block.get('id'), str)
             and isinstance(block.get('input'), dict) and is_kind(block['input'])]
 
 
 def final_review_events(row):
-    """(unlocks, call_id) pairs: a simplify call unlocks with no id to launch, a final review locks."""
-    simplify = [(True, None)] if row_calls_simplify(row) else []
-    return simplify + [(False, call_id) for call_id in dispatch_ids(row, is_final_review)]
+    """(unlocks, call_id, tool_input) triples: a simplify call unlocks with no id to launch, a final review locks."""
+    simplify = [(True, None, None)] if row_calls_simplify(row) else []
+    return simplify + [(False, call_id, tool_input) for call_id, tool_input in dispatch_calls(row, is_final_review)]
 
 
 def plan_review_events(row):
-    """(unlocks, call_id) pairs: a plan simplify unlocks and a plan review locks, each only once it launched."""
-    return ([(True, call_id) for call_id in dispatch_ids(row, is_plan_simplify)]
-            + [(False, call_id) for call_id in dispatch_ids(row, is_plan_review)])
+    """(unlocks, call_id, tool_input) triples: a plan simplify unlocks and a plan review locks, each only once it
+    launched."""
+    return ([(True, call_id, tool_input) for call_id, tool_input in dispatch_calls(row, is_plan_simplify)]
+            + [(False, call_id, tool_input) for call_id, tool_input in dispatch_calls(row, is_plan_review)])
 
 
 def launched_ids(row, ids):
@@ -117,7 +124,8 @@ def launched_ids(row, ids):
 
 
 def ordered_events(path, row_events):
-    """Return (timestamp, unlocks, call_id) in file order, from row_events on each line holding one of EVENT_NEEDLES.
+    """Return (timestamp, unlocks, call_id, tool_input) in file order, from row_events on each line holding one of
+    EVENT_NEEDLES.
 
     A row with no timestamp takes the previous row's, so file order holds when it is merged with another transcript.
     """
@@ -133,7 +141,7 @@ def ordered_events(path, row_events):
                 found = row_events(row)
             except (ValueError, AttributeError, TypeError):  # A torn or odd line says nothing either way.
                 continue
-            events.extend((timestamp, unlocks, call_id) for unlocks, call_id in found)
+            events.extend((timestamp, unlocks, call_id, tool_input) for unlocks, call_id, tool_input in found)
     return events
 
 
@@ -152,21 +160,25 @@ def launched_dispatches(paths, ids):
     return launched
 
 
-def unlocked_since_last_lock(paths, row_events):
-    """True when an unlock comes after the last lock. Raises OSError if a file can't be read.
+def locks_since_last_unlock(paths, row_events):
+    """The tool inputs of the locks after the last unlock, in order, or None when no unlock counts yet. Raises OSError
+    if a file can't be read.
 
     An event with a call_id counts once that dispatch launched: it has a tool_result that is not an error, so the
     dispatch being judged, which has none yet, and one that was refused or not found don't count. Rows from several
     transcripts merge by timestamp.
     """
     per_file = [ordered_events(path, row_events) for path in paths]
-    ids = {call_id for events in per_file for _, _, call_id in events if call_id is not None}
+    ids = {call_id for events in per_file for _, _, call_id, _ in events if call_id is not None}
     launched = launched_dispatches(paths, ids) if ids else set()
-    since = False
-    for _, unlocks, call_id in heapq.merge(*per_file, key=lambda event: event[0]):
+    locks, unlocked = [], False
+    for _, unlocks, call_id, tool_input in heapq.merge(*per_file, key=lambda event: event[0]):
         if call_id is None or call_id in launched:
-            since = unlocks
-    return since
+            if unlocks:
+                locks, unlocked = [], True
+            else:
+                locks.append(tool_input)
+    return locks if unlocked else None
 
 
 def transcripts_to_scan(path):
@@ -175,15 +187,19 @@ def transcripts_to_scan(path):
     return [path]
 
 
-def ordering_reason(path, row_events, reason):
-    """reason unless an unlock comes after the last lock in the transcripts; None when there is no path or one
-    can't be read."""
+def ordering_reason(path, row_events, reason, pair=False):
+    """reason unless an unlock comes after the last lock in the transcripts, or, with pair, exactly one lock not
+    passing Fable follows the last unlock; None when there is no path or one can't be read. The pair rule is
+    scripts/workflow-report.py's pair_halves, which counts these dispatches: keep them the same."""
     if not isinstance(path, str) or not path:
         return None
     try:
-        return None if unlocked_since_last_lock(transcripts_to_scan(path), row_events) else reason
+        locks = locks_since_last_unlock(transcripts_to_scan(path), row_events)
     except OSError:
         return None
+    if locks is not None and (not locks or pair and len(locks) == 1 and not passes_fable(locks[0])):
+        return None
+    return reason
 
 
 def decide(payload):
@@ -194,7 +210,8 @@ def decide(payload):
     if tool_input.get('subagent_type') in UNNAMED_TYPES and not tool_input.get('model'):
         return UNNAMED_REASON
     if is_final_review(tool_input):
-        return ordering_reason(payload.get('transcript_path'), final_review_events, SIMPLIFY_REASON)
+        pair = tool_input.get('subagent_type') == 'final-reviewer' and passes_fable(tool_input)
+        return ordering_reason(payload.get('transcript_path'), final_review_events, SIMPLIFY_REASON, pair)
     if is_plan_review(tool_input):
         return ordering_reason(payload.get('transcript_path'), plan_review_events, PLAN_SIMPLIFY_REASON)
     return None

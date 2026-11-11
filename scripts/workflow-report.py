@@ -15,9 +15,10 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
   --no-cache  read and write no cache; the output is the same
   --since     ignore transcript rows and run records before this date (UTC); --health and --brief default it to
               7 days before --now, --json and --html read everything
-  --brief     at most 3 lines: this week's advisor share of Fable use, the trial's progress, then this week's
-              first WARN line with a count of the rest, or else the consultations with no note, then any commits on
-              main since the last template export; the trial counts every run record
+  --brief     at most 4 lines: this week's advisor share of Fable use, the trial's progress, "pairs: N of 10" when the
+              final review pairs since PAIRS_FROM, whatever --since says, are N > 0 (CHECKPOINT at ten), then this
+              week's first WARN line with a count of the rest, or else the consultations with no note, then any
+              commits on main since the last template export; the trial counts every run record
   --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
               this week's sessions with no run record, for this week's plan reviews with no plan-simplifier
               since the previous plan review, for this week's typed triggers whose skill never loaded, and for
@@ -44,10 +45,10 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               "totals" (scoreboard, weeks, context (the units' context, tool-result characters and sweeps by week),
               run_time, skills, models, advisor, offers, health); each WARN also as an
               object with its kind, run or session, step, skill and agent, each session's title, each step's agent
-              id, time and end with the dispatch and skill load tied to it, and each finding's category and validity
-              and each review step's strengths. Every transcript row belongs to one run or to its transcript's
-              session, so every total is a sum over the runs and sessions exported. It holds personal data: print
-              it, never write it into a repo
+              id, time and end with the dispatch and skill load tied to it, each dispatch's "pair", whether it is a
+              pair's second half, and each finding's category and validity and each review step's strengths. Every
+              transcript row belongs to one run or to its transcript's session, so every total is a sum over the
+              runs and sessions exported. It holds personal data: print it, never write it into a repo
   --changed-since CURSOR  with --json: print only the runs and sessions whose entry changed since the export that
               gave CURSOR, the keys removed since, and a new cursor; 0 or an unknown cursor exports everything; refused
               with --since or --no-cache
@@ -239,6 +240,10 @@ TRIAL_RUNS = 5
 TRIAL_WEEKS = 3
 # The day final-reviewer's Opus seat was installed: up to and on it, its pin was Fable at high.
 OPUS_FINAL_REVIEW_FROM = '2026-11-10'
+# PAIRS is the ten pairs of claude-md/agentic-workflow.md's **Measure (pairs)** bullet, and PAIRS_FROM, the day the
+# pair measure was installed, is copied in tests/test_report.py: keep them the same.
+PAIRS = 10
+PAIRS_FROM = '2026-11-11'
 FIX_WINDOW_DAYS = 14
 NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
@@ -1161,6 +1166,29 @@ def launches_final_review(kind, value, launched):
     return kind == 'agent' and value[0] in launched and is_final_review(value[1])
 
 
+def pair_halves(events, launched):
+    """The call ids of the launched final reviews in events, in order, that are a pair's second half: a final-reviewer
+    asked for a Fable model, launched when exactly one final review had launched since the last simplify (or the start
+    of events) and that one was not asked for a Fable model. Judged from the dispatch inputs only. The rule is
+    hooks/guard-agent-dispatch.py's ordering_reason with pair, which allows these dispatches: keep them the same. The
+    start of events counts as a simplify here, where the hook needs one, a case reachable only when the hook did not
+    run."""
+    def on_fable(inp):
+        return on_model(inp.get('model') or '', 'fable')
+
+    halves, finals = set(), []
+    for _, kind, value in events:
+        if kind == 'simplify':
+            finals = []
+        elif launches_final_review(kind, value, launched):
+            call_id, inp = value
+            if (len(finals) == 1 and inp.get('subagent_type') == 'final-reviewer' and on_fable(inp)
+                    and not on_fable(finals[0])):
+                halves.add(call_id)
+            finals.append(inp)
+    return halves
+
+
 def is_plan_review(tool_input):
     subagent_type = tool_input.get('subagent_type')
     if subagent_type == 'plan-reviewer':
@@ -1411,6 +1439,17 @@ def guard_refusals(projects_root, since, now):
                            if in_range(e[0], since, now)])
 
 
+def pair_count(projects_root, now):
+    """How many pair halves the main transcripts hold from PAIRS_FROM to now, each counted once by event_key."""
+    since, keys = parse_time(PAIRS_FROM), set()
+    for path in main_transcripts(projects_root):
+        events, launched, _ = transcript_events(path)
+        halves = pair_halves(events, launched)
+        keys.update(event_key(e) for e in events
+                    if e[1] == 'agent' and e[2][0] in halves and in_range(e[0], since, now))
+    return len(keys)
+
+
 def run_spans(projects_root, records, now):
     """Map each record's index in records, the whole run log, to (transcript_path, start, end), as timestamps.
 
@@ -1505,9 +1544,9 @@ def scan_report(subagent_path):
 
 @functools.lru_cache(maxsize=None)
 def span_reports(path, start, end):
-    """(dispatch input, subagent transcript path, report, launch time, agent id) for each dispatch launched in the span,
-    in order; the path and report are None when its subagent transcript isn't there. The agent id is the launch's own,
-    else the subagent transcript's agent-<id>.jsonl name, else None."""
+    """(dispatch input, subagent transcript path, report, launch time, agent id, call id) for each dispatch launched in
+    the span, in order; the path and report are None when its subagent transcript isn't there. The agent id is the
+    launch's own, else the subagent transcript's agent-<id>.jsonl name, else None."""
     events, launched = span_events(path, start, end)
     files = {}
     for p in (sub for main, _ in chain_paths(path) for sub in subagent_transcripts(main)):
@@ -1520,19 +1559,22 @@ def span_reports(path, start, end):
             sub = files.get(value[0])
             name = os.path.basename(sub) if sub else ''
             agent_id = launched[value[0]] or (name[len('agent-'):-len('.jsonl')] if name.startswith('agent-') else None)
-            reports.append((value[1], sub, review_report(sub) if sub else None, time, agent_id))
+            reports.append((value[1], sub, review_report(sub) if sub else None, time, agent_id, value[0]))
     return reports
 
 
 @functools.lru_cache(maxsize=None)
 def span_dispatches(path, start, end):
-    """{'inp', 'sub', 'report', 'time', 'id', 'kind'} for each dispatch launched in the span, in order: its input,
-    subagent transcript path, report, launch time and agent id as span_reports gives them, and its step kind."""
+    """{'inp', 'sub', 'report', 'time', 'id', 'kind', 'pair'} for each dispatch launched in the span, in order: its
+    input, subagent transcript path, report, launch time and agent id as span_reports gives them, its step kind and
+    whether it is a pair's second half."""
     dispatches, after_final = [], False
-    for inp, sub, report, time, agent_id in span_reports(path, start, end):
+    halves = pair_halves(*span_events(path, start, end))
+    for inp, sub, report, time, agent_id, call_id in span_reports(path, start, end):
         kind = step_kind(inp, after_final)
         after_final = after_final or kind == 'final_review'
-        dispatches.append({'inp': inp, 'sub': sub, 'report': report, 'time': time, 'id': agent_id, 'kind': kind})
+        dispatches.append({'inp': inp, 'sub': sub, 'report': report, 'time': time, 'id': agent_id, 'kind': kind,
+                           'pair': call_id in halves})
     return dispatches
 
 
@@ -1650,7 +1692,7 @@ def asks_for_conventions(report):
 
 def count_not_proportionate(path, start, end):
     """"fixed, not proportionate" verdicts in the span's fix-checker reports."""
-    return sum(report.lower().count(NOT_PROPORTIONATE) for inp, _, report, _, _ in span_reports(path, start, end)
+    return sum(report.lower().count(NOT_PROPORTIONATE) for inp, _, report, _, _, _ in span_reports(path, start, end)
                if report is not None and inp.get('subagent_type') == 'fix-checker')
 
 
@@ -1768,7 +1810,7 @@ def texts(warnings):
 def check_steps(run, dispatches, events, pins):
     """Problems in a schema 2 record's steps against its window's events and its span_dispatches."""
     steps = {kind: [s for s in run['steps'] if s['step'] == kind] for kind in STEP_KINDS}
-    launched = {kind: [d for d in dispatches if d['kind'] == kind] for kind in STEP_KINDS}
+    launched = {kind: [d for d in dispatches if d['kind'] == kind and not d['pair']] for kind in STEP_KINDS}
     launched['simplify'] = [e for e in events if e[1] == 'simplify']
     problems = [problem('step_count_differs',
                         f'record has {len(steps[kind])} {kind} steps, transcript launched {len(launched[kind])}',
@@ -1858,8 +1900,9 @@ def check_steps(run, dispatches, events, pins):
             continue
         model, effort = ran_on(sub_usage(sub))
         # The overrides the stage allows: an explicit model in stage 3 or Out, xhigh for final-reviewer in Out, and
-        # final-reviewer's Fable seats: at xhigh passed in a risk area, and at high in a run finished on or before the day
-        # the Opus seat was installed. A model or effort the transcript doesn't show passes.
+        # final-reviewer's Fable seats: at xhigh passed in a risk area, at high in a run finished on or before the day
+        # the Opus seat was installed, and the pair's second half at high. A model or effort the transcript doesn't
+        # show passes.
         final = agent == 'final-reviewer'
         fable = on_model(model or '', 'fable')
         model_ok = (not model or not pin['model'] or on_model(model, pin['model'])
@@ -1868,7 +1911,8 @@ def check_steps(run, dispatches, events, pins):
                      or final and stage == 'out' and effort == 'xhigh')
         seat_ok = final and fable and (run.get('risk_area') is True and inp.get('effort') == effort == 'xhigh'
                                        or effort == 'high' and run['_time'] is not None
-                                       and run['_time'].date().isoformat() <= OPUS_FINAL_REVIEW_FROM)
+                                       and run['_time'].date().isoformat() <= OPUS_FINAL_REVIEW_FROM
+                                       or d['pair'] and effort == 'high')
         if not (model_ok and effort_ok or seat_ok):
             problems.append(problem('agent_off_pin', f"{agent} ran on {model}/{effort}, pinned "
                                     f"{pin['model']}/{pin['effort']}: {inp.get('description')}",
@@ -1898,10 +1942,11 @@ def check_run(path, start, end, run, pins):
     dispatches = span_dispatches(path, start, end)
     ran = run['simplify']['ran']
     problems, since, simplified = [], False, False
+    halves = pair_halves(events, launched)
     for _, kind, value in events:
         if kind == 'simplify':
             since = simplified = True
-        elif launches_final_review(kind, value, launched):
+        elif launches_final_review(kind, value, launched) and value[0] not in halves:
             # When the record says simplify did not run, its own warning covers these.
             if not since and ran != 'no':
                 problems.append(problem('final_review_without_simplify',
@@ -1933,7 +1978,8 @@ def check_run(path, start, end, run, pins):
             problems.append(problem('count_line_missing',
                                     f"{label} report has no {name}: line: {d['inp'].get('description')}",
                                     step=step, agent=d['inp'].get('subagent_type')))
-    finals = [findings_line(d['report']) for d in dispatches if d['report'] is not None and d['kind'] == 'final_review']
+    finals = [findings_line(d['report']) for d in dispatches
+              if d['report'] is not None and d['kind'] == 'final_review' and not d['pair']]
     if finals and finals[-1] is not None and finals[-1] != run['final_findings']:
         problems.append(problem('final_findings_differ',
                                 f"record's final_findings {findings_text(run['final_findings'])} differ from the "
@@ -2124,7 +2170,7 @@ def health(projects_root, runs, now, records, pins, spans):
         span = span_of.get(id(r))
         problems = check_run(*span, r, pins) if span else [problem('no_transcript', 'no session transcript found')]
         finals = [d['report'] for d in span_dispatches(*span)
-                  if d['report'] is not None and d['kind'] == 'final_review'] if span else []
+                  if d['report'] is not None and d['kind'] == 'final_review' and not d['pair']] if span else []
         git_problems, usable = check_git(r, finals[-1] if finals else '')
         unavailable += usable is False
         own_warns = [warning(p, run=run_ref(r), label=label) for p in problems + git_problems]
@@ -2298,12 +2344,14 @@ def brief_report(tr, runs, now, records, projects_root, pins, spans, stamp_path)
     drift = template_drift(stamp_path)
     if drift is not None:
         last += '; ' + drift
-    return '\n'.join([
-        "Advisor share of this week's Fable use: " + share_text(tr.week_advisor.get(week, 0.0),
-                                                               tr.week_fable.get(week, 0.0)),
-        f'Trial: {trial(records, now)}',
-        last,
-    ])
+    lines = ["Advisor share of this week's Fable use: " + share_text(tr.week_advisor.get(week, 0.0),
+                                                                    tr.week_fable.get(week, 0.0)),
+             f'Trial: {trial(records, now)}']
+    pairs = pair_count(projects_root, now)
+    if pairs:
+        lines.append(f'pairs: {pairs} of {PAIRS}' + (' CHECKPOINT' if pairs >= PAIRS else ''))
+    lines.append(last)
+    return '\n'.join(lines)
 
 
 def spent(models):
@@ -2442,7 +2490,7 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
                            'requested_model': inp.get('model'), 'requested_effort': inp.get('effort'),
                            'model': sub_model, 'effort': sub_effort, 'skills': agent_skills(sub) if sub else None,
                            'counts': count_line(report, name) if name and report is not None else None,
-                           'models': sub_tr.models if sub_tr else None})
+                           'models': sub_tr.models if sub_tr else None, 'pair': d['pair']})
     for i, j in tie_steps(r, span_ds).items():
         entry['steps'][i].update(time=dispatches[j]['time'], end=dispatches[j]['end'])
         dispatches[j]['step'] = i
@@ -2496,7 +2544,7 @@ def scoreboard(runs, entries, sessions, advisor):
             if r['simplify']['ran'] in ('agents', 'inline'):
                 add('simplify', {k: r['simplify'][k] for k in ('applied', 'skipped')})
         for dispatch in entry['dispatches'] or []:
-            if dispatch['kind'] in board and dispatch['models']:
+            if dispatch['kind'] in board and dispatch['models'] and not dispatch['pair']:
                 tokens, dollars = spent(dispatch['models'])
                 row = board[dispatch['kind']]
                 row['cost'] += dollars

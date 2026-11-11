@@ -26,6 +26,9 @@ SILENT = [
 ]
 FINAL = {'subagent_type': 'final-reviewer'}
 GP_FINAL = {'subagent_type': 'general-purpose', 'model': 'fable', 'description': 'Final review of family B diff'}
+FABLE_FINAL = {'subagent_type': 'final-reviewer', 'model': 'fable', 'effort': 'high'}
+OPUS_FINAL = {'subagent_type': 'final-reviewer', 'model': 'opus'}
+GP_OPUS_FINAL = {'subagent_type': 'general-purpose', 'model': 'opus', 'description': 'Final review of the branch'}
 SIMPLIFY_REASON = ('No simplify since the last final review in this session\'s transcript. Run the simplify skill, '
                    'then dispatch the final review again.')
 PLAN_REVIEW = {'subagent_type': 'plan-reviewer'}
@@ -328,6 +331,32 @@ class OneSimplifyPerFinalReview(HookFixture):
     def test_a_row_without_a_timestamp_takes_the_previous_rows(self):
         own = [at(tool_call('Agent', {'subagent_type': 'Explore'}, call_id='toolu_x'), '10:00')] + launched_review()
         self.assertEqual(self.decision_in_subagent(FINAL, parent=[at(skill_call('simplify'), '09:00')], own=own), 'deny')
+
+
+class PairSecondHalf(HookFixture):
+    """A final-reviewer passing Fable is allowed as a pair's second half: exactly one final review, not on Fable,
+    launched since the last simplify."""
+
+    def test_a_fable_final_reviewer_passes_after_one_final_review_not_on_fable(self):
+        for previous in [FINAL, OPUS_FINAL, GP_OPUS_FINAL]:
+            transcript = [skill_call('simplify')] + launched_review(tool_input=previous)
+            self.assertIsNone(self.decision(FABLE_FINAL, transcript=transcript), previous)
+            self.assertIsNone(self.decision(dict(FABLE_FINAL, model='claude-fable-5-1'), transcript=transcript), previous)
+
+    def test_only_a_final_reviewer_on_fable_is_a_second_half(self):
+        transcript = [skill_call('simplify')] + launched_review()
+        for tool_input in [OPUS_FINAL, GP_FINAL]:
+            self.assertEqual(self.reason(tool_input, transcript=transcript), SIMPLIFY_REASON, tool_input)
+
+    def test_a_fable_predecessor_a_third_review_or_no_simplify_refuses_it(self):
+        cases = {
+            'after a Fable review': [skill_call('simplify')] + launched_review(tool_input=FABLE_FINAL),
+            'after a risk-area review': [skill_call('simplify')] + launched_review(tool_input=dict(FABLE_FINAL, effort='xhigh')),
+            'a third review': [skill_call('simplify')] + launched_review('toolu_a') + launched_review('toolu_b', FABLE_FINAL),
+            'no simplify ever': launched_review(),
+        }
+        for name, transcript in cases.items():
+            self.assertEqual(self.reason(FABLE_FINAL, transcript=transcript), SIMPLIFY_REASON, name)
 
 
 class PlanReviewNeedsPlanSimplify(HookFixture):
