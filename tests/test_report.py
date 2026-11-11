@@ -684,7 +684,8 @@ class Report(unittest.TestCase):
     def test_json_has_its_version_and_top_level_keys(self):
         data = self.json()
         self.assertEqual(data['version'], 1)
-        self.assertEqual(sorted(data), ['categories', 'generated', 'now', 'runs', 'sessions', 'since', 'stage_table', 'totals', 'version'])
+        self.assertEqual(sorted(data), ['categories', 'changes', 'generated', 'now', 'runs', 'sessions', 'since',
+                                        'stage_table', 'totals', 'version'])
         self.assertEqual(sorted(data['totals']),
                          ['advisor', 'context', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills',
                           'weeks'])
@@ -695,6 +696,14 @@ class Report(unittest.TestCase):
         data = self.json()
         self.assertEqual(data['stage_table'],
                          {path: row['recommended'] for path, row in data['totals']['models']['main'].items()})
+
+    def test_json_exports_the_dated_workflow_changes(self):
+        changes = self.json()['changes']
+        self.assertEqual([sorted(row) for row in changes], [['date', 'ref', 'title']] * len(changes))
+        dates = [datetime.date.fromisoformat(row['date']).isoformat() for row in changes]
+        self.assertEqual(dates, sorted(dates))
+        # the pair measure's start is a change, on its day
+        self.assertIn({'date': PAIRS_FROM, 'title': 'Final review pairs', 'ref': 'claude-workflow#29'}, changes)
 
     def test_html_page_is_self_contained_and_escaped(self):
         step = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},

@@ -35,7 +35,8 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
               bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
               tie-break rule, validity definitions and areas), "stage_table" (the main session's recommended model and
-              effort, by path and stage), "runs" (each record in range as written, its window and what the window,
+              effort, by path and stage), "changes" (the workflow's major changes, each with the day it was installed,
+              its title and its PR), "runs" (each record in range as written, its window and what the window,
               over a handed-off run's whole chain of transcripts, shows: dispatches, skills, refusals, models, tokens
               and cost, advisor, its spend by phase, its main calls' context, tool-result characters by call class and
               inline and delegated sweeps, its WARN and information lines, later fix commits), "sessions" (each main
@@ -248,6 +249,16 @@ PAST_PINS = {'final-reviewer': [('2026-11-10', 'fable', 'high')],
 # pair measure was installed, is copied in tests/test_report.py: keep them the same.
 PAIRS = 10
 PAIRS_FROM = '2026-11-11'
+# The workflow's major changes (the UTC install day, title, PR ref naming the repo), oldest first, exported whole as
+# --json's "changes": a merge that changes what a session or agent must do, or starts a measure the charts show, adds
+# its row in the PR, its day set as PAST_PINS has it; a change to what a report or record carries is no row.
+CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
+           ('2026-11-09', 'Skill offers and the template export', 'claude-workflow#6'),
+           ('2026-11-10', 'Finding categories, validity and strengths', 'claude-workflow#10'),
+           ('2026-11-10', 'Final reviewer on Opus at high, Fable at xhigh in risk areas', 'claude-workflow#22'),
+           ('2026-11-10', 'Context cap, handoff chain and sweeper', 'claude-workflow#26'),
+           ('2026-11-11', 'Final review pairs', 'claude-workflow#29'),
+           ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'))
 FIX_WINDOW_DAYS = 14
 NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
@@ -2843,6 +2854,7 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         'now': now.isoformat(),
         'categories': category_list(),
         'stage_table': RECOMMENDED,
+        'changes': [{'date': date, 'title': title, 'ref': ref} for date, title, ref in CHANGES],
         'runs': entries,
         'sessions': sessions,
         'totals': {'scoreboard': scoreboard(runs, entries, sessions, advisor),
