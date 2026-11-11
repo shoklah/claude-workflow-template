@@ -240,18 +240,11 @@ PATH_PHASES = {'plan': 'design', 'full': 'coordination', 'small': 'implement'}
 STOP_SHARE = 25.0
 TRIAL_RUNS = 5
 TRIAL_WEEKS = 3
-# Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
-# day passes on the old pin too, since the check reads today's pins. The day is the one the new seat was installed,
-# set in the change that merges with it. A row is never removed.
-PAST_PINS = {'final-reviewer': [('2026-11-10', 'fable', 'high')],
-             'implementer': [('2026-11-11', 'opus', 'high')]}
-# PAIRS is the ten pairs of claude-md/agentic-workflow.md's **Measure (pairs)** bullet, and PAIRS_FROM, the day the
-# pair measure was installed, is copied in tests/test_report.py: keep them the same.
-PAIRS = 10
-PAIRS_FROM = '2026-11-11'
 # The workflow's major changes (the UTC install day, title, PR ref naming the repo), oldest first, exported whole as
 # --json's "changes": a merge that changes what a session or agent must do, or starts a measure the charts show, adds
-# its row in the PR, its day set as PAST_PINS has it; a change to what a report or record carries is no row.
+# its row in the PR, its day set in the change that merges with it; a change to what a report or record carries is
+# no row. A constant dated by a change reads its day from the row here through CHANGE_DAYS, so an install day is
+# written once in the script.
 CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-09', 'Skill offers and the template export', 'claude-workflow#6'),
            ('2026-11-10', 'Finding categories, validity and strengths', 'claude-workflow#10'),
@@ -259,6 +252,16 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-10', 'Context cap, handoff chain and sweeper', 'claude-workflow#26'),
            ('2026-11-11', 'Final review pairs', 'claude-workflow#29'),
            ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'))
+CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
+# Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
+# day passes on the old pin too, since the check reads today's pins. A row is never removed.
+PAST_PINS = {'final-reviewer': [(CHANGE_DAYS['claude-workflow#22'], 'fable', 'high')],
+             'implementer': [(CHANGE_DAYS['claude-workflow#28'], 'opus', 'high')]}
+# PAIRS is the ten pairs of claude-md/agentic-workflow.md's **Measure (pairs)** bullet, and PAIRS_FROM, the day the
+# pair measure was installed, is copied in tests/test_report.py, whose test_json_exports_the_dated_workflow_changes
+# ties the copy to the row it reads here: keep them the same.
+PAIRS = 10
+PAIRS_FROM = CHANGE_DAYS['claude-workflow#29']
 FIX_WINDOW_DAYS = 14
 NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
