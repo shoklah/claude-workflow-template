@@ -27,6 +27,8 @@ PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement',
           'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
 # PAIRS_FROM in scripts/workflow-report.py, the day the pair measure was installed: keep them the same.
 PAIRS_FROM = '2026-11-11'
+# CAP_OFFER_FROM in scripts/workflow-report.py, the day the context cap hook was installed: keep them the same.
+CAP_OFFER_FROM = '2026-11-12'
 
 
 # Copied from scripts/workflow-report.py's unit_key, since tests can't import the script: keep them the same.
@@ -704,6 +706,9 @@ class Report(unittest.TestCase):
         self.assertEqual(dates, sorted(dates))
         # the pair measure's start is a change, on its day
         self.assertIn({'date': PAIRS_FROM, 'title': 'Final review pairs', 'ref': 'claude-workflow#29'}, changes)
+        # so is the context cap hook's
+        self.assertIn({'date': CAP_OFFER_FROM, 'title': 'Context cap hook and the no-offer warning',
+                       'ref': 'claude-workflow#34'}, changes)
 
     def test_html_page_is_self_contained_and_escaped(self):
         step = {'step': 'final_review', 'counts': {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0},
@@ -2675,6 +2680,148 @@ class HealthCheck(Report):
         self.session(reads + past, sid='busy')
         out = self.run_report('--health', '--now', '2026-11-06T00:00:00Z')
         self.assertEqual(out.splitlines()[-2:], ['inline sweeps: 1', 'over the cap without a handoff: 1 transcripts'])
+
+    CAP_NOW = ('--now', '2026-11-13T00:00:00Z')  # after CAP_OFFER_FROM's rows
+
+    def context(self, tokens, *blocks):
+        """A main-session message of tokens input tokens on CAP_OFFER_FROM, holding the tool calls blocks."""
+        self.day = CAP_OFFER_FROM
+        return asst(f'c-{self.clock}', list(blocks) or None, u=usage(None, tokens, 0), ts=self.ts())
+
+    def offer(self, label='Yes, hand off', ask='Hand off now?', labels=None):
+        """A wrap-up call whose ask is ask and whose action labels are labels, else label alone."""
+        return tool_use(f'o{self.clock}', 'mcp__ccd_turn__wrap_up', {'ask': ask, 'actions': [{'label': l} for l in labels or [label]]})
+
+    def turn_end(self, errors=()):
+        """A turn end's stop_hook_summary row, its hookErrors errors."""
+        return {'type': 'system', 'subtype': 'stop_hook_summary', 'timestamp': self.ts(), 'hookCount': 1,
+                'hookInfos': [{'command': 'callback'}], 'hookErrors': list(errors), 'hookAdditionalContext': [],
+                'preventedContinuation': False, 'stopReason': '', 'level': 'suggestion'}
+
+    def stop_hook_error(self, kind, text):
+        """The attachment row a Stop hook's error of kind writes just before the turn end's summary, then that summary."""
+        return [{'type': 'attachment', 'timestamp': self.ts(),
+                 'attachment': {'type': kind, 'hookName': 'Stop', 'toolUseID': 'tu', 'hookEvent': 'Stop',
+                                'blockingError': {'blockingError': text, 'command': '/x/hold.py'}}},
+                self.turn_end([text])]
+
+    def held_end(self):
+        """A turn end the Stop hook held."""
+        return self.stop_hook_error('hook_blocking_error', 'HOLD: offer the handoff')
+
+    def cap_warns(self, out=None):
+        """The no-offer warning lines of --health at CAP_NOW, or of out."""
+        out = self.run_report('--health', *self.CAP_NOW) if out is None else out
+        return [line for line in out.splitlines() if 'no handoff offer' in line]
+
+    def slips(self, n, k, name='sess-1.jsonl'):
+        return [f'WARN: session {name}: turn ends past the context cap with no handoff offer: {n} (largest {k}K)']
+
+    def two_slips(self):
+        return [self.context(310_000), self.turn_end(), self.context(377_000), self.turn_end()]
+
+    def test_no_slip_under_the_cap(self):
+        self.session([self.context(299_999), self.turn_end()])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_session_that_ends_turns_past_the_cap_with_no_offer_warns(self):
+        self.session(self.two_slips())
+        self.assertEqual(self.cap_warns(), self.slips(2, 377))
+
+    def test_an_offer_moves_the_threshold_by_the_step(self):
+        self.session([self.context(310_000, self.offer()), self.turn_end(), self.context(359_000), self.turn_end(),
+                      self.context(361_000), self.turn_end()])
+        self.assertEqual(self.cap_warns(), self.slips(1, 361))
+
+    def test_an_offer_under_the_cap_keeps_the_cap(self):
+        self.session([self.context(200_000, self.offer()), self.context(301_000), self.turn_end()])
+        self.assertEqual(self.cap_warns(), self.slips(1, 301))
+
+    def test_an_offer_in_a_question_dialog_is_no_slip(self):
+        ask = tool_use('q1', 'AskUserQuestion', {'questions': [{'question': 'Next?', 'options': [{'label': 'Handoff now'}]}]})
+        self.session([self.context(310_000, ask), self.turn_end()])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_compact_button_is_an_offer(self):
+        self.session([self.context(460_000, self.offer('Compact')), self.turn_end()])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_question_mentioning_a_handoff_is_no_offer(self):
+        payment = self.offer(ask='Automate the payment hand-off too?', labels=['Yes', 'No'])
+        self.session([self.context(310_000, payment), self.turn_end()])
+        self.assertEqual(self.cap_warns(), self.slips(1, 310))
+
+    def test_a_started_handoff_counts_as_an_offer(self):
+        self.day = CAP_OFFER_FROM
+        started = self.handoff()
+        started[0]['message']['usage'] = usage(None, 310_000, 0)
+        self.session(started + [self.turn_end()])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_compaction_resets_the_threshold(self):
+        self.session([self.context(310_000, self.offer()), user('summary', ts=self.ts(), isCompactSummary=True),
+                      self.context(120_000), self.turn_end(), self.context(305_000), self.turn_end()])
+        self.assertEqual(self.cap_warns(), self.slips(1, 305))
+
+    def test_a_held_turn_end_is_no_slip(self):
+        self.session([self.context(310_000), *self.held_end(), self.context(310_000, self.offer()),
+                      self.turn_end()])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_failed_stop_hook_is_no_hold(self):
+        self.session([self.context(310_000),
+                      *self.stop_hook_error('hook_non_blocking_error', 'Hook script appears to be missing')])
+        self.assertEqual(self.cap_warns(), self.slips(1, 310))
+
+    def test_turn_ends_before_the_install_day_are_no_slips(self):
+        rows = [self.context(310_000), self.turn_end()]
+        before = (datetime.date.fromisoformat(CAP_OFFER_FROM) - datetime.timedelta(days=1)).isoformat()
+        self.session([dict(row, timestamp=before + row['timestamp'][10:]) for row in rows])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_slip_before_the_week_does_not_warn_again(self):
+        def on(day, rows):
+            return [dict(row, timestamp=day + row['timestamp'][10:]) for row in rows]
+        last_week = on('2026-11-14', [self.context(310_000), self.turn_end(), self.context(310_000, self.offer()),
+                                      self.turn_end()])
+        self.session(last_week + on('2026-11-15', [self.context(320_000), self.turn_end()]))
+        self.assertEqual(self.cap_warns(self.run_report('--health', '--now', '2026-11-16T00:00:00Z')), [])
+
+    def test_a_forked_copy_of_a_slip_warns_once(self):
+        rows = [self.context(310_000), self.turn_end()]
+        self.session(rows, sid='a-orig')
+        self.session(rows, sid='b-copy')
+        self.assertEqual(self.cap_warns(), self.slips(1, 310, 'a-orig.jsonl'))
+
+    def test_the_no_offer_warning_is_in_json(self):
+        self.session(self.two_slips())
+        data = self.json(*self.CAP_NOW)
+        cap = [w for w in data['totals']['health']['warnings'] if w['kind'] == 'cap_no_offer']
+        self.assertEqual([w['session'] for w in cap], [os.path.join(self.projects, '-Users-me-Work-proj', 'sess-1.jsonl')])
+
+    def test_a_slip_inside_a_run_warns_on_its_session(self):
+        self.session(self.two_slips() + [self.record_write('c0ffee01', started='2026-11-12T09:00:00Z')], project='proj')
+        self.records([run_record(head='c0ffee01', started='2026-11-12T09:00:00Z', date='2026-11-12T12:00:00Z')])
+        self.assertEqual(self.cap_warns(), self.slips(2, 377))
+        data = self.json(*self.CAP_NOW)
+        self.assertEqual(len(data['runs']), 1)
+        cap = [w for w in data['totals']['health']['warnings'] if w['kind'] == 'cap_no_offer']
+        self.assertEqual([(w['session'], w['run']) for w in cap],
+                         [(os.path.join(self.projects, 'proj', 'sess-1.jsonl'), None)])
+
+    def test_the_no_offer_warning_is_the_same_with_no_cache(self):
+        self.session([self.context(310_000), *self.held_end(), self.context(310_000, self.offer()),
+                      self.turn_end(), self.context(370_000), self.turn_end()])
+        outputs = [self.run_report('--health', *self.CAP_NOW), self.run_report('--health', *self.CAP_NOW),
+                   self.run_report('--health', '--no-cache', *self.CAP_NOW)]
+        self.assertEqual(outputs[1:], outputs[:1] * 2)
+        self.assertEqual(self.cap_warns(outputs[0]), self.slips(1, 370))
+
+    def test_a_context_with_no_timestamp_is_no_crash(self):
+        late = asst('no-time', u=usage(None, 5, 0))
+        del late['timestamp']
+        self.session(self.two_slips() + [late])
+        self.assertEqual(self.cap_warns(), self.slips(2, 377))
 
     def test_health_and_brief_default_to_the_last_seven_days(self):
         self.records([run_record(branch='old-branch', date='2026-10-20T12:00:00Z',

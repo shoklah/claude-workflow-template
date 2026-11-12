@@ -22,7 +22,8 @@ AGENTS = ['final-reviewer.md', 'fix-checker.md', 'implementer-copy.md', 'impleme
           'implementer.md', 'plan-reviewer.md', 'plan-simplifier.md', 'sweeper.md', 'task-reviewer.md']
 SCRIPTS = ['failing-test-check.py', 'wave.py', 'workflow-report.py']
 SKILLS = ['workflow-dashboard']
-HOOK_FILES = ['guard-agent-dispatch.py', 'guard-main-commit.py', 'session-start-superpowers.sh']
+HOOK_FILES = ['guard-agent-dispatch.py', 'guard-main-commit.py', 'remind-context-cap.py',
+              'session-start-superpowers.sh']
 HOOK_TESTS = ['settings-snippet.json', 'test_dispatch.py', 'test_hooks.py']
 START = '<!-- agentic-workflow:start -->'
 END = '<!-- agentic-workflow:end -->'
@@ -32,6 +33,8 @@ GUARD = {'type': 'command', 'command': '/usr/bin/python3 -I "$HOME/.claude/hooks
 SESSION = {'type': 'command', 'command': 'sh "$HOME/.claude/hooks/session-start-superpowers.sh"', 'timeout': 5}
 DISPATCH_GROUP = {'matcher': 'Agent', 'hooks': [
     {'type': 'command', 'command': '/usr/bin/python3 -I "$HOME/.claude/hooks/guard-agent-dispatch.py"', 'timeout': 10}]}
+STOP_GROUP = {'hooks': [
+    {'type': 'command', 'command': '/usr/bin/python3 -I "$HOME/.claude/hooks/remind-context-cap.py"', 'timeout': 10}]}
 SETTINGS = {
     'hooks': {
         'SessionStart': [{'matcher': 'startup|clear|compact', 'hooks': [SESSION]}],
@@ -45,6 +48,7 @@ SETTINGS_AFTER = {
     'hooks': {
         'SessionStart': [{'matcher': 'startup|clear|compact', 'hooks': [SESSION]}],
         'PreToolUse': [{'matcher': 'Bash', 'hooks': [OTHER, GUARD]}, DISPATCH_GROUP],
+        'Stop': [STOP_GROUP],
     },
     'enabledPlugins': {'superpowers@claude-plugins-official': True},
     'someUnknownKey': {'nested': [1, 2.5, None, 'é']},
@@ -123,7 +127,7 @@ class Hooks(HomeFixture):
         after = self.settings()
         self.assertEqual(after, SETTINGS_AFTER)
         self.assertEqual(list(after), ['hooks', 'enabledPlugins', 'someUnknownKey', 'theme'])
-        self.assertEqual(list(after['hooks']), ['SessionStart', 'PreToolUse'])
+        self.assertEqual(list(after['hooks']), ['SessionStart', 'PreToolUse', 'Stop'])
         self.assertIn('"someUnknownKey": {\n    "nested": [\n      1,\n      2.5,\n      null,\n      "é"\n',
                       read(self.path('settings.json')))
         self.assertTrue(read(self.path('settings.json')).endswith('}\n'))
@@ -145,7 +149,7 @@ class Hooks(HomeFixture):
 
     def test_hooks_creates_settings_when_there_is_none(self):
         self.ok('hooks')
-        self.assertEqual(self.settings(), {'hooks': {'PreToolUse': [DISPATCH_GROUP]}})
+        self.assertEqual(self.settings(), {'hooks': {'PreToolUse': [DISPATCH_GROUP], 'Stop': [STOP_GROUP]}})
 
     def test_installed_hook_tests_still_run_from_their_new_folder(self):
         self.write_settings(SETTINGS)
@@ -168,12 +172,32 @@ class Hooks(HomeFixture):
         edited = {'matcher': 'Agent', 'hooks': [
             {'type': 'command', 'command': "/usr/bin/python3 -I '/Users/me/.claude/hooks/guard-agent-dispatch.py'",
              'timeout': 30}]}
-        before = dict(SETTINGS, hooks=dict(SETTINGS['hooks'], PreToolUse=SETTINGS['hooks']['PreToolUse'] + [edited]))
+        before = dict(SETTINGS, hooks=dict(SETTINGS['hooks'], PreToolUse=SETTINGS['hooks']['PreToolUse'] + [edited],
+                                           Stop=[STOP_GROUP]))
         self.write_settings(before)
         first = read(self.path('settings.json'), 'rb')
         p = self.ok('hooks')
-        self.assertIn('Agent hook already present', p.stdout)
+        self.assertIn('Agent and Stop hooks already present', p.stdout)
         self.assertEqual(read(self.path('settings.json'), 'rb'), first)
+
+    def test_an_edited_stop_hook_entry_is_recognised_and_not_duplicated(self):
+        edited = {'hooks': [
+            {'type': 'command', 'command': "/usr/bin/python3 -I '/Users/me/.claude/hooks/remind-context-cap.py'",
+             'timeout': 30}]}
+        before = dict(SETTINGS, hooks=dict(SETTINGS['hooks'],
+                                           PreToolUse=SETTINGS['hooks']['PreToolUse'] + [DISPATCH_GROUP],
+                                           Stop=[edited]))
+        self.write_settings(before)
+        first = read(self.path('settings.json'), 'rb')
+        p = self.ok('hooks')
+        self.assertIn('Agent and Stop hooks already present', p.stdout)
+        self.assertEqual(read(self.path('settings.json'), 'rb'), first)
+
+    def test_hooks_keeps_another_stop_group(self):
+        other = {'hooks': [{'type': 'command', 'command': 'other-tool hook'}]}
+        self.write_settings(dict(SETTINGS, hooks=dict(SETTINGS['hooks'], Stop=[other])))
+        self.ok('hooks')
+        self.assertEqual(self.settings()['hooks']['Stop'], [other, STOP_GROUP])
 
     def test_the_dispatch_command_under_another_matcher_is_not_the_agent_hook(self):
         elsewhere = {'matcher': 'Bash', 'hooks': [DISPATCH_GROUP['hooks'][0]]}
@@ -184,7 +208,7 @@ class Hooks(HomeFixture):
 
     def test_invalid_settings_json_stops_without_touching_the_file(self):
         for bad in (b'{"theme": "dark",\n', b'["a list"]\n', b'', b'{"hooks": {"PreToolUse": {"not": "a list"}}}\n',
-                    b'{"hooks": ["not", "an", "object"]}\n'):
+                    b'{"hooks": ["not", "an", "object"]}\n', b'{"hooks": {"Stop": {}}}\n'):
             with self.subTest(bad=bad):
                 write(self.path('settings.json'), bad)
                 p = self.run_install('hooks')

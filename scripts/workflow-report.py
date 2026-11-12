@@ -21,8 +21,9 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               commits on main since the last template export; the trial counts every run record
   --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
               this week's sessions with no run record, for this week's plan reviews with no plan-simplifier
-              since the previous plan review, for this week's typed triggers whose skill never loaded, and for
-              this week's sessions outside every run with no startup guidelines, or "Health: no problems"; for
+              since the previous plan review, for this week's typed triggers whose skill never loaded, for this
+              week's sessions outside every run with no startup guidelines, and for this week's main transcripts
+              whose turns ended past the context cap with no handoff offer, or "Health: no problems"; for
               schema 2 runs it also checks the steps against the launched agents, their count lines, the agents'
               pinned model, effort and skills, and the skills the run's path requires, for schema 3 plan runs a
               required offer with no entry, and for schema 4 records each step's agent id against the launched
@@ -251,7 +252,8 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-10', 'Final reviewer on Opus at high, Fable at xhigh in risk areas', 'claude-workflow#22'),
            ('2026-11-10', 'Context cap, handoff chain and sweeper', 'claude-workflow#26'),
            ('2026-11-11', 'Final review pairs', 'claude-workflow#29'),
-           ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'))
+           ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'),
+           ('2026-11-12', 'Context cap hook and the no-offer warning', 'claude-workflow#34'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
@@ -262,6 +264,9 @@ PAST_PINS = {'final-reviewer': [(CHANGE_DAYS['claude-workflow#22'], 'fable', 'hi
 # ties the copy to the row it reads here: keep them the same.
 PAIRS = 10
 PAIRS_FROM = CHANGE_DAYS['claude-workflow#29']
+# CAP_OFFER_FROM, the day the context cap hook was installed, is copied in tests/test_report.py, whose
+# test_json_exports_the_dated_workflow_changes ties the copy to the row it reads here: keep them the same.
+CAP_OFFER_FROM = CHANGE_DAYS['claude-workflow#34']
 FIX_WINDOW_DAYS = 14
 NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
@@ -288,8 +293,13 @@ START_SESSION = 'mcp__ccd_session__start_session'
 # the new session's first user row holds the brief.
 HANDOFF_MARKER = re.compile(r'^Handoff \d+:')
 SESSION_ID = re.compile(r'session_id: local_([0-9a-f-]+)')
-# The context cap in claude-md/agentic-workflow.md's **Context cap** bullet: keep them the same.
+# The context cap in claude-md/agentic-workflow.md's **Context cap** bullet, and what a handoff offer is and how far
+# it moves the next one's threshold, copied in hooks/remind-context-cap.py: keep them the same.
 CONTEXT_CAP = 300_000
+OFFER_STEP = 50_000
+COMPACT_AT = 450_000
+OFFER_LABEL = re.compile(r'hand[ -]?off|compact', re.I)
+ASK_USER = 'AskUserQuestion'
 OVER_CAP_CALLS = 50
 SWEEP_READS = 5
 # A tool call's class, which its result's characters count under: tool_class gives it.
@@ -338,13 +348,13 @@ SUPERPOWERS_TAG = b'<using-superpowers-session-start>'
 RUN_LOG = 'workflow-log.jsonl'
 # Only lines matching this can hold a dispatch, a simplify call, a record write, the startup block, an error, a skill
 # load (the hook's using-superpowers block included, which it prints alone when the karpathy file is unreadable), a
-# typed trigger, a spec or plan write, a session title, a handoff or a compaction. A typed command shows as
-# <command-name>/name</command-name>.
+# typed trigger, a spec or plan write, a session title, a handoff, a compaction, a handoff offer, a turn end or the
+# Stop hook's blocking error before it. A typed command shows as <command-name>/name</command-name>.
 HEALTH_NEEDLES = (b'"Agent"', b'simplify', b'workflow-log.jsonl', b'karpathy-guidelines-session-start',
                   b'using-superpowers-session-start',
                   b'"is_error":true', b'"is_error": true', b'Base directory for this skill', b'rill me',
                   b'command-name', b'docs/superpowers/', b'"custom-title"', b'start_session',
-                  b'isCompactSummary')
+                  b'isCompactSummary', b'wrap_up', b'AskUserQuestion', b'stop_hook_summary', b'hook_blocking_error')
 SKILL_LOADED = 'Base directory for this skill: '
 SPECS_AND_PLANS = {'spec': 'docs/superpowers/specs/', 'plan': 'docs/superpowers/plans/'}
 
@@ -394,7 +404,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 7
+CACHE_VERSION = 8
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -904,6 +914,27 @@ def context_facts(contexts, events):
             'handoff': handoff}
 
 
+def cap_slips(contexts, events):
+    """The turn ends past the threshold with no handoff offer, as (the turn end's timestamp, the tokens of the last
+    context at or before it), contexts as Transcripts collects them and events a main transcript's own. The threshold
+    starts at CONTEXT_CAP, becomes the latest context plus OFFER_STEP, but never under the cap, at an offer or a
+    handoff, and returns to the cap at a compaction; a held turn end or one before CAP_OFFER_FROM is no slip."""
+    # Sorted by time, stable, a context before an event of the same time; a context can lack one.
+    timeline = sorted([(t or '', 0, None, n) for t, n in contexts] + [(t or '', 1, k, v) for t, k, v in events],
+                      key=lambda item: item[:2])
+    latest, threshold, slips = 0, CONTEXT_CAP, []
+    for timestamp, _, kind, value in timeline:
+        if kind is None:
+            latest = value
+        elif kind in ('offer', 'handoff'):
+            threshold = max(CONTEXT_CAP, latest + OFFER_STEP)
+        elif kind == 'compact':
+            threshold = CONTEXT_CAP
+        elif kind == 'turn_end' and not value and timestamp[:10] >= CAP_OFFER_FROM and latest > threshold:
+            slips.append((timestamp, latest))
+    return slips
+
+
 def sweep_counts(calls, events, launched):
     """A unit's sweeps: inline, the runs of SWEEP_READS or more consecutive read calls, calls as Transcripts.calls
     holds them, ended by the next call of another class or the end, but not by an edit of one of the run's files; and
@@ -1289,7 +1320,10 @@ def scan_events(path):
     ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('command', name) for a typed row's slash
     command, its first text that COMMAND matches, ('wrote', path) for a Write or Edit of a spec or plan, ('title',
     text) for a custom-title row, ('handoff', brief) at the time of a START_SESSION call whose brief starts with
-    HANDOFF_MARKER, added when its result names a session, and ('compact', None) for a compaction's summary row.
+    HANDOFF_MARKER, added when its result names a session, ('compact', None) for a compaction's summary row,
+    ('offer', None) for a WRAP_UP call with an action label, or an ASK_USER call with an option label, that OFFER_LABEL
+    matches, and ('turn_end', held) for a stop_hook_summary row, held when the line just before it is a Stop hook's
+    hook_blocking_error attachment (a failed hook fills hookErrors too, after a hook_non_blocking_error one).
     A row with no timestamp takes the previous row's.
     Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of calls still waiting for one.
     """
@@ -1300,8 +1334,10 @@ def scan_events(path):
         f = open(path, 'rb')
     except OSError:
         return events, launched, startup
+    blocking = False  # whether the file's previous line was a Stop hook's blocking error
     with f:
         for line in f:
+            after_block, blocking = blocking, False
             if not any(n in line for n in HEALTH_NEEDLES) and not any(needle in line for needle in pending.values()):
                 continue
             try:
@@ -1311,15 +1347,19 @@ def scan_events(path):
                 kind, content = row.get('type'), row.get('message', {}).get('content')
                 # Prompts and briefs can quote the tag; only the hook's attachment row shows the block was injected.
                 startup = startup or (kind == 'attachment' and STARTUP_TAG in line)
+                attachment = field(row, 'attachment', dict, {}) if kind == 'attachment' else {}
                 if kind == 'attachment' and SUPERPOWERS_TAG in line:
                     # A SessionStart hook row carries the block; a queued prompt or another hook can only quote it.
-                    hook = field(field(row, 'attachment', dict, {}), 'hookName', str, '')
+                    hook = field(attachment, 'hookName', str, '')
                     if hook.startswith('SessionStart'):
                         events.append((timestamp, 'skill', 'using-superpowers'))
                 if kind == 'custom-title' and isinstance(row.get('customTitle'), str):
                     events.append((timestamp, 'title', row['customTitle']))
                 if kind == 'user' and row.get('isCompactSummary') is True:
                     events.append((timestamp, 'compact', None))
+                if kind == 'system' and row.get('subtype') == 'stop_hook_summary':
+                    events.append((timestamp, 'turn_end', after_block))
+                blocking = attachment.get('type') == 'hook_blocking_error' and attachment.get('hookEvent') == 'Stop'
                 if row_calls_simplify(row):
                     events.append((timestamp, 'simplify', None))
                 # Only the load's own row counts, never a tool result quoting it or an attachment re-listing it.
@@ -1355,6 +1395,13 @@ def scan_events(path):
                         elif (block.get('name') in ('Write', 'Edit') and isinstance(inp.get('file_path'), str)
                               and any(folder in inp['file_path'] for folder in SPECS_AND_PLANS.values())):
                             events.append((timestamp, 'wrote', inp['file_path']))
+                        elif block.get('name') in (WRAP_UP, ASK_USER):
+                            choices = (field(inp, 'actions', list, []) if block['name'] == WRAP_UP else
+                                       [o for q in field(inp, 'questions', list, []) if isinstance(q, dict)
+                                        for o in field(q, 'options', list, [])])
+                            if any(OFFER_LABEL.search(field(c, 'label', str, '')) for c in choices
+                                   if isinstance(c, dict)):
+                                events.append((timestamp, 'offer', None))
                 elif kind == 'user' and isinstance(content, list):
                     launched.update(launched_ids(row, pending.keys() - handoffs.keys()))
                     for block in content:
@@ -2132,17 +2179,20 @@ def shared_triggers(events_by_path):
 def session_warnings(projects_root, spans, now):
     """(transcript path, problem) for each typed trigger the main transcripts hold this week, up to now, that no later
     load of its skill meets, on the transcript whose run span holds its row, else on the first transcript holding it,
-    and for each main transcript written this week with no run's span, over its chain, and no startup block."""
+    for each main transcript written this week with no run's span, over its chain, and no startup block, and for each
+    main transcript written this week with cap_slips over its own contexts and its events up to now, the threshold
+    read over the whole transcript but only this week's slips kept, a slip's time counting once, on the first
+    transcript by path that holds it."""
     week = week_start(now)
     covered = span_windows(spans)
     read = {path: transcript_events(path) for path in main_transcripts(projects_root)}
-    triggers = shared_triggers({path: [e for e in events if in_range(e[0], None, now)]
-                                for path, (events, _, _) in read.items()})
+    upto = {path: [e for e in events if in_range(e[0], None, now)] for path, (events, _, _) in read.items()}
+    triggers = shared_triggers(upto)
     # A trigger warns on the holder whose run span holds its row, else on the first holder by path.
     owners = {key: next((p for p in holders if any(in_window(key[0], start, end) for start, end in covered.get(p, []))),
                         holders[0])
               for key, (holders, _) in triggers.items()}
-    out = []
+    out, slipped = [], set()
     for path, (_, _, startup) in read.items():
         name = os.path.basename(path)
         for (timestamp, skill), (_, met) in triggers.items():
@@ -2158,8 +2208,18 @@ def session_warnings(projects_root, spans, now):
             touched = os.path.getmtime(path) >= week.timestamp()
         except OSError:
             touched = False
-        if path not in covered and not startup and touched and (file_usage(path)['last'] or '') >= stamp(week):
+        this_week = (file_usage(path)['last'] or '') >= stamp(week)
+        if path not in covered and not startup and touched and this_week:
             out.append((path, problem('startup_missing', f'session {name}: startup guidelines missing')))
+        if this_week:
+            # No shared Transcripts, so a fork keeps its copied prefix and its thresholds; a slip warns once.
+            contexts = usage_of([path], [], None, now, {'skipped': 0}).contexts
+            slips = [s for s in cap_slips(contexts, upto[path]) if s[0] >= stamp(week) and s[0] not in slipped]
+            slipped.update(t for t, _ in slips)
+            if slips:
+                out.append((path, problem('cap_no_offer', f'session {name}: turn ends past the context cap with no '
+                                                          f'handoff offer: {len(slips)} '
+                                                          f'(largest {max(n for _, n in slips) // 1000}K)')))
     return out
 
 

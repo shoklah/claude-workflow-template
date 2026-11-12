@@ -12,7 +12,8 @@ Usage: /usr/bin/python3 -I install.py {snapshot|agents|section|scripts|skills|ho
   scripts    Copies scripts/*.py into ~/.claude/scripts/.
   skills     Copies skills/<name>/SKILL.md into ~/.claude/skills/<name>/.
   hooks      Copies hooks/* into ~/.claude/hooks/ and the hook tests into ~/.claude/hooks/tests/,
-             then adds the Agent dispatch hook to ~/.claude/settings.json once.
+             then adds the Agent dispatch hook and the Stop context cap hook to ~/.claude/settings.json,
+             each once.
   rollback   Restores what the snapshot holds, removes settings.json or CLAUDE.md if the snapshot
              found none, and removes every file install copies that the snapshot doesn't hold.
              Other files stay.
@@ -33,6 +34,10 @@ START = '<!-- agentic-workflow:start -->'
 END = '<!-- agentic-workflow:end -->'
 DISPATCH_COMMAND = '/usr/bin/python3 -I "$HOME/.claude/hooks/guard-agent-dispatch.py"'
 DISPATCH_GROUP = {'matcher': 'Agent', 'hooks': [{'type': 'command', 'command': DISPATCH_COMMAND, 'timeout': 10}]}
+CONTEXT_CAP_COMMAND = '/usr/bin/python3 -I "$HOME/.claude/hooks/remind-context-cap.py"'
+CONTEXT_CAP_GROUP = {'hooks': [{'type': 'command', 'command': CONTEXT_CAP_COMMAND, 'timeout': 10}]}
+HOOK_GROUPS = (('PreToolUse', 'guard-agent-dispatch.py', DISPATCH_GROUP),
+               ('Stop', 'remind-context-cap.py', CONTEXT_CAP_GROUP))
 HOOK_TESTS = ['test_hooks.py', 'test_dispatch.py', 'settings-snippet.json']
 SNAPSHOT_MARK = 'snapshot.json'
 SNAPSHOT_ITEMS = ['settings.json', 'CLAUDE.md', 'hooks']
@@ -160,17 +165,18 @@ def load_settings(path):
     hooks = settings.get('hooks', {})
     if not isinstance(hooks, dict):
         raise Stop('%s: "hooks" is not an object' % path)
-    if not isinstance(hooks.get('PreToolUse', []), list):
-        raise Stop('%s: "hooks.PreToolUse" is not a list' % path)
+    for event, _, _ in HOOK_GROUPS:
+        if not isinstance(hooks.get(event, []), list):
+            raise Stop('%s: "hooks.%s" is not a list' % (path, event))
     return settings
 
 
-def has_dispatch_hook(groups):
-    # An Agent group running the guard counts even after the owner edits its timeout, path or quoting.
+def has_hook(groups, script, matcher=None):
+    # A group running the script counts even after the owner edits its timeout, path or quoting.
     for group in groups:
-        if isinstance(group, dict) and group.get('matcher') == 'Agent' and isinstance(group.get('hooks'), list):
+        if isinstance(group, dict) and group.get('matcher') == matcher and isinstance(group.get('hooks'), list):
             for hook in group['hooks']:
-                if isinstance(hook, dict) and 'guard-agent-dispatch.py' in str(hook.get('command', '')):
+                if isinstance(hook, dict) and script in str(hook.get('command', '')):
                     return True
     return False
 
@@ -179,11 +185,14 @@ def hooks(claude):
     path = os.path.join(claude, 'settings.json')
     settings = load_settings(path)
     copy_into(claude, 'hooks')
-    groups = settings.setdefault('hooks', {}).setdefault('PreToolUse', [])
-    if has_dispatch_hook(groups):
-        print('unchanged ' + path + ' (Agent hook already present)')
+    events = settings.setdefault('hooks', {})
+    missing = [(event, group) for event, script, group in HOOK_GROUPS
+               if not has_hook(events.get(event, []), script, group.get('matcher'))]
+    if not missing:
+        print('unchanged ' + path + ' (Agent and Stop hooks already present)')
         return
-    groups.append(DISPATCH_GROUP)
+    for event, group in missing:
+        events.setdefault(event, []).append(group)
     write_text(path, json.dumps(settings, indent=2, ensure_ascii=False) + '\n')
     print('updated ' + path)
 

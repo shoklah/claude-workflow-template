@@ -15,6 +15,8 @@ HOOKS_DIR = os.path.join(HERE, '..', 'hooks') if os.path.isdir(os.path.join(HERE
 GUARD = os.path.join(HOOKS_DIR, 'guard-main-commit.py')
 SESSION_START = os.path.join(HOOKS_DIR, 'session-start-superpowers.sh')
 SNIPPET = os.path.join(HERE, 'settings-snippet.json')
+CONTEXT_CAP_HOOK = os.path.join(HOOKS_DIR, 'remind-context-cap.py')
+REPORTER = os.path.join(HERE, '..', 'scripts', 'workflow-report.py')
 PYTHON = '/usr/bin/python3'
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 
@@ -398,6 +400,129 @@ class SettingsSnippet(unittest.TestCase):
         p = self.run_command(self.commands('SessionStart')[0], '{}')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('FIXTURE RULE BODY', p.stdout)
+
+
+class ContextCapHook(unittest.TestCase):
+    CAP_REASON = ('Context is {}K, past the 300K cap. Before ending this turn, draft the handoff and offer it with a '
+                  'button labelled "Hand off": in the next-step box, or in a question where there is no box. A skip '
+                  'means not now.')
+    COMPACT_REASON = ('Context is 450K, past 450K. Before ending this turn, offer compaction or the handoff, with '
+                      'buttons labelled "Compact" and "Hand off": in the next-step box, or in a question where there '
+                      'is no box. A skip means not now.')
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='context-cap-test-')
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.path = os.path.join(self.root, 'session.jsonl')
+        self.ids = 0
+
+    def assistant(self, tokens, *content, usage=None):
+        self.ids += 1
+        usage = usage or {'input_tokens': tokens, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0,
+                          'output_tokens': 1}
+        return {'type': 'assistant', 'message': {'id': f'msg_{self.ids}', 'usage': usage, 'content': list(content)}}
+
+    @staticmethod
+    def call(name, **tool_input):
+        return {'type': 'tool_use', 'id': f'toolu_{name}', 'name': name, 'input': tool_input}
+
+    def wrap_up(self, *labels, ask='Hand off now?'):
+        return self.call('mcp__ccd_turn__wrap_up', recap='r', ask=ask, actions=[{'label': l} for l in labels])
+
+    def write(self, rows):
+        with open(self.path, 'w') as f:
+            f.writelines(json.dumps(row) + '\n' for row in rows)
+
+    def run_raw(self, stdin):
+        p = subprocess.run([PYTHON, '-I', CONTEXT_CAP_HOOK], input=stdin, capture_output=True, text=True, timeout=30,
+                           env=CLEAN_ENV)
+        return p.returncode, p.stdout
+
+    def run_hook(self, rows, **extra):
+        self.write(rows)
+        return self.run_raw(json.dumps({'transcript_path': self.path, 'stop_hook_active': False, **extra}))
+
+    def assert_holds(self, result, reason):
+        code, out = result
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {'decision': 'block', 'reason': reason})
+
+    def test_says_nothing_under_the_cap(self):
+        self.assertEqual(self.run_hook([self.assistant(299_999)]), (0, ''))
+
+    def test_holds_past_the_cap_with_no_offer(self):
+        self.assert_holds(self.run_hook([self.assistant(377_400)]), self.CAP_REASON.format(377))
+
+    def test_says_nothing_within_the_step_after_an_offer(self):
+        rows = [self.assistant(310_000, self.wrap_up('Yes, hand off')), self.assistant(359_000)]
+        self.assertEqual(self.run_hook(rows), (0, ''))
+
+    def test_holds_again_a_step_past_the_last_offer(self):
+        rows = [self.assistant(310_000, self.wrap_up('Yes, hand off')), self.assistant(359_000),
+                self.assistant(361_000)]
+        self.assert_holds(self.run_hook(rows), self.CAP_REASON.format(361))
+
+    def test_names_compaction_from_450k(self):
+        self.assert_holds(self.run_hook([self.assistant(450_000)]), self.COMPACT_REASON)
+
+    def test_a_question_dialog_offer_counts(self):
+        question = self.call('AskUserQuestion', questions=[{'question': 'Next?', 'options': [
+            {'label': 'Handoff now'}, {'label': 'Keep going'}]}])
+        self.assertEqual(self.run_hook([self.assistant(310_000, question)]), (0, ''))
+
+    def test_a_handoff_call_counts(self):
+        start = self.call('mcp__ccd_session__start_session', prompt='Handoff 1: carry on with task 4')
+        self.assertEqual(self.run_hook([self.assistant(310_000, start)]), (0, ''))
+
+    def test_holds_when_only_the_question_text_mentions_a_handoff(self):
+        rows = [self.assistant(310_000, self.wrap_up('Yes', 'No', ask='Ready for the hand-off?'))]
+        self.assert_holds(self.run_hook(rows), self.CAP_REASON.format(310))
+
+    def test_holds_again_after_a_compaction(self):
+        rows = [self.assistant(310_000, self.wrap_up('Hand off')),
+                {'type': 'user', 'isCompactSummary': True, 'message': {'role': 'user', 'content': 'summary'}},
+                self.assistant(120_000), self.assistant(305_000)]
+        self.assert_holds(self.run_hook(rows), self.CAP_REASON.format(305))
+
+    def test_says_nothing_when_already_continuing(self):
+        self.assertEqual(self.run_hook([self.assistant(377_400)], stop_hook_active=True), (0, ''))
+
+    def test_the_largest_own_iteration_is_the_context(self):
+        def iteration(kind, tokens):
+            return {'type': kind, 'input_tokens': tokens, 'cache_read_input_tokens': 0,
+                    'cache_creation_input_tokens': 0, 'output_tokens': 1}
+        usage = {'input_tokens': 1, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0,
+                 'output_tokens': 1, 'iterations': [iteration('message', 100_000), iteration('message', 320_000),
+                                                    iteration('advisor_message', 900_000)]}
+        self.assert_holds(self.run_hook([self.assistant(0, usage=usage)]), self.CAP_REASON.format(320))
+
+    def test_iterations_with_no_own_message_are_no_context(self):
+        usage = {'input_tokens': 400_000, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0,
+                 'output_tokens': 1, 'iterations': [{'type': 'advisor_message', 'input_tokens': 400_000,
+                                                     'output_tokens': 1}]}
+        self.assertEqual(self.run_hook([self.assistant(0, usage=usage)]), (0, ''))
+
+    def test_stays_silent_on_a_broken_or_empty_transcript(self):
+        missing = os.path.join(self.root, 'missing.jsonl')
+        self.assertEqual(self.run_raw(json.dumps({'stop_hook_active': False})), (0, ''))
+        self.assertEqual(self.run_raw(json.dumps({'transcript_path': missing, 'stop_hook_active': False})), (0, ''))
+        self.assertEqual(self.run_hook([]), (0, ''))
+        with open(self.path, 'w') as f:
+            f.write('{"type": "assistant", "message": {"usage": {"input_tokens": 400000\n{"usage"\n')
+        self.assertEqual(self.run_raw(json.dumps({'transcript_path': self.path, 'stop_hook_active': False})), (0, ''))
+        self.assertEqual(self.run_raw('not json'), (0, ''))
+
+    @unittest.skipUnless(os.path.exists(REPORTER), 'the reporter is not installed beside the hooks')
+    def test_the_copies_match_the_reporter(self):
+        with open(CONTEXT_CAP_HOOK) as f:
+            hook = f.read().splitlines()
+        with open(REPORTER) as f:
+            reporter = set(f.read().splitlines())
+        for name in ('CONTEXT_CAP', 'OFFER_STEP', 'COMPACT_AT', 'OFFER_LABEL', 'ASK_USER', 'WRAP_UP',
+                     'START_SESSION', 'HANDOFF_MARKER'):
+            lines = [line for line in hook if line.startswith(f'{name} =')]
+            self.assertEqual(len(lines), 1, name)
+            self.assertIn(lines[0], reporter, name)
 
 
 if __name__ == '__main__':

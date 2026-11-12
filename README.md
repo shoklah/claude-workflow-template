@@ -162,6 +162,7 @@ flowchart LR
         AG["Nine custom agents<br/>model, effort, disallowedTools,<br/>preloaded skills"]
         DH["Dispatch hook<br/>refuses model-less general-purpose,<br/>refuses final-reviewer before simplify,<br/>refuses plan-reviewer before plan-simplifier"]
         SH["Startup hook<br/>loads using-superpowers +<br/>karpathy-guidelines"]
+        CH["Context cap hook<br/>holds a turn ending past 300K<br/>with no handoff offer"]
     end
     subgraph INS ["Instructions: followed, not checked"]
         MD["CLAUDE.md section<br/>paths, stages, caps,<br/>stop rule, run record"]
@@ -176,10 +177,11 @@ flowchart LR
 | Dispatch hook | `hooks/guard-agent-dispatch.py` | PreToolUse on `Agent`. Denies a dispatch with no `model` when the type is missing or `general-purpose`, which would otherwise run silently on the main session's model. Denies a final review, `final-reviewer` or a `general-purpose` one matched by description, until the transcript shows `simplify` since the previous launched final review, except a pair's second half: a `final-reviewer` passing `fable` when exactly one final review, not passing `fable`, launched since that `simplify`. Denies a plan review, `plan-reviewer` or a `general-purpose` one matched by description, until the transcript shows a launched plan simplify since the previous launched plan review. Silent on everything else, never answers `allow`, fails open. |
 | Startup hook | `hooks/session-start-superpowers.sh` | On `startup`, `clear` and `compact`, prints `using-superpowers` and `karpathy-guidelines`. A missing file is noted on stderr; the rest still loads. Combined output stays under the 10,000-character cap. |
 | Commit guard | `hooks/guard-main-commit.py` | Optional. Answers `ask` for a commit landing on `main` or `master`, `deny` in bypass mode. |
+| Context cap hook | `hooks/remind-context-cap.py` | `Stop`. Holds a turn that would end past the 300K context cap with no handoff offer made, once per turn end, and tells the session to offer the handoff with a `Hand off` button; from 450K it names compaction and a `Compact` button too. After an offer, the next hold waits until context has grown a further 50K; a compaction puts it back to the cap. If the hook fails or can't read the transcript, the turn ends. |
 | `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 29 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
 | Failing-test check | `scripts/failing-test-check.py` | See above. |
 | Wave script | `scripts/wave.py` | `start` makes a worktree per task from the wave's base and keeps the linked folders out of git, `merge` merges the task branches in plan order and stops at the first conflict, `finish` removes the worktrees and branches once all are merged and clean, refusing otherwise. |
-| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, sessions that wrote no run record and, for schema 2 records, each step, count line, finding total, agent pin and required skill, a risk area on the Small path and a wave with no wave check, and for schema 3 plan records a required offer with no entry, and for schema 4 records each step's agent id against the launched dispatches (missing, unknown, mismatched or shared ids), and for schema 5 records each finding's category and validity, each review step's strengths, and their number against its report's count line. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one, and a typed trigger whose skill never loaded. Each problem becomes a `WARN` line in `--brief`. It also prints two information lines over this week's main transcripts, like the session checks: inline sweeps, and transcripts over the cap without a handoff. The runs `--health` and `--brief` list default to the last 7 days. |
+| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, sessions that wrote no run record and, for schema 2 records, each step, count line, finding total, agent pin and required skill, a risk area on the Small path and a wave with no wave check, and for schema 3 plan records a required offer with no entry, and for schema 4 records each step's agent id against the launched dispatches (missing, unknown, mismatched or shared ids), and for schema 5 records each finding's category and validity, each review step's strengths, and their number against its report's count line. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one, a typed trigger whose skill never loaded, and turn ends past the context cap with no handoff offer (`cap_no_offer`). Each problem becomes a `WARN` line in `--brief`. It also prints two information lines over this week's main transcripts, like the session checks: inline sweeps, and transcripts over the cap without a handoff. The runs `--health` and `--brief` list default to the last 7 days. |
 | Report | `scripts/workflow-report.py` | Read-only. Reads transcripts and the run log; reports advisor calls, tokens and estimated cost by role, missing advisor notes, findings and fix rounds per run, and failing-test check results. `--json` prints the same data as one JSON object; `--html` writes it as one self-contained page. |
 
 Still unenforced, by design: choosing the path, reading the stage, the main session's model, the fix-round cap, and whether the guidelines are followed once loaded. Naming the path and stage out loud is what lets the owner catch a wrong call.
@@ -217,7 +219,7 @@ A skill or command the owner triggers is offered at a fixed moment, or never. Th
 | Skill or command | When it's offered |
 |---|---|
 | `grill-me` | On every Full design, once, right before the owner approves it. |
-| `handoff` | At the cap, at a stopping point, drafted so a yes costs only the switch. |
+| `handoff` | At the cap, at a stopping point, drafted so a yes costs only the switch. After a skip, it comes back once context has grown a further 50K. |
 | `workflow-dashboard` | Never offered: the owner runs `/workflow-dashboard` when they want the page, and its link stays the same, so nothing is lost by waiting. |
 
 ## Layout
@@ -225,7 +227,7 @@ A skill or command the owner triggers is offered at a fixed moment, or never. Th
 ```
 agents/          nine custom agents
 claude-md/       the CLAUDE.md section
-hooks/           dispatch hook, startup hook, commit guard
+hooks/           dispatch hook, startup hook, commit guard, context cap hook
 scripts/         failing-test check, workflow report, wave.py
 skills/          workflow-dashboard: the /workflow-dashboard command
 tools/           replay_dispatches.py: replays past dispatches through the dispatch hook
@@ -282,7 +284,7 @@ Hooks and agents load into running sessions within seconds, so install when no i
 /usr/bin/python3 -I install.py hooks
 ```
 
-The `hooks` step copies all three hooks, but it only adds the dispatch hook to `~/.claude/settings.json`. To use the startup hook and the commit guard, copy their entries from `tests/settings-snippet.json` into `~/.claude/settings.json` yourself.
+The `hooks` step copies all four hooks, but it only adds the dispatch hook and the context cap hook to `~/.claude/settings.json`. To use the startup hook and the commit guard, copy their entries from `tests/settings-snippet.json` into `~/.claude/settings.json` yourself.
 
 Before you rely on the dispatch hook, replay past dispatches to see what it would have refused:
 

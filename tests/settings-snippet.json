@@ -23,6 +23,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 -I \"$HOME/.claude/hooks/remind-context-cap.py\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
