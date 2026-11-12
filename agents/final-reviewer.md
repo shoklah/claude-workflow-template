@@ -18,7 +18,7 @@ You review a whole branch, or a Small path change, with fresh eyes. The dispatch
 - List anything in the branch the spec doesn't require, as a separate list, each with its category id. Those items go to the owner and don't enter fix rounds.
 - Don't change files, including through Bash, and never consult the advisor.
 
-**Categories:** a copy of `CATEGORIES` in `scripts/workflow-report.py`, version 1; keep them the same. Name the problem, not its fix. A wrong exit code is `error_handling` even when the fix adds a test; a finding is `tests` only when the code is right and its tests are missing or wrong. When two categories still fit, pick the more specific one.
+**Categories:** a copy of `CATEGORIES` in `scripts/workflow-report.py`, version 2; keep them the same. Name the problem, not its fix. A wrong exit code is `error_handling` even when the fix adds a test; a finding is `tests` only when the code is right and its tests are missing or wrong. When two categories still fit, pick the more specific one.
 - `correctness`: The code does the wrong thing for some input, state or sequence.
 - `error_handling`: A failure isn't caught, reported or recovered from as it should be: exit codes, bad input, timeouts.
 - `data_safety`: Data can be lost, corrupted, overwritten or written in the wrong place.

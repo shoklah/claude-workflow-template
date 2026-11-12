@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "name": "standin",
+  "version": "0.1.0",
+  "applies_when": "The task changes the stand-in's sample file.",
+  "design": "design.md",
+  "guidance": "guidance.md",
+  "checklist": "checklist.md",
+  "checks": [{"name": "sample", "command": "/usr/bin/python3 -I {kit}/checks/sample.py"}],
+  "bindings": [
+    {"read": "extra/always.md"},
+    {"read": "extra/motion.md", "tag": "motion"},
+    {"read": "stacks/alpha/notes.md", "stack": "alpha"}
+  ],
+  "stacks": ["alpha"]
+}

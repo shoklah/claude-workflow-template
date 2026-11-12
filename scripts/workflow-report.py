@@ -84,13 +84,18 @@ import tempfile
 OUTCOMES = ('fixed', 'applied', 'declined', 'deferred', 'ruled', 'open', 'to_owner')
 OFFER_OUTCOMES = ('accepted', 'skipped', 'not_offered', 'updated')
 REQUIRED_OFFERS = ('grill-me',)
-STEP_KINDS = ('plan_simplify', 'plan_review', 'task_review', 'fix_check', 'simplify', 'final_review', 'final_fix_check')
+STEP_KINDS = ('plan_simplify', 'plan_review', 'task_review', 'fix_check', 'simplify', 'final_review', 'final_fix_check',
+              'kit_review')
+KIT_RESULTS = ('passed', 'failed', 'couldnt_run')
+KIT_RULES = '/docs/kits.md'  # the workflow's installed kits rules file, as the end of a read path
+PLAN_TASK = re.compile(r'^### Task (\d+)')
+PLAN_KIT = re.compile(r'^\*\*Kit:\*\* (?!exempt:)([\w-]+)')
 
 # The finding category list: its version, its tie-break rule, the validity definitions and a list per area. An id is
 # permanent: a new version adds ids, retires one (kept and marked) or rewords text, and never reuses, renames or removes
 # one; any change bumps the version. The reviewer agents carry their area's copy: keep them the same.
 CATEGORIES = {
-    'version': 1,
+    'version': 2,
     'rule': 'Name the problem, not its fix. A wrong exit code is `error_handling` even when the fix adds a test; a '
             'finding is `tests` only when the code is right and its tests are missing or wrong. When two categories '
             'still fit, pick the more specific one.',
@@ -138,11 +143,16 @@ CATEGORIES = {
         {'id': 'docs', 'label': 'Docs', 'means': 'README, help text, CLAUDE.md or other docs missing, wrong or '
          'stale.'},
     ],
+    'kit': [
+        {'id': 'kit', 'label': 'Kit finding', 'means': "A finding from a kit's own review; its `label` is the kit's own "
+         "name for the rule it breaks."},
+    ],
 }
 # Area, the step kinds whose findings it labels, the CATEGORIES list it uses.
 AREAS = (('plan', ('plan_simplify', 'plan_review'), 'plan'),
          ('implementation', ('task_review', 'final_review'), 'implementation'),
-         ('cleanup', ('simplify',), 'implementation'))
+         ('cleanup', ('simplify',), 'implementation'),
+         ('kit', ('kit_review',), 'kit'))
 STRENGTH_STEPS = ('plan_simplify', 'plan_review', 'task_review', 'final_review')
 VALIDITY = tuple(CATEGORIES['validity'])
 
@@ -158,7 +168,7 @@ def category_list():
             'areas': [{'area': area, 'steps': list(kinds), 'list': CATEGORIES[key]} for area, kinds, key in AREAS]}
 
 SCHEMA = {
-    'schema': 'int, record format: 5; a record without it is 1',
+    'schema': 'int, record format: 6; a record without it is 1',
     'date': 'ISO 8601 time the run finished',
     'started': 'ISO 8601 time the session named the run\'s path and stage, in its first message',
     'project': 'absolute path of the project',
@@ -189,20 +199,28 @@ SCHEMA = {
              + ', "task": N, "wave": "A" in place of "task" on the wave check (a task_review) and on the wave\'s '
              'fix_check steps, "round": N (0 is the first review, fix-checks are 1 to 3), "agent", "model", "effort" '
              '(as dispatched; agent "simplify" for the skill), "agent_id": the agentId the Agent tool returned for the '
-             'step\'s dispatch, which names its subagent transcript (every kind but simplify; schema 4), "counts": '
+             'step\'s dispatch, which names its subagent transcript (every kind but simplify; schema 4), "kit": the '
+             'kit\'s name, on a kit_review step and on a fix-check that kit-reviewer ran (schema 6), "counts": '
              '{keys of the step\'s count line: reviews critical, important, minor, plus unneeded for the final review; '
              'plan_simplify cuts, flags; plan_review findings; fix-checks fixed, not_proportionate, open; simplify '
-             'applied, skipped}, "findings" (every step but fix-checks): [{"id": "F7", "severity" (or "kind": '
+             'applied, skipped; kit_review critical, important, minor}, "findings" (every step but fix-checks): [{"id": "F7", "severity" (or "kind": '
              '"cut"|"flag" for plan_simplify), "summary", '
              '"outcome": ' + '|'.join(f'"{o}"' for o in OUTCOMES)
              + ', "reason" (required for declined and ruled), "closed_round": N, "category": an id from its step\'s '
              'area list in "category_list", the reviewer\'s, "validity": "valid"|"invalid"|"unclear", the '
-             'session\'s, by the definitions in "category_list" (schema 5), "verdicts": the fix-checker verdicts in '
+             'session\'s, by the definitions in "category_list" (schema 5), "label": the kit\'s own name for the rule, on '
+             'a kit_review finding (schema 6), "verdicts": the fix-checker verdicts in '
              'order}], '
              '"strengths" (plan_simplify, plan_review, task_review and final_review; schema 5): [{"category", '
              '"summary"}], [] for none; "counts" never holds "strengths"}',
     'waves': 'list of {"wave": "A", "tasks": [N, ...], "conflicts": N}, one per wave in order; absent on a run with no '
              'waves. tasks still counts plan tasks, fix_rounds includes the waves\' rounds and stops counts a wave stop',
+    'kits': 'list of {"name", "version", "tasks": [N, ...] the tasks marked with the kit, [] on a Small run where the kit '
+            'covers the branch, "files": [the full paths the implementers\' briefs said to read: the kit\'s guidance '
+            'and the bindings its tasks called for]}, one per kit the run used; absent on a run with none (schema 6)',
+    'kit_checks': 'list of {"kit", "task": N (absent on a Small run), "result": '
+                  + '|'.join(f'"{r}"' for r in KIT_RESULTS) + '}, each kit task\'s last check result; "couldnt_run" '
+                  'is a task left "kit not verified" (schema 6)',
     'offers': 'list of {"skill", "outcome": ' + '|'.join(f'"{o}"' for o in OFFER_OUTCOMES)
               + ', "reason" (required for not_offered)}, one per offer answered before the record is written; plan '
               'records carry ' + ' and '.join(REQUIRED_OFFERS) + '. Schema 3; absent on older records',
@@ -230,8 +248,8 @@ ADVISOR_MODEL = 'claude-fable-5-1'  # for advisor iterations that name no model
 TOKENS = (('input', 'input_tokens'), ('output', 'output_tokens'), ('cache_read', 'cache_read_input_tokens'),
           ('cache_write', 'cache_creation_input_tokens'))
 # The phases --json splits a run's or session's spend into, in the order it lists them.
-PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'fix_check',
-          'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
+PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'kit_review',
+          'fix_check', 'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
 # The main session's phase from the last of these skills it loaded, and before any of them from the run's path.
 SKILL_PHASES = {'brainstorming': 'design', 'writing-plans': 'plan_writing',
                 'subagent-driven-development': 'coordination', 'executing-plans': 'implement',
@@ -253,7 +271,8 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-10', 'Context cap, handoff chain and sweeper', 'claude-workflow#26'),
            ('2026-11-11', 'Final review pairs', 'claude-workflow#29'),
            ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'),
-           ('2026-11-12', 'Context cap hook and the no-offer warning', 'claude-workflow#34'))
+           ('2026-11-12', 'Context cap hook and the no-offer warning', 'claude-workflow#34'),
+           ('2026-11-12', 'Kits: topic packs with a design step, checks and review', 'claude-workflow#35'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
@@ -268,21 +287,25 @@ PAIRS_FROM = CHANGE_DAYS['claude-workflow#29']
 # test_json_exports_the_dated_workflow_changes ties the copy to the row it reads here: keep them the same.
 CAP_OFFER_FROM = CHANGE_DAYS['claude-workflow#34']
 FIX_WINDOW_DAYS = 14
-NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper')
+NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper',
+                 'kit-reviewer')
 FINDINGS = ('critical', 'important', 'minor', 'unneeded')
+KIT_FINDINGS = FINDINGS[:3]  # kit-reviewer has no unneeded count
 VERDICTS = ('fixed', 'not_proportionate', 'open')
 # Each dispatched step kind's report: its name in WARN lines, its count line and that line's keys.
 COUNT_LINES = {'plan_simplify': ('plan simplify', 'Findings', ('cuts', 'flags')),
                'plan_review': ('plan review', 'Findings', ('findings',)),
                'task_review': ('review', 'Findings', FINDINGS), 'fix_check': ('fix-check', 'Verdicts', VERDICTS),
-               'final_review': ('review', 'Findings', FINDINGS), 'final_fix_check': ('fix-check', 'Verdicts', VERDICTS)}
+               'final_review': ('review', 'Findings', FINDINGS), 'final_fix_check': ('fix-check', 'Verdicts', VERDICTS),
+               'kit_review': ('kit review', 'Findings', KIT_FINDINGS)}
 # What a step's findings add up to: the count each finding adds to, and the counts they make up. Fix-checks carry no
 # findings.
 ADDS_UP = {'plan_simplify': (lambda f: {'cut': 'cuts', 'flag': 'flags'}.get(f['kind']), ('cuts', 'flags')),
            'plan_review': (lambda f: 'findings', ('findings',)),
            'task_review': (lambda f: f['severity'], FINDINGS),
            'simplify': (lambda f: 'applied' if f['outcome'] == 'applied' else 'skipped', ('applied', 'skipped')),
-           'final_review': (lambda f: f['severity'], FINDINGS)}
+           'final_review': (lambda f: f['severity'], FINDINGS),
+           'kit_review': (lambda f: f['severity'], KIT_FINDINGS)}
 TEST_RESULTS = ('passed', 'failed', 'no_tests', 'couldnt_run', 'exempt')
 SIMPLIFY_RAN = ('agents', 'inline', 'no')
 NOTE_RE = re.compile(r'^Advisor: .+ \| changed: (yes|no) \| .*$', re.M)
@@ -314,6 +337,10 @@ RUN_VERBS = ('python', 'python3', '/usr/bin/python3', 'pytest', 'npm', 'pnpm', '
              'go', 'php', 'composer', 'docker', 'bash', 'sh', 'zsh', 'timeout')
 # What a Bash command is classed after: any leading cd.
 BASH_PREFIX = re.compile(r'^(?:cd\s+[^;&]*?\s*(?:&&|;)\s*)*')
+# The commands whose path arguments read_calls counts as files read; read is the read command of a prefix
+# BASH_PREFIX strips.
+FILE_READ_VERBS = ('cat', 'head', 'tail', 'less', 'sed', 'read')
+HOME_WORD = re.compile(r'^(?:~|\$HOME|\$\{HOME\})(?=/|$)')  # a path word's leading home folder
 HEALTH_DAYS = 7
 GIT_TIMEOUT = 30
 
@@ -332,6 +359,8 @@ NOT_FINAL_REVIEW = re.compile(r'fix|check', re.I)
 # plan-simplifier is not a plan simplify.
 PLAN_REVIEW_DESCRIPTION = re.compile(r'plan[ -](re-?)?review', re.I)
 PLAN_SIMPLIFY_DESCRIPTION = re.compile(r'plan[ -]simplif', re.I)
+# A kit-reviewer dispatch whose description starts with this is a fix-check of its earlier findings.
+KIT_RECHECK = re.compile(r'\s*re-?check', re.I)
 # Health check: a general-purpose dispatch with one of these descriptions did a named agent's job.
 TASK_REVIEW = re.compile(r're-?review|review task|task \d+ review|(spec|quality|code quality) review', re.I)
 NAMED_ROLE = re.compile(r'implement|plan review|fix-?check|final[ -]review|' + TASK_REVIEW.pattern, re.I)
@@ -364,6 +393,11 @@ def command_re(name):
     return re.compile(SIMPLIFY_COMMAND.pattern.replace('/simplify', '/' + name), re.S)
 
 
+def bash_head(command):
+    """A Bash command with the leading prefixes BASH_PREFIX matches stripped."""
+    return BASH_PREFIX.sub('', command.lstrip())
+
+
 def tool_class(name, inp):
     """A tool call's TOOL_CLASSES class, from its name and its input dict. A Bash call is classed by its first command
     after BASH_PREFIX: a git one by its subcommand, else by its first word."""
@@ -377,7 +411,7 @@ def tool_class(name, inp):
         return 'mcp'
     if name != 'Bash':
         return 'other'
-    words = BASH_PREFIX.sub('', field(inp, 'command', str, '').lstrip()).split()
+    words = bash_head(field(inp, 'command', str, '')).split()
     first = words[0] if words else ''
     if first == 'git':
         return 'read' if words[1:2] and words[1] in GIT_READ else 'bash_other'
@@ -404,7 +438,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 8
+CACHE_VERSION = 9
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -1070,13 +1104,14 @@ def read_steps(rec):
         findings = [{'id': field(f, 'id', str, None), 'severity': field(f, 'severity', str, None),
                      'category': read_category(f, ids),
                      'validity': f.get('validity') if f.get('validity') in VALIDITY else None,
+                     'label': field(f, 'label', str, None),
                      'kind': field(f, 'kind', str, None), 'summary': field(f, 'summary', str, None),
                      'outcome': f.get('outcome') if f.get('outcome') in OUTCOMES else None,
                      'reason': field(f, 'reason', str, None), 'closed_round': field(f, 'closed_round', int, None),
                      'verdicts': [v for v in field(f, 'verdicts', list, []) if isinstance(v, str)]}
                     for f in field(step, 'findings', list, []) if isinstance(f, dict)]
         steps.append({'step': step['step'], 'task': field(step, 'task', int, None),
-                      'wave': field(step, 'wave', str, None),
+                      'wave': field(step, 'wave', str, None), 'kit': field(step, 'kit', str, None),
                       'round': field(step, 'round', int, None), 'agent': field(step, 'agent', str, None),
                       'model': field(step, 'model', str, None), 'effort': field(step, 'effort', str, None),
                       'agent_id': field(step, 'agent_id', str, None),
@@ -1092,6 +1127,23 @@ def read_waves(rec):
              'tasks': [t for t in field(w, 'tasks', list, []) if isinstance(t, int) and not isinstance(t, bool)],
              'conflicts': num(w.get('conflicts'))}
             for w in field(rec, 'waves', list, []) if isinstance(w, dict) and isinstance(w.get('wave'), str)]
+
+
+def read_kits(rec):
+    """The record's kits, cleaned: an entry that isn't a dict with a string name is dropped, other bad values read as
+    absent."""
+    return [{'name': k['name'], 'version': field(k, 'version', str, None),
+             'tasks': [t for t in field(k, 'tasks', list, []) if isinstance(t, int) and not isinstance(t, bool)],
+             'files': [f for f in field(k, 'files', list, []) if isinstance(f, str)]}
+            for k in field(rec, 'kits', list, []) if isinstance(k, dict) and isinstance(k.get('name'), str)]
+
+
+def read_kit_checks(rec):
+    """The record's kit checks, cleaned: an entry that isn't a dict with a string kit and a known result is dropped,
+    a bad task reads as absent."""
+    return [{'kit': c['kit'], 'task': field(c, 'task', int, None), 'result': c['result']}
+            for c in field(rec, 'kit_checks', list, [])
+            if isinstance(c, dict) and isinstance(c.get('kit'), str) and c.get('result') in KIT_RESULTS]
 
 
 def read_offers(rec):
@@ -1114,6 +1166,8 @@ def read_runs(log, stats):
         rec['schema'] = field(rec, 'schema', int, 1)
         rec['steps'] = read_steps(rec)
         rec['waves'] = read_waves(rec)
+        rec['kits'] = read_kits(rec)
+        rec['kit_checks'] = read_kit_checks(rec)
         rec['offers'] = read_offers(rec)
         rec['categories'] = field(rec, 'categories', int, None)
         rec['advisor'] = rec.get('advisor') is True
@@ -1427,6 +1481,61 @@ def scan_events(path):
     return events, launched, startup
 
 
+@functools.lru_cache(maxsize=None)
+def read_calls(path):
+    """scan_reads(path) through the parse cache."""
+    return cached(path, 'reads', lambda: scan_reads(path))
+
+
+def scan_reads(path):
+    """[timestamp, file_path] of every file one transcript reads, in file order: a Read call's file_path and a Bash
+    call's bash_reads. A row with no timestamp takes the previous row's; only lines holding a Read or a Bash are
+    parsed, and a torn or odd line is skipped."""
+    calls, timestamp, home = [], '', os.path.expanduser('~')
+    try:
+        f = open(path, 'rb')
+    except OSError:
+        return calls
+    with f:
+        for line in f:
+            if b'"Read"' not in line and b'"Bash"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+                if isinstance(row.get('timestamp'), str):
+                    timestamp = row['timestamp']
+                if row.get('type') != 'assistant':
+                    continue
+                for block in row.get('message', {}).get('content') or []:
+                    inp = block.get('input')
+                    if block.get('type') != 'tool_use' or not isinstance(inp, dict):
+                        continue
+                    if block.get('name') == 'Read' and isinstance(inp.get('file_path'), str):
+                        calls.append([timestamp, inp['file_path']])
+                    elif block.get('name') == 'Bash' and isinstance(inp.get('command'), str):
+                        calls += [[timestamp, file_path] for file_path in bash_reads(inp['command'], home)]
+            except (ValueError, AttributeError, TypeError, RecursionError):
+                continue
+    return calls
+
+
+def bash_reads(command, home):
+    """The files a Bash command reads: in each of its simple commands (split at ;|& and newlines, with heredoc bodies
+    dropped and each cut at its first < or >) whose first word after BASH_PREFIX is one of FILE_READ_VERBS, each
+    argument but options, a leading ~, $HOME or ${HOME} standing for home, and a relative one joined to the folder of
+    the last cd before it in the command."""
+    command = re.sub(r"<<-?\s*(['\"]?)(\w+)\1.*?(?:\n[ \t]*\2[ \t]*(?=\n|$)|$)", '', command, flags=re.S)
+    reads, folder = [], None
+    for part in re.split(r'[;|&\n]', command):
+        words = [HOME_WORD.sub(lambda m: home, word)
+                 for word in re.findall(r"[^\s'\"`()]+", re.split(r'[<>]', bash_head(part), maxsplit=1)[0])]
+        if words[:1] == ['cd'] and words[1:]:
+            folder = os.path.join(folder or '', words[1])
+        elif words[:1] and words[0] in FILE_READ_VERBS:
+            reads += [os.path.join(folder, word) if folder else word for word in words[1:] if not word.startswith('-')]
+    return reads
+
+
 def transcript_title(path):
     """The transcript's last custom title, or None when it has none."""
     return next((value for _, kind, value in reversed(transcript_events(path)[0]) if kind == 'title'), None)
@@ -1658,6 +1767,11 @@ def is_review(tool_input):
 
 def step_kind(tool_input, after_final):
     """The step kind of a launched dispatch, or None; a fix-check is a final_fix_check once a final review launched."""
+    if tool_input.get('subagent_type') == 'kit-reviewer':
+        description = tool_input.get('description')
+        if isinstance(description, str) and KIT_RECHECK.match(description):
+            return 'final_fix_check' if after_final else 'fix_check'
+        return 'kit_review'
     if is_final_review(tool_input):
         return 'final_review'
     if is_plan_review(tool_input):
@@ -2001,6 +2115,72 @@ def check_steps(run, dispatches, events, pins):
     return problems
 
 
+def plan_kits(run):
+    """{kit name: [task numbers]} from the run's plan file, a relative plan joined to its project; None when the
+    record has no plan or the file can't be read. A task is a "### Task N" heading, and carries a kit when a line
+    before the next heading names it as PLAN_KIT reads it."""
+    plan, project = field(run, 'plan', str, None), field(run, 'project', str, None)
+    if plan is None or (not os.path.isabs(plan) and project is None):
+        return None
+    try:
+        with open(os.path.join(project or '', plan), encoding='utf-8') as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    kits, task = {}, None
+    for line in lines:
+        if line.startswith('#'):
+            found = PLAN_TASK.match(line)
+            task = int(found.group(1)) if found else None
+            continue
+        found = PLAN_KIT.match(line)
+        if task is not None and found:
+            kits.setdefault(found.group(1), []).append(task)
+    return kits
+
+
+def check_kits(run, path, end, dispatches):
+    """Problems in a schema 6 run's kits: one the plan marks or a kit review names that the record lacks, a kit task
+    with no kit review step, no check or a check that did not pass, the kits rules file unread in the main
+    transcripts, and a kit file no reader read, the readers being the main transcripts and the implementers."""
+    problems, names = [], {k['name'] for k in run['kits']}
+    planned = plan_kits(run) or {}
+    problems += [problem('kit_unrecorded', f"the plan marks tasks {', '.join(map(str, tasks))} with kit {name} but "
+                                           'the record names no such kit')
+                 for name, tasks in planned.items() if name not in names]
+    problems += [problem('kit_unrecorded', f"kit {s['kit']} was reviewed but the record names no such kit", step=s)
+                 for s in run['steps'] if s['step'] == 'kit_review' and s['kit'] not in names]
+    for kit in run['kits']:
+        name = kit['name']
+        for t in kit['tasks'] or [None]:
+            on = f' on task {t}' if t is not None else ''
+            if not any(s['step'] == 'kit_review' and s['kit'] == name and (t is None or s['task'] in (t, None))
+                       for s in run['steps']):
+                text = (f"task {t} carries kit {name} but has no kit review step" if t is not None
+                        else f"kit {name} has no kit review step")
+                problems.append(problem('kit_review_missing', text, step={'step': 'kit_review', 'task': t}))
+            checks = [c for c in run['kit_checks'] if c['kit'] == name and (t is None or c['task'] == t)]
+            if not checks:
+                problems.append(problem('kit_check_missing', f"kit {name}'s checks did not run{on}"))
+            problems += [problem('kit_unverified', f"kit {name}'s checks ended {c['result']}{on}")
+                         for c in checks if c['result'] != 'passed']
+    if not run['kits']:
+        return problems
+    main_reads = [file_path for main, main_end in chain_windows(path, end)
+                  for time, file_path in read_calls(main) if in_window(time, None, main_end)]
+    if not any(p.endswith(KIT_RULES) for p in main_reads):
+        problems.append(problem('kit_rules_unread', 'a kit ran but the kits rules file was never read'))
+    subs = [d['sub'] for d in dispatches
+            if field(d['inp'], 'subagent_type', str, '').startswith('implementer') and d['sub'] is not None]
+    if field(run, 'path', str, None) == 'full' and not subs:
+        return problems
+    read = {os.path.normpath(p) for p in main_reads + [p for sub in subs for _, p in read_calls(sub)]}
+    problems += [problem('kit_file_unread', f"kit {kit['name']}'s file {os.path.basename(f)} was read by no "
+                                            'implementer', agent='implementer')
+                 for kit in run['kits'] for f in kit['files'] if os.path.normpath(f) not in read]
+    return problems
+
+
 def check_run(path, start, end, run, pins):
     """Problems shown by the rows timed in (start, end] of the main transcript path and its subagent transcripts, and
     for a schema 2 run its steps against them and against the agents' pins."""
@@ -2063,6 +2243,8 @@ def check_run(path, start, end, run, pins):
         problems.append(problem('startup_missing', 'startup guidelines missing from the session'))
     if schema2:
         problems += check_steps(run, dispatches, events, pins)
+    if run['schema'] >= 6 and field(run, 'path', str, None) != 'plan':
+        problems += check_kits(run, path, end, dispatches)
     return problems
 
 
@@ -2542,7 +2724,8 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
     known = r['_time'] is not None and r['_started'] is not None
     entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': [dict(s, time=None, end=None) for s in r['steps']],
              'final_findings': r['final_findings'],
-             'simplify': r['simplify'], 'waves': r['waves'], 'offers': r['offers'], 'categories': r['categories'],
+             'simplify': r['simplify'], 'waves': r['waves'], 'kits': r['kits'],
+             'kit_checks': r['kit_checks'], 'offers': r['offers'], 'categories': r['categories'],
              'fable_points': run_points(r, 'fable_start', 'fable_end'),
              'all_points': run_points(r, 'all_start', 'all_end'),
              'minutes': (r['_time'] - r['_started']).total_seconds() / 60 if known else None,

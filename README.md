@@ -110,6 +110,18 @@ Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3
 - **At review:** `final-reviewer` also lists what the spec doesn't require. That list goes to the owner, never into fix rounds.
 - **The finding bar:** outside risk areas, a "this can break" finding is Critical or Important only with a shown path in this code; inside one, plausibility is enough, and a shown path makes it at least Important, even if it looks rare or benign, judged per finding. A finding naming the existing helper or pattern a change duplicates or departs from is Important, and so is a missing or contradicted `## Code conventions` entry. `fix-checker` reports a fix that closes its finding with a parallel function, a test-only parameter or more change than needed as "fixed, not proportionate", which counts as still open.
 
+### Kits
+
+A kit specializes the workflow for one topic, only on the tasks it fits: it adds design points, guidance for implementers, automated checks and a `kit-reviewer` pass, and never changes the path, the models, the caps or the order of steps. Kits come from a separate kits repo and live in `~/.claude/kits/<name>/`; a project names the ones it uses under `## Kits` in its `CLAUDE.md`, and `scripts/kit.py show <name>` finds one by name. The rules are in `claude-md/kits.md`. Each kit's `kit.json` holds:
+
+- `format`, `name`, `version`: the manifest's format, the kit's folder name and its version, which the run record keeps.
+- `applies_when`: one sentence naming the tasks the kit fits.
+- `design`: the file listing the kit's prerequisites and what the spec and design must settle.
+- `guidance`: the file a kit task's implementer reads before writing.
+- `checklist`: the file `kit-reviewer` reviews against.
+- `checks`: the commands run after a kit task's tests pass.
+- `bindings` and `stacks`: further files to read, kept to the tasks carrying their tag or the project's stack.
+
 ## Models and effort
 
 | Role | Agent | Model | Effort |
@@ -122,6 +134,7 @@ Results: `passed` exits 0, `failed` and `no_tests` exit 1, `couldnt_run` exits 3
 | Implementer when the plan holds the code | `implementer-copy` | Sonnet 5.5 | `medium` |
 | Round 3 from Opus | `implementer-escalated` | Fable | `high` |
 | Task review | `task-reviewer` | Opus 5.5 | `high` |
+| A kit's own review | `kit-reviewer` | Opus 5.5 | `high` |
 | Re-check of listed findings | `fix-checker` | Sonnet 5.5 | `medium` |
 | Sweeps | `sweeper` | Haiku | `medium` |
 | Final review, and the Small path's reviewer | `final-reviewer` | Opus 5.5; Fable in risk areas | `high`; `xhigh` in risk areas |
@@ -159,7 +172,7 @@ After each consultation the model writes `Advisor: <what it advised> | changed: 
 ```mermaid
 flowchart LR
     subgraph CFG ["Configuration: checked by the harness"]
-        AG["Nine custom agents<br/>model, effort, disallowedTools,<br/>preloaded skills"]
+        AG["Ten custom agents<br/>model, effort, disallowedTools,<br/>preloaded skills"]
         DH["Dispatch hook<br/>refuses model-less general-purpose,<br/>refuses final-reviewer before simplify,<br/>refuses plan-reviewer before plan-simplifier"]
         SH["Startup hook<br/>loads using-superpowers +<br/>karpathy-guidelines"]
         CH["Context cap hook<br/>holds a turn ending past 300K<br/>with no handoff offer"]
@@ -173,7 +186,7 @@ flowchart LR
 
 | Piece | File | What it does |
 |---|---|---|
-| Custom agents | `agents/*.md` | Nine agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. `sweeper`, on Haiku, is read-only the same way: it takes a lookup of five or more reads off the main session and reports only the conclusion, under 300 words, each fact with where it was read and what it couldn't verify marked, with no count line. Reviewers give each finding a category from their area's list and end with a guarded `Strengths:` section. Task and final reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N] strengths=N` line, `fix-checker` with `Verdicts: fixed=N not_proportionate=N open=N`, `plan-simplifier` with `Findings: cuts=N flags=N strengths=N` and `plan-reviewer` with `Findings: findings=N strengths=N`. |
+| Custom agents | `agents/*.md` | Ten agents with model and effort pinned in frontmatter. Implementers can't spawn agents; reviewers can't edit files and never consult the advisor. `sweeper`, on Haiku, is read-only the same way: it takes a lookup of five or more reads off the main session and reports only the conclusion, under 300 words, each fact with where it was read and what it couldn't verify marked, with no count line. Reviewers give each finding a category from their area's list and end with a guarded `Strengths:` section. Task and final reviewers end with a fixed `Findings: critical=N important=N minor=N [unneeded=N] strengths=N` line, `fix-checker` with `Verdicts: fixed=N not_proportionate=N open=N`, `plan-simplifier` with `Findings: cuts=N flags=N strengths=N` and `plan-reviewer` with `Findings: findings=N strengths=N`. |
 | Dispatch hook | `hooks/guard-agent-dispatch.py` | PreToolUse on `Agent`. Denies a dispatch with no `model` when the type is missing or `general-purpose`, which would otherwise run silently on the main session's model. Denies a final review, `final-reviewer` or a `general-purpose` one matched by description, until the transcript shows `simplify` since the previous launched final review, except a pair's second half: a `final-reviewer` passing `fable` when exactly one final review, not passing `fable`, launched since that `simplify`. Denies a plan review, `plan-reviewer` or a `general-purpose` one matched by description, until the transcript shows a launched plan simplify since the previous launched plan review. Silent on everything else, never answers `allow`, fails open. |
 | Startup hook | `hooks/session-start-superpowers.sh` | On `startup`, `clear` and `compact`, prints `using-superpowers` and `karpathy-guidelines`. A missing file is noted on stderr; the rest still loads. Combined output stays under the 10,000-character cap. |
 | Commit guard | `hooks/guard-main-commit.py` | Optional. Answers `ask` for a commit landing on `main` or `master`, `deny` in bypass mode. |
@@ -225,13 +238,14 @@ A skill or command the owner triggers is offered at a fixed moment, or never. Th
 ## Layout
 
 ```
-agents/          nine custom agents
-claude-md/       the CLAUDE.md section
+agents/          ten custom agents
+claude-md/       the CLAUDE.md section; kits.md: the kit rules, read on demand
 hooks/           dispatch hook, startup hook, commit guard, context cap hook
-scripts/         failing-test check, workflow report, wave.py
+scripts/         failing-test check, workflow report, wave.py, kit.py
 skills/          workflow-dashboard: the /workflow-dashboard command
 tools/           replay_dispatches.py: replays past dispatches through the dispatch hook
-tests/           unittest suites, run as subprocesses against temp folders
+tests/           unittest suites, run as subprocesses against temp folders;
+                 kits/: a stand-in kit for kit.py's tests
 install.py       the installer
 ```
 
@@ -274,6 +288,10 @@ Hooks and agents load into running sessions within seconds, so install when no i
 
 ```bash
 /usr/bin/python3 -I install.py scripts
+```
+
+```bash
+/usr/bin/python3 -I install.py docs
 ```
 
 ```bash

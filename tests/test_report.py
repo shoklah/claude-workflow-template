@@ -23,8 +23,8 @@ NOW = '2026-11-07T12:00:00Z'  # a Saturday; its week started Sunday 2026-11-01 0
 OVER_CAP = {'input_tokens': 300_001, 'output_tokens': 1}  # the usage of one call past CONTEXT_CAP
 
 # The spec's phase order, as PHASES in scripts/workflow-report.py: keep them the same.
-PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'fix_check',
-          'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
+PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'kit_review',
+          'fix_check', 'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
 # PAIRS_FROM in scripts/workflow-report.py, the day the pair measure was installed: keep them the same.
 PAIRS_FROM = '2026-11-11'
 # CAP_OFFER_FROM in scripts/workflow-report.py, the day the context cap hook was installed: keep them the same.
@@ -501,7 +501,8 @@ class Report(unittest.TestCase):
         schema = json.loads(self.run_report('--schema'))
         self.assertLessEqual(set(run_record()), set(schema))
         self.assertEqual(sorted(set(schema) - set(run_record())),
-                         ['archive', 'categories', 'category_list', 'offers', 'plan', 'schema', 'started', 'steps', 'waves'])
+                         ['archive', 'categories', 'category_list', 'kit_checks', 'kits', 'offers', 'plan', 'schema', 'started',
+                          'steps', 'waves'])
 
     def test_schema_lists_the_schema_2_fields_and_outcomes(self):
         schema = json.loads(self.run_report('--schema'))
@@ -531,7 +532,7 @@ class Report(unittest.TestCase):
     def test_schema_4_steps_carry_the_agent_id(self):
         out = self.run_report('--schema')
         schema = json.loads(out)
-        self.assertEqual(schema['schema'], 'int, record format: 5; a record without it is 1')
+        self.assertEqual(schema['schema'], 'int, record format: 6; a record without it is 1')
         self.assertIn('"agent_id"', schema['steps'])
         self.assertIn('every kind but simplify', schema['steps'])
 
@@ -574,12 +575,14 @@ class Report(unittest.TestCase):
 
     def test_json_carries_the_category_list(self):
         cats = self.json()['categories']
-        self.assertEqual((cats['version'], sorted(cats['validity'])), (1, ['invalid', 'unclear', 'valid']))
+        self.assertEqual((cats['version'], sorted(cats['validity'])), (2, ['invalid', 'unclear', 'valid']))
         self.assertTrue(cats['rule'].startswith('Name the problem, not its fix'))
         self.assertEqual([(a['area'], a['steps']) for a in cats['areas']],
                          [('plan', ['plan_simplify', 'plan_review']), ('implementation', ['task_review', 'final_review']),
-                          ('cleanup', ['simplify'])])
-        plan, implementation, cleanup = (a['list'] for a in cats['areas'])
+                          ('cleanup', ['simplify']), ('kit', ['kit_review'])])
+        plan, implementation, cleanup, kit = (a['list'] for a in cats['areas'])
+        self.assertEqual(kit, [{'id': 'kit', 'label': 'Kit finding', 'means': "A finding from a kit's own review; its "
+                                "`label` is the kit's own name for the rule it breaks."}])
         self.assertEqual([c['id'] for c in plan],
                          ['scope', 'task_split', 'spec_gap', 'risk_missed', 'test_plan', 'code_facts'])
         self.assertEqual([c['id'] for c in implementation],
@@ -2204,6 +2207,351 @@ class HealthCheck(Report):
         self.assertEqual(run['record']['waves'], waves)
         self.assertEqual([s['wave'] for s in run['steps']], [None, None, 'A', None, None])
 
+    KIT_STEP = {'step': 'kit_review', 'task': 3, 'round': 0, 'agent': 'kit-reviewer', 'kit': 'standin',
+                'counts': {'critical': 0, 'important': 1, 'minor': 0},
+                'findings': [{'id': 'F1', 'severity': 'important', 'category': 'kit', 'label': 'one value per cell',
+                              'validity': 'valid', 'summary': 's', 'outcome': 'fixed'}]}
+    KITS = [{'name': 'standin', 'version': '0.1.0', 'tasks': [3], 'files': ['/k/standin/guidance.md']}]
+    KIT_CHECKS = [{'kit': 'standin', 'task': 3, 'result': 'passed'}]
+
+    def test_json_carries_a_runs_kits_checks_and_kit_steps(self):
+        self.records([run_record(schema=6, categories=2, steps=[self.KIT_STEP], kits=self.KITS,
+                                 kit_checks=self.KIT_CHECKS)])
+        run = self.json()['runs'][0]
+        self.assertEqual((run['kits'], run['kit_checks']), (self.KITS, self.KIT_CHECKS))
+        step = run['steps'][0]
+        self.assertEqual((step['step'], step['kit']), ('kit_review', 'standin'))
+        self.assertEqual((step['findings'][0]['label'], step['findings'][0]['category']),
+                         ('one value per cell', 'kit'))
+
+    KIT_RULES = '/Users/me/.claude/docs/kits.md'
+    GUIDANCE = '/k/standin/guidance.md'
+
+    def read(self, path):
+        """A row whose Read call reads path."""
+        return asst(f'read-{self.clock}', content=[tool_use(f'rd{self.clock}', 'Read', {'file_path': path})],
+                    ts=self.ts())
+
+    def kit_run(self, report='Findings: critical=0 important=1 minor=0', steps=None, description='Kit review: task 3',
+                rows=(), reads=(KIT_RULES,), implementer=(GUIDANCE,), reviewer_reads=(), **over):
+        """A schema 6 run with KITS and KIT_CHECKS (over replaces any record field) whose main transcript Reads reads,
+        then launches a kit-reviewer kr reporting report whose transcript then Reads reviewer_reads, then rows, then
+        an implementer im whose transcript Reads implementer (no im when None), with steps, else KIT_STEP tied to kr,
+        and SIMPLIFY_STEP."""
+        dispatched = [self.read(path) for path in reads]
+        dispatched += self.reviewed('kr', report, subagent_type='kit-reviewer', description=description)
+        if reviewer_reads:
+            self.subagent('kit-reviewer', [self.read(path) for path in reviewer_reads], project='proj', aid='kr',
+                          tid='kr')
+        dispatched += list(rows)
+        if implementer is not None:
+            self.subagent('implementer', [self.read(path) for path in implementer] or [asst('im-0', ts=self.ts())],
+                          project='proj', aid='im', tid='im')
+            dispatched += self.agent('im', subagent_type='implementer', description='Implement task 3')
+        steps = [dict(self.KIT_STEP, agent_id='kr')] if steps is None else steps
+        record = dict(schema=6, categories=2, kits=self.KITS, kit_checks=self.KIT_CHECKS)
+        record.update(over)
+        self.schema2_run(steps + [SIMPLIFY_STEP], dispatched, **record)
+
+    def test_a_kit_reviewer_dispatch_is_a_kit_review_step(self):
+        self.kit_run('Findings: critical=0 important=1 minor=0')
+        run = self.json()['runs'][0]
+        dispatch = run['dispatches'][0]
+        self.assertEqual((dispatch['kind'], dispatch['counts'], dispatch['step']),
+                         ('kit_review', {'critical': 0, 'important': 1, 'minor': 0}, 0))
+        self.assertIsNotNone(run['steps'][0]['time'])
+        self.assertEqual([line for line in self.health() if line.startswith('WARN')], [])
+
+    def test_a_kit_review_whose_counts_differ_is_warned(self):
+        self.kit_run('Findings: critical=0 important=2 minor=0')
+        warnings = self.json()['runs'][0]['warnings']
+        self.assertEqual([w['kind'] for w in warnings], ['step_counts_differ'])
+        self.assertIn('kit_review', warnings[0]['text'])
+        self.assertEqual(warnings[0]['step']['step'], 'kit_review')
+
+    def test_a_recheck_by_kit_reviewer_is_a_fix_check(self):
+        for description, kind in (('Re-check kit findings: task 3', 'fix_check'), ('re-check kit findings', 'fix_check'),
+                                  ('Recheck kit findings', 'fix_check'),
+                                  ('Kit review: task 3 (re-check not needed)', 'kit_review')):
+            with self.subTest(description=description):
+                self.tearDown()
+                self.setUp()
+                self.kit_run('Verdicts: fixed=1 not_proportionate=0 open=0', description=description)
+                self.assertEqual(self.json()['runs'][0]['dispatches'][0]['kind'], kind)
+        self.tearDown()
+        self.setUp()
+        review = dict(self.KIT_STEP, agent_id='kr',
+                      findings=[dict(self.KIT_STEP['findings'][0], verdicts=['fixed'])])
+        check = {'step': 'fix_check', 'task': 3, 'round': 1, 'agent': 'kit-reviewer', 'kit': 'standin',
+                 'agent_id': 'kc', 'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}
+        recheck = self.reviewed('kc', 'Verdicts: fixed=1 not_proportionate=0 open=0', subagent_type='kit-reviewer',
+                                description='Re-check kit findings: task 3')
+        self.kit_run('Findings: critical=0 important=1 minor=0', steps=[review, check], rows=recheck,
+                     implementer=None)
+        self.assertEqual([line for line in self.health() if line.startswith('WARN')], [])
+        run = self.json()['runs'][0]
+        self.assertEqual([d['step'] for d in run['dispatches']], [0, 1])
+        self.assertEqual((run['steps'][1]['step'], run['steps'][1]['kit']), ('fix_check', 'standin'))
+
+    def test_a_kit_reviews_spend_is_its_own_phase(self):
+        dispatched = self.reviewed('kr', 'Findings: critical=0 important=1 minor=0', u=usage(None, 30000, 0),
+                                   subagent_type='kit-reviewer', description='Kit review: task 3')
+        self.schema2_run([dict(self.KIT_STEP, agent_id='kr'), SIMPLIFY_STEP], dispatched, schema=6, categories=2,
+                         kits=self.KITS, kit_checks=self.KIT_CHECKS)
+        self.assertEqual(phase_inputs(self.json()['runs'][0])['kit_review'], 30000)
+
+    def kit_kinds(self):
+        return [k for k in self.kinds() if k.startswith('kit_')]
+
+    def test_a_kit_run_with_everything_in_place_is_clean(self):
+        self.kit_run()
+        self.assertEqual(self.health(), ['Health: no problems'])
+        self.assertEqual(self.kinds(), [])
+
+    def test_a_kit_task_without_its_review_step_is_warned(self):
+        self.kit_run(steps=[], rows=())
+        warnings = [w for w in self.json()['runs'][0]['warnings'] if w['kind'] == 'kit_review_missing']
+        self.assertEqual([w['text'] for w in warnings],
+                         ['WARN: b (2026-11-05): task 3 carries kit standin but has no kit review step'])
+        self.assertEqual((warnings[0]['step']['step'], warnings[0]['step']['task']), ('kit_review', 3))
+
+    def test_a_kit_task_without_its_check_is_warned(self):
+        self.kit_run(kit_checks=[])
+        self.assertEqual(self.kit_kinds(), ['kit_check_missing'])
+        self.assertIn("WARN: b (2026-11-05): kit standin's checks did not run on task 3", self.health())
+
+    def test_a_kit_task_left_unverified_is_warned(self):
+        for result in ('couldnt_run', 'failed'):
+            with self.subTest(result=result):
+                self.tearDown()
+                self.setUp()
+                self.kit_run(kit_checks=[dict(self.KIT_CHECKS[0], result=result)])
+                self.assertEqual(self.kit_kinds(), ['kit_unverified'])
+                self.assertIn(f"WARN: b (2026-11-05): kit standin's checks ended {result} on task 3", self.health())
+
+    def test_a_kit_run_that_never_read_the_rules_is_warned(self):
+        self.kit_run(reads=())
+        self.assertEqual(self.kit_kinds(), ['kit_rules_unread'])
+        self.tearDown()
+        self.setUp()
+        self.kit_run(reads=(), implementer=(self.GUIDANCE, self.KIT_RULES))
+        self.assertEqual(self.kit_kinds(), ['kit_rules_unread'])
+        self.assertIn('WARN: b (2026-11-05): a kit ran but the kits rules file was never read', self.health())
+
+    def test_a_kit_file_no_implementer_read_is_warned(self):
+        self.kit_run(implementer=(), reviewer_reads=(self.GUIDANCE,))
+        warnings = [w for w in self.json()['runs'][0]['warnings'] if w['kind'].startswith('kit_')]
+        self.assertEqual([(w['kind'], w['text'], w['agent']) for w in warnings],
+                         [('kit_file_unread', "WARN: b (2026-11-05): kit standin's file guidance.md was read by no "
+                                              'implementer', 'implementer')])
+
+    def shell(self, command):
+        """A row whose Bash call runs command."""
+        return asst(f'sh-{self.clock}', content=[tool_use(f'sh{self.clock}', 'Bash', {'command': command})],
+                    ts=self.ts())
+
+    def test_kit_files_read_through_bash_count_as_read(self):
+        guidance = os.path.join(os.path.expanduser('~'), '.claude', 'kits', 'standin', 'guidance.md')
+        kits = [dict(self.KITS[0], files=[guidance, self.GUIDANCE])]
+        rows = [self.shell('cat ~/.claude/docs/kits.md'), self.shell('head -200 ~/.claude/kits/standin/guidance.md'),
+                self.shell(f'cat "{self.GUIDANCE}" | head')]
+        self.kit_run(reads=(), rows=rows, implementer=None, kits=kits)
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_an_implementer_reading_a_kit_file_through_bash_counts(self):
+        self.subagent('implementer', [self.shell(f'cat {self.GUIDANCE}')], project='proj', aid='im', tid='im')
+        self.kit_run(implementer=None, rows=self.agent('im', subagent_type='implementer', description='Implement'))
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_a_bash_command_naming_no_kit_file_leaves_the_warnings(self):
+        self.subagent('implementer', [self.shell('cat /k/standin/other.md')], project='proj', aid='im', tid='im')
+        rows = [self.shell('cat ~/.claude/docs/kits.md.bak; ls /k/standin')]
+        rows += self.agent('im', subagent_type='implementer', description='Implement')
+        self.kit_run(reads=(), implementer=None, rows=rows)
+        self.assertEqual(self.kit_kinds(), ['kit_rules_unread', 'kit_file_unread'])
+
+    def test_home_written_as_a_variable_counts(self):
+        guidance = os.path.join(os.path.expanduser('~'), '.claude', 'kits', 'standin', 'guidance.md')
+        kits = [dict(self.KITS[0], files=[guidance])]
+        for command in ('cd /x && cat "$HOME/.claude/kits/standin/guidance.md"',
+                        'cat ${HOME}/.claude/kits/standin/guidance.md'):
+            with self.subTest(command=command):
+                self.tearDown()
+                self.setUp()
+                self.kit_run(reads=(), implementer=(), kits=kits,
+                             rows=[self.shell('cat "$HOME/.claude/docs/kits.md"'), self.shell(command)])
+                self.assertEqual(self.kit_kinds(), [])
+
+    def test_a_bash_command_that_reads_no_file_counts_for_nothing(self):
+        guidance = os.path.join(os.path.expanduser('~'), '.claude', 'kits', 'standin', 'guidance.md')
+        kits = [dict(self.KITS[0], files=[guidance])]
+        rows = [self.shell('ls ~/.claude/kits/standin/guidance.md ~/.claude/docs/kits.md'),
+                self.shell('git add ~/.claude/kits/standin/guidance.md')]
+        self.kit_run(reads=(), implementer=(), rows=rows, kits=kits)
+        self.assertEqual(self.kit_kinds(), ['kit_rules_unread', 'kit_file_unread'])
+
+    def test_the_record_write_naming_the_kit_files_is_no_read(self):
+        record = json.dumps({'kits': self.KITS})
+        for command in (f"echo '{record}' >> \"$HOME/.claude/workflow-log.jsonl\"",
+                        f"cat >> ~/.claude/workflow-log.jsonl <<'EOF'\n{record}\nEOF"):
+            with self.subTest(command=command):
+                self.tearDown()
+                self.setUp()
+                self.kit_run(implementer=(), rows=[self.shell(command)])
+                self.assertEqual(self.kit_kinds(), ['kit_file_unread'])
+
+    def test_the_rules_read_before_the_run_started_counts(self):
+        early = asst('read-early', content=[tool_use('rd-early', 'Read', {'file_path': self.KIT_RULES})],
+                     ts='2026-11-05T09:59:58.000Z')
+        self.kit_run(reads=(), rows=[early])
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_every_command_of_a_bash_call_reads_its_files(self):
+        home = os.path.expanduser('~')
+        kit = os.path.join(home, '.claude', 'kits', 'standin')
+        kits = [dict(self.KITS[0], files=[os.path.join(kit, name) for name in ('kit.json', 'design.md',
+                                                                                'guidance.md')])]
+        rows = [self.shell('date -u +%FT%TZ; cat ~/.claude/docs/kits.md; echo ----; ls ~/.claude/kits'),
+                self.shell('cd ~/.claude/kits/standin; cat kit.json; echo ----; cat design.md; echo ----; '
+                           'cat guidance.md')]
+        self.kit_run(reads=(), implementer=(), rows=rows, kits=kits)
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_a_relative_path_resolves_against_the_last_cd_before_it(self):
+        home = os.path.expanduser('~')
+        files = ['/a/x.md', os.path.join(home, 'y.md'), '/abs.md', 'rel.md']
+        rows = [self.shell('cd /a && cat x.md | head; cd ${HOME}/b || cat ../y.md && cat /abs.md'),
+                self.shell('cat rel.md')]
+        self.kit_run(implementer=(), rows=rows, kits=[dict(self.KITS[0], files=files)])
+        self.assertEqual(self.kit_kinds(), [])
+        self.tearDown()
+        self.setUp()
+        self.kit_run(implementer=(), rows=[self.shell('cat x.md; cd /b; cat y.md')],
+                     kits=[dict(self.KITS[0], files=['/b/x.md', '/y.md'])])
+        self.assertEqual(self.kit_kinds(), ['kit_file_unread', 'kit_file_unread'])
+
+    def test_a_redirect_or_heredoc_body_is_no_read(self):
+        rows = [self.shell('cd /a; echo hi > out.md; sed -n 1p < in.md; cat >> log.md <<EOF\ncat body.md\nEOF')]
+        files = ['/a/out.md', '/a/in.md', '/a/body.md', '/a/log.md']
+        self.kit_run(implementer=(), rows=rows, kits=[dict(self.KITS[0], files=files)])
+        self.assertEqual(self.kit_kinds(), ['kit_file_unread'] * 4)
+
+    def test_a_kit_review_with_no_task_covers_every_kit_task(self):
+        kits = [dict(self.KITS[0], tasks=[3, 4])]
+        checks = [{'kit': 'standin', 'task': t, 'result': 'couldnt_run'} for t in (3, 4)]
+        step = {k: v for k, v in self.KIT_STEP.items() if k != 'task'}
+        self.kit_run(steps=[dict(step, agent_id='kr')], path='full', kits=kits, kit_checks=checks,
+                     description='Kit review: catch-up')
+        self.assertNotIn('kit_review_missing', self.kinds())
+
+    def test_no_implementer_transcript_means_no_unread_warning(self):
+        self.kit_run(implementer=None, rows=self.agent('im', subagent_type='implementer', description='Implement'))
+        self.assertNotIn('kit_file_unread', self.kinds())
+
+    def test_a_small_run_with_a_kit_matches_by_kit_alone(self):
+        kits = [dict(self.KITS[0], tasks=[])]
+        step = {k: v for k, v in self.KIT_STEP.items() if k != 'task'}
+        small = dict(path='small', kits=kits, kit_checks=[{'kit': 'standin', 'result': 'passed'}],
+                     reads=(self.KIT_RULES, self.GUIDANCE), implementer=None)
+        self.kit_run(steps=[dict(step, agent_id='kr')], **small)
+        self.assertEqual(self.kit_kinds(), [])
+        self.tearDown()
+        self.setUp()
+        self.kit_run(steps=[], **small)
+        self.assertEqual(self.kit_kinds(), ['kit_review_missing'])
+        self.assertIn('WARN: b (2026-11-05): kit standin has no kit review step', self.health())
+
+    def test_a_small_runs_kit_recheck_after_the_final_review_is_a_final_fix_check(self):
+        kits = [dict(self.KITS[0], tasks=[])]
+        review = dict({k: v for k, v in self.KIT_STEP.items() if k != 'task'}, agent_id='kr',
+                      findings=[dict(self.KIT_STEP['findings'][0], verdicts=['fixed'])])
+        final = dict(FINAL_STEP, agent_id='fr', strengths=[{'category': 'tests', 'summary': 's'}])
+        recheck = {'step': 'final_fix_check', 'agent': 'kit-reviewer', 'kit': 'standin', 'agent_id': 'kc',
+                   'counts': {'fixed': 1, 'not_proportionate': 0, 'open': 0}}
+        rows = self.reviewed('fr', CLEAN, subagent_type='final-reviewer', description='Final review')
+        rows += self.reviewed('kc', 'Verdicts: fixed=1 not_proportionate=0 open=0', subagent_type='kit-reviewer',
+                              description='Re-check kit findings')
+        self.kit_run(steps=[review, final, recheck], rows=rows, path='small', kits=kits, implementer=None,
+                     kit_checks=[{'kit': 'standin', 'result': 'passed'}], reads=(self.KIT_RULES, self.GUIDANCE))
+        self.assertEqual([line for line in self.health() if line.startswith('WARN')], [])
+        run = self.json()['runs'][0]
+        self.assertEqual([(d['kind'], d['step']) for d in run['dispatches']],
+                         [('kit_review', 0), ('final_review', 1), ('final_fix_check', 2)])
+        self.assertEqual(run['steps'][2]['kit'], 'standin')
+
+    def plan_file(self):
+        plan = os.path.join(self.root, 'plan.md')
+        with open(plan, 'w') as f:
+            f.write('# Plan\n\n### Task 3: one\n\n**Kit:** standin\n\n### Task 4: two\n\n**Kit:** exempt: a typo\n\n'
+                    '### Task 5: three\n\n**Files:**\n**Kit:** standin [alpha]; tags: motion\n\n## After\n\n'
+                    '**Kit:** other\n')
+        return plan
+
+    def test_a_plan_with_kit_tasks_the_record_does_not_name_is_warned(self):
+        plan = self.plan_file()
+        self.schema2_run([SIMPLIFY_STEP], [], schema=6, categories=2, kits=[], plan=plan)
+        warnings = [w for w in self.json()['runs'][0]['warnings'] if w['kind'].startswith('kit_')]
+        self.assertEqual([(w['kind'], w['text']) for w in warnings],
+                         [('kit_unrecorded', 'WARN: b (2026-11-05): the plan marks tasks 3, 5 with kit standin but '
+                                             'the record names no such kit')])
+        cases = (('recorded', dict(kits=self.KITS, plan=plan)), ('missing file', dict(kits=[], plan=plan + '.gone')),
+                 ('no plan', dict(kits=[])))
+        for name, over in cases:
+            with self.subTest(case=name):
+                self.tearDown()
+                self.setUp()
+                self.schema2_run([SIMPLIFY_STEP], [], schema=6, categories=2, **over)
+                self.assertNotIn('kit_unrecorded', self.kinds())
+
+    def test_a_plan_record_of_a_kit_plan_gets_no_kit_warning(self):
+        plan = self.plan_file()
+        self.schema2_run([SIMPLIFY_STEP], [], schema=6, categories=2, path='plan', kits=[], plan=plan)
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_a_relative_plan_is_read_from_the_project(self):
+        self.plan_file()
+        self.schema2_run([SIMPLIFY_STEP], [], schema=6, categories=2, kits=[], plan='plan.md', project=self.root)
+        self.assertEqual(self.kit_kinds(), ['kit_unrecorded'])
+
+    def test_a_kit_review_step_for_an_unrecorded_kit_is_warned(self):
+        self.kit_run(kits=[])
+        self.assertEqual(self.kit_kinds(), ['kit_unrecorded'])
+        self.assertIn('WARN: b (2026-11-05): kit standin was reviewed but the record names no such kit', self.health())
+
+    def test_runs_without_kits_get_no_kit_warning(self):
+        self.schema2_run([SIMPLIFY_STEP], [], schema=5, categories=2, kits=self.KITS, kit_checks=[])
+        self.assertEqual(self.kit_kinds(), [])
+        self.tearDown()
+        self.setUp()
+        self.schema2_run([SIMPLIFY_STEP], [], schema=6, categories=2, kits=[])
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_malformed_kits_and_kit_checks_are_dropped_or_read_as_absent(self):
+        kits = [3, {'version': '1'}, {'name': 'k', 'tasks': [1, True, 'x'], 'files': ['/f', 4]}]
+        checks = ['x', {'kit': 'k', 'result': 'nonsense'}, {'kit': 'k', 'result': 'couldnt_run', 'task': 'x'}]
+        self.records([run_record(schema=6, steps=[], kits=kits, kit_checks=checks),
+                      run_record(branch='odd', schema=6, steps=[], kits='x', kit_checks=5)])
+        runs = {r['record']['branch']: r for r in self.json()['runs']}
+        self.assertEqual(runs['b']['kits'], [{'name': 'k', 'version': None, 'tasks': [1], 'files': ['/f']}])
+        self.assertEqual(runs['b']['kit_checks'], [{'kit': 'k', 'task': None, 'result': 'couldnt_run'}])
+        self.assertEqual((runs['odd']['kits'], runs['odd']['kit_checks']), ([], []))
+
+    def test_a_record_before_schema_6_has_no_kits(self):
+        steps = [{'step': 'task_review', 'task': 1, 'round': 0, 'counts': {}, 'findings': [{'id': 'F1'}]}]
+        self.records([run_record(schema=5, categories=1, steps=steps)])
+        run = self.json()['runs'][0]
+        self.assertEqual((run['kits'], run['kit_checks']), ([], []))
+        self.assertEqual([s['kit'] for s in run['steps']], [None])
+        self.assertIsNone(run['steps'][0]['findings'][0]['label'])
+
+    def test_schema_prints_format_6_and_the_kit_fields(self):
+        schema = json.loads(self.run_report('--schema'))
+        self.assertIn('record format: 6', schema['schema'])
+        self.assertIn('kits', schema)
+        self.assertIn('kit_checks', schema)
+        for name in ('"kit_review"', '"kit"', '"label"', 'kit_review critical, important, minor'):
+            self.assertIn(name, schema['steps'])
+
     def test_a_runs_cleaned_waves_reach_json_and_the_page(self):
         self.records([run_record(schema=2, steps=[], waves=[{'wave': 'A', 'tasks': [3, 4], 'conflicts': 1},
                                                             {'wave': 'B', 'tasks': 'x'}, 'not a dict'])])
@@ -2969,12 +3317,13 @@ class HealthCheck(Report):
         self.assertEqual(self.json()['totals']['skills']['simplify']['outcomes'], {'none': 1})
 
     def cache_fixture(self):
-        """A covered run with a reviewed final review, and a second session with an advisor iteration, a hook decision
-        and a typed trigger."""
+        """A covered kit run with a reviewed final review, and a second session with an advisor iteration, a hook
+        decision and a typed trigger."""
         rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
                              sub_model='claude-fable-5-1', sub_effort='high', subagent_type='final-reviewer',
                              description='Final review')
-        self.schema2_run([SIMPLIFY_STEP, {'step': 'final_review', 'counts': {}, 'findings': []}], rows)
+        self.kit_run(steps=[dict(self.KIT_STEP, agent_id='kr'), {'step': 'final_review', 'counts': {}, 'findings': []}],
+                     rows=rows)
         self.session([asst('adv', iterations=[executor(), ADVISOR], ts=self.ts()),
                       hook_row('guard-main-commit.py', decision('ask', 'commit on main'), ts=self.ts()),
                       user('grill me', ts=self.ts())], project='proj', sid='sess-2')

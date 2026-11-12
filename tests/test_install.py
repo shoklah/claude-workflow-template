@@ -19,8 +19,8 @@ CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
 
 AGENTS = ['final-reviewer.md', 'fix-checker.md', 'implementer-copy.md', 'implementer-escalated.md',
-          'implementer.md', 'plan-reviewer.md', 'plan-simplifier.md', 'sweeper.md', 'task-reviewer.md']
-SCRIPTS = ['failing-test-check.py', 'wave.py', 'workflow-report.py']
+          'implementer.md', 'kit-reviewer.md', 'plan-reviewer.md', 'plan-simplifier.md', 'sweeper.md', 'task-reviewer.md']
+SCRIPTS = ['failing-test-check.py', 'kit.py', 'wave.py', 'workflow-report.py']
 SKILLS = ['workflow-dashboard']
 HOOK_FILES = ['guard-agent-dispatch.py', 'guard-main-commit.py', 'remind-context-cap.py',
               'session-start-superpowers.sh']
@@ -291,8 +291,15 @@ class AgentsAndScripts(HomeFixture):
                 self.assertEqual(read(self.path('skills', name, 'SKILL.md'), 'rb'),
                                  read(os.path.join(ROOT, 'skills', name, 'SKILL.md'), 'rb'))
 
+    def test_docs_copy_into_place(self):
+        write(self.path('docs', 'another-doc.md'), 'theirs\n')
+        self.ok('docs')
+        self.assertEqual(sorted(os.listdir(self.path('docs'))), ['another-doc.md', 'kits.md'])
+        self.assertEqual(read(self.path('docs', 'another-doc.md')), 'theirs\n')
+        self.assertEqual(read(self.path('docs', 'kits.md'), 'rb'), read(os.path.join(ROOT, 'claude-md', 'kits.md'), 'rb'))
+
     def test_usage_errors_exit_2(self):
-        for args in ((), ('nonsense',), ('rollback',), ('agents', 'extra'), ('rollback', 'a', 'b')):
+        for args in ((), ('nonsense',), ('rollback',), ('agents', 'extra'), ('docs', 'extra'), ('rollback', 'a', 'b')):
             with self.subTest(args=args):
                 p = self.run_install(*args)
                 self.assertEqual(p.returncode, 2)

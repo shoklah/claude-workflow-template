@@ -20,7 +20,7 @@ You check an implementation plan in one pass for one question: is it heavier tha
 
 Report each finding with its plan location, what to cut or replace, the smaller form and the evidence: the spec line it fails to trace to, or the existing helper. Each finding also names one category id from the list below, under its rule. Items the spec doesn't require are findings like any other. Then list the spec flags separately, each with its category id.
 
-**Categories:** a copy of `CATEGORIES` in `scripts/workflow-report.py`, version 1; keep them the same. Name the problem, not its fix. A wrong exit code is `error_handling` even when the fix adds a test; a finding is `tests` only when the code is right and its tests are missing or wrong. When two categories still fit, pick the more specific one.
+**Categories:** a copy of `CATEGORIES` in `scripts/workflow-report.py`, version 2; keep them the same. Name the problem, not its fix. A wrong exit code is `error_handling` even when the fix adds a test; a finding is `tests` only when the code is right and its tests are missing or wrong. When two categories still fit, pick the more specific one.
 - `scope`: The plan's work differs from the spec's: work missing, work the spec doesn't ask for (including new code where existing code would do), or a step that contradicts the spec.
 - `task_split`: Tasks too big or too small, in the wrong order, depending on each other when they shouldn't, or grouped into a wave that breaks its rules.
 - `spec_gap`: The spec itself leaves out or gets wrong something the plan needs, so the plan has to guess.

@@ -30,6 +30,7 @@ ROLES = {
     'fix-checker': ('sonnet', 'medium', REVIEWER_TOOLS, None),
     'final-reviewer': ('opus', 'high', REVIEWER_TOOLS, [GUIDELINES]),
     'sweeper': ('haiku', 'medium', REVIEWER_TOOLS, None),
+    'kit-reviewer': ('opus', 'high', REVIEWER_TOOLS, None),
 }
 
 
@@ -80,12 +81,15 @@ class AgentFiles(unittest.TestCase):
                  'plan-simplifier': '`Findings: cuts=N flags=N strengths=N`',
                  'plan-reviewer': '`Findings: findings=N strengths=N`',
                  'task-reviewer': '`Findings: critical=N important=N minor=N strengths=N`',
-                 'final-reviewer': '`Findings: critical=N important=N minor=N unneeded=N strengths=N`'}
+                 'final-reviewer': '`Findings: critical=N important=N minor=N unneeded=N strengths=N`',
+                 'kit-reviewer': '`Findings: critical=N important=N minor=N`'}
         for name, line in lines.items():
             with self.subTest(agent=name):
                 _, body = frontmatter(read(os.path.join('agents', name + '.md')))
                 self.assertIn(line, body)
                 self.assertIn('End your report with this line', body)
+        _, body = frontmatter(read(os.path.join('agents', 'kit-reviewer.md')))
+        self.assertIn('`Verdicts: fixed=N not_proportionate=N open=N`', body)
 
     def schema_categories(self):
         script = os.path.join(ROOT, 'scripts', 'workflow-report.py')
@@ -97,7 +101,8 @@ class AgentFiles(unittest.TestCase):
         cats = self.schema_categories()
         lists = {a['area']: a['list'] for a in cats['areas']}
         for name, area in (('plan-reviewer', 'plan'), ('plan-simplifier', 'plan'),
-                           ('task-reviewer', 'implementation'), ('final-reviewer', 'implementation')):
+                           ('task-reviewer', 'implementation'), ('final-reviewer', 'implementation'),
+                           ('kit-reviewer', 'kit')):
             with self.subTest(agent=name):
                 _, body = frontmatter(read(os.path.join('agents', name + '.md')))
                 lines = body.splitlines()
@@ -216,6 +221,24 @@ class AgentFiles(unittest.TestCase):
         for must in ('**Wave:**', 'same part', 'sibling', 'at most 3'):
             with self.subTest(must=must):
                 self.assertIn(must, body)
+
+    def test_section_points_to_the_kits_rules(self):
+        text = read('claude-md/agentic-workflow.md')
+        for must in ('**Kits:**', '## Kits', '**Kit:**', '~/.claude/docs/kits.md'):
+            self.assertIn(must, text)
+        self.assertLessEqual(len(text.splitlines()), 30)
+
+    def test_kits_rules_hold_the_contract(self):
+        text = read('claude-md/kits.md')
+        for must in ('kit.py show', 'applies_when', '**Kit:** exempt:', '; tags:', 'kit-reviewer', 'task-reviewer',
+                     'final-reviewer', 'starts with `Re-check`', 'not verified', 'never stops a run', 'start no server',
+                     'kits', 'kit_checks', 'kit_review', 'fix_check', 'workflow-archive', 'offer no pull request'):
+            self.assertIn(must, text)
+
+    def test_plan_reviewer_checks_kit_tasks_both_ways(self):
+        _, body = frontmatter(read('agents/plan-reviewer.md'))
+        for must in ('## Kits', 'kit.py show', 'applies_when', '**Kit:** exempt:', 'unmarked'):
+            self.assertIn(must, body)
 
     def test_section_holds_the_rules_and_monitoring_contract(self):
         text = read('claude-md/agentic-workflow.md')
