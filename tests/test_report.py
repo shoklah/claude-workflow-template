@@ -1442,15 +1442,20 @@ class HealthCheck(Report):
         added = change('CLAUDE.md', 'feat: record two conventions', text='- new rule\n\n- second new rule\n')
         elsewhere = change('CLAUDE.md', 'feat: a note elsewhere', text='\n## Notes\n\n- a note\n')
         none = change('code.txt', 'feat: code only')
+        # its own head: a record is tied to its record write by its head
+        more = change('code.txt', 'feat: more code')
         open_finding = ('### Important\n\n1. The new helper is a convention: record it under `## Code conventions`.\n\n'
                         'Findings: critical=0 important=1 minor=0 unneeded=0')
         minor_only = ('### Important\n\n1. A bug in code.txt.\n\n### Minor\n\n1. Maybe note it under '
                       '`## Code conventions`.\n\nFindings: critical=0 important=1 minor=1 unneeded=0')
+        contradicted = ('### Important\n\n1. The colour contradicts the `## Code conventions` entry on the palette.\n\n'
+                        'Findings: critical=0 important=1 minor=0 unneeded=0')
         found = {'critical': 0, 'important': 1, 'minor': 0, 'unneeded': 0}
         self.run_on_repo(repo, [
             (run_record(branch='added', base=base, head=added, final_findings=found), open_finding),
             (run_record(branch='elsewhere', base=added, head=elsewhere, final_findings=found), open_finding),
             (run_record(branch='minor', base=elsewhere, head=none, final_findings=dict(found, minor=1)), minor_only),
+            (run_record(branch='contradicted', base=none, head=more, final_findings=found), contradicted),
         ])
         self.assertEqual(self.health(), [
             'WARN: elsewhere (2026-11-05): final review asked for a ## Code conventions entry but the branch added none'])

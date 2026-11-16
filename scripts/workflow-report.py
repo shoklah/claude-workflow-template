@@ -275,7 +275,8 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'),
            ('2026-11-12', 'Context cap hook and the no-offer warning', 'claude-workflow#34'),
            ('2026-11-12', 'Kits: topic packs with a design step, checks and review', 'claude-workflow#35'),
-           ('2026-11-16', "The final review's unneeded items recorded as findings", 'claude-workflow#38'))
+           ('2026-11-16', "The final review's unneeded items recorded as findings", 'claude-workflow#38'),
+           ('2026-11-16', "A session's own review fixes take the fix-round commit subject", 'claude-workflow#39'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
@@ -1882,13 +1883,14 @@ def pairs(counts):
 
 def asks_for_conventions(report):
     """Whether the report has an Important finding that mentions ## Code conventions: on a line starting with
-    Important, or under an Important heading up to the next severity or heading."""
+    Important, or under an Important heading up to the next severity or heading. A line saying the code contradicts
+    an entry cites one that exists, so it asks for none."""
     severity = None
     for line in report.splitlines():
         m = SEVERITY.match(line)
         if m or line.startswith('#'):
             severity = m.group(1).lower() if m else None
-        if severity == 'important' and CONVENTIONS in line:
+        if severity == 'important' and CONVENTIONS in line and 'contradict' not in line.lower():
             return True
     return False
 
