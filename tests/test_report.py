@@ -510,6 +510,8 @@ class Report(unittest.TestCase):
             self.assertIn(key, schema)
         for outcome in ('fixed', 'applied', 'declined', 'deferred', 'ruled', 'open', 'to_owner'):
             self.assertIn(outcome, schema['steps'])
+        # ADDS_UP tallies a final review's findings by severity against its counts, "unneeded" included.
+        self.assertIn('"severity": "critical"|"important"|"minor", or "unneeded" for', schema['steps'])
         self.assertIn('"plan"', schema['path'])
 
     def test_schema_1_and_2_records_and_a_plan_record_are_all_read(self):

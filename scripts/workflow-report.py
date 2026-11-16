@@ -204,8 +204,9 @@ SCHEMA = {
              'kit\'s name, on a kit_review step and on a fix-check that kit-reviewer ran (schema 6), "counts": '
              '{keys of the step\'s count line: reviews critical, important, minor, plus unneeded for the final review; '
              'plan_simplify cuts, flags; plan_review findings; fix-checks fixed, not_proportionate, open; simplify '
-             'applied, skipped; kit_review critical, important, minor}, "findings" (every step but fix-checks): [{"id": "F7", "severity" (or "kind": '
-             '"cut"|"flag" for plan_simplify), "summary", '
+             'applied, skipped; kit_review critical, important, minor}, "findings" (every step but fix-checks): [{"id": "F7", '
+             '"severity": "critical"|"important"|"minor", or "unneeded" for an item of the final review\'s list of '
+             'what the spec doesn\'t require (or "kind": "cut"|"flag" for plan_simplify), "summary", '
              '"outcome": ' + '|'.join(f'"{o}"' for o in OUTCOMES)
              + ', "reason" (required for declined and ruled), "closed_round": N, "category": an id from its step\'s '
              'area list in "category_list", the reviewer\'s, "validity": "valid"|"invalid"|"unclear", the '
@@ -273,7 +274,8 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-11', 'Final review pairs', 'claude-workflow#29'),
            ('2026-11-11', 'Implementer at medium, dated pin history, narrowed risk-area words', 'claude-workflow#28'),
            ('2026-11-12', 'Context cap hook and the no-offer warning', 'claude-workflow#34'),
-           ('2026-11-12', 'Kits: topic packs with a design step, checks and review', 'claude-workflow#35'))
+           ('2026-11-12', 'Kits: topic packs with a design step, checks and review', 'claude-workflow#35'),
+           ('2026-11-16', "The final review's unneeded items recorded as findings", 'claude-workflow#38'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
