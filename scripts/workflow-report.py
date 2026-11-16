@@ -20,7 +20,8 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               week's first WARN line with a count of the rest, or else the consultations with no note, then any
               commits on main since the last template export; the trial counts every run record
   --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
-              this week's sessions with no run record, for this week's plan reviews with no plan-simplifier
+              this week's sessions with no run record and no row in the last hour, for this week's plan reviews
+              with no plan-simplifier
               since the previous plan review, for this week's typed triggers whose skill never loaded, for this
               week's sessions outside every run with no startup guidelines, and for this week's main transcripts
               whose turns ended past the context cap with no handoff offer, or "Health: no problems"; for
@@ -342,6 +343,7 @@ BASH_PREFIX = re.compile(r'^(?:cd\s+[^;&]*?\s*(?:&&|;)\s*)*')
 FILE_READ_VERBS = ('cat', 'head', 'tail', 'less', 'sed', 'read')
 HOME_WORD = re.compile(r'^(?:~|\$HOME|\$\{HOME\})(?=/|$)')  # a path word's leading home folder
 HEALTH_DAYS = 7
+UNRECORDED_GRACE = datetime.timedelta(hours=1)  # a session this fresh is not yet missing its run record
 GIT_TIMEOUT = 30
 
 # Copied from hooks/guard-agent-dispatch.py, since scripts can't import each other: keep them the same.
@@ -438,7 +440,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 9
+CACHE_VERSION = 10
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -1523,16 +1525,21 @@ def bash_reads(command, home):
     """The files a Bash command reads: in each of its simple commands (split at ;|& and newlines, with heredoc bodies
     dropped and each cut at its first < or >) whose first word after BASH_PREFIX is one of FILE_READ_VERBS, each
     argument but options, a leading ~, $HOME or ${HOME} standing for home, and a relative one joined to the folder of
-    the last cd before it in the command."""
+    the last cd before it in the command; a `for` loop's variable stands for each of its words."""
     command = re.sub(r"<<-?\s*(['\"]?)(\w+)\1.*?(?:\n[ \t]*\2[ \t]*(?=\n|$)|$)", '', command, flags=re.S)
-    reads, folder = [], None
+    reads, folder, loops = [], None, {}
     for part in re.split(r'[;|&\n]', command):
         words = [HOME_WORD.sub(lambda m: home, word)
                  for word in re.findall(r"[^\s'\"`()]+", re.split(r'[<>]', bash_head(part), maxsplit=1)[0])]
-        if words[:1] == ['cd'] and words[1:]:
+        if words[:1] == ['do']:
+            words = words[1:]
+        if words[:1] == ['for'] and words[2:3] == ['in']:
+            loops['$' + words[1]] = loops['${' + words[1] + '}'] = words[3:]
+        elif words[:1] == ['cd'] and words[1:]:
             folder = os.path.join(folder or '', words[1])
         elif words[:1] and words[0] in FILE_READ_VERBS:
-            reads += [os.path.join(folder, word) if folder else word for word in words[1:] if not word.startswith('-')]
+            reads += [os.path.join(folder, word) if folder else word
+                      for arg in words[1:] for word in loops.get(arg, [arg]) if not word.startswith('-')]
     return reads
 
 
@@ -1636,13 +1643,18 @@ def run_spans(projects_root, records, now):
     value ends nothing. A run whose record write isn't found has no span, and a span ends at now at the latest, since
     rows after now are ignored. A handed-off run starts no earlier than the last record-writing row in each earlier
     transcript of its chain_paths, up to that one's handoff, so the window never holds an earlier run's rows.
+
+    When records share a "started", as a plan and its implementation in one session do, each ends at the first row
+    holding that "started" that also holds its own "date" value, if there is one, and starts no earlier than the end
+    of the one written before it in that transcript.
     """
     heads = [(i, re.compile(r'"head"\s*:\s*"' + re.escape(r['head'])))
              for i, r in enumerate(records) if isinstance(r.get('head'), str) and r['head']]
-    starts = [(i, re.compile(r'"started"\s*:\s*"' + re.escape(r['started']) + '"'), stamp(r['_started']))
+    starts = [(i, re.compile(r'"started"\s*:\s*"' + re.escape(r['started']) + '"'),
+               re.compile(r'"date"\s*:\s*"' + re.escape(field(r, 'date', str, '')) + '"'), stamp(r['_started']))
               for i, r in enumerate(records) if r['_started'] is not None]
-    by_start = {i for i, _, _ in starts}
-    spans, last, writes = {}, stamp(now), {}
+    by_start = {i for i, _, _, _ in starts}
+    spans, last, writes, dated = {}, stamp(now), {}, set()
     if not heads and not starts:
         return spans
     for path in main_transcripts(projects_root):
@@ -1653,9 +1665,14 @@ def run_spans(projects_root, records, now):
                 continue
             # A record built in a Python dict or an echo "..." string quotes its values with ' or \".
             command = command.replace('\\"', '"').replace("'", '"')
-            for i, written, started in starts:
-                if written.search(command):
-                    spans.setdefault(i, (path, started, min(timestamp, last)))
+            for i, written, own_date, started in starts:
+                if written.search(command) and i not in dated:
+                    span = (path, started, min(timestamp, last))
+                    if own_date.search(command):
+                        dated.add(i)
+                        spans[i] = span
+                    else:
+                        spans.setdefault(i, span)
             owners = [i for i, written in heads if written.search(command)]
             for i in owners:
                 if i not in by_start:
@@ -1663,8 +1680,13 @@ def run_spans(projects_root, records, now):
             if owners:
                 start = timestamp
                 writes[path].append(timestamp)
+    shared = {}  # the ends of the spans by "started" that share a transcript and a start
+    for i, (path, start, end) in spans.items():
+        if i in by_start:
+            shared.setdefault((path, start), []).append(end)
     for i, (path, start, end) in spans.items():
         earlier = [t for p, cutoff in chain_paths(path)[:-1] for t in writes.get(p, []) if t <= cutoff]
+        earlier += [e for e in shared.get((path, start), []) if e < end] if i in by_start else []
         if earlier:
             spans[i] = (path, max(earlier + ([start] if start else [])), end)
     return spans
@@ -1937,6 +1959,22 @@ def missing_required(run, events):
     """The skills REQUIRED_SKILLS asks of the run's path that no event loaded."""
     loaded = {value for _, kind, value in events if kind == 'skill'}
     return [skill for path, skill in REQUIRED_SKILLS if run.get('path') == path and skill not in loaded]
+
+
+@functools.lru_cache(maxsize=None)
+def lead_in_skills(path, start):
+    """The skill events of the main transcript path up to start, since its last run-log command before start: a run's
+    first turn loads its skill before the session reads the time it records as "started"."""
+    lead = []
+    if start is None:
+        return lead
+    for event in transcript_events(path)[0]:
+        if in_window(event[0], None, start):
+            if event[1] == 'write':
+                lead = []
+            elif event[1] == 'skill':
+                lead.append(event)
+    return lead
 
 
 def agent_skills(sub):
@@ -2242,7 +2280,7 @@ def check_run(path, start, end, run, pins):
     if not transcript_events(path)[2]:
         problems.append(problem('startup_missing', 'startup guidelines missing from the session'))
     if schema2:
-        problems += check_steps(run, dispatches, events, pins)
+        problems += check_steps(run, dispatches, lead_in_skills(path, start) + events, pins)
     if run['schema'] >= 6 and field(run, 'path', str, None) != 'plan':
         problems += check_kits(run, path, end, dispatches)
     return problems
@@ -2296,11 +2334,14 @@ def span_windows(spans):
 
 def unrecorded_sessions(projects_root, spans, now):
     """(transcript path, problem) for each main transcript that launched a workflow agent this week, up to now,
-    outside every run's span."""
+    outside every run's span, but one whose last row is under UNRECORDED_GRACE old, which may still reach its
+    record."""
     week = week_start(now)
     covered = span_windows(spans)
     out = []
     for path in main_transcripts(projects_root):
+        if (file_usage(path)['last'] or '') > stamp(now - UNRECORDED_GRACE):
+            continue
         events, launched, _ = transcript_events(path)
         own = covered.get(path, [])
         for timestamp, kind, value in events:
@@ -2754,7 +2795,8 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
             tr.read_file(sub, field(subagent_meta(sub), 'agentType', str, '') or 'subagent', {'skipped': 0})
     span_ds = span_dispatches(*span)
     # The required-skill checks run only on schema 2 records.
-    missing = [skill for skill, _ in missing_skills(r, events, span_ds, pins)] if r['schema'] >= 2 else None
+    missing = ([skill for skill, _ in missing_skills(r, lead_in_skills(path, start) + events, span_ds, pins)]
+               if r['schema'] >= 2 else None)
     dispatches = []
     for d in span_ds:
         inp, sub, report, kind = d['inp'], d['sub'], d['report'], d['kind']

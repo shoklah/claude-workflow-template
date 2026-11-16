@@ -942,9 +942,10 @@ class HealthCheck(Report):
         """The first user row of a session that start_session started with the brief prompt."""
         return user(f'Task (from the session that started this one):\n{prompt}', ts=self.ts())
 
-    def record_write(self, head, base='0000aaaa', started=None, command=None):
+    def record_write(self, head, base='0000aaaa', started=None, command=None, date=None):
         """The Bash row that appends the record with head to the log: an echo of its JSON, or command when given."""
         fields = f'"base": "{base}", "head": "{head}"' + (f', "started": "{started}"' if started else '')
+        fields += f', "date": "{date}"' if date else ''
         command = command or f'echo \'{{{fields}}}\' >> "$HOME/.claude/workflow-log.jsonl"'
         return asst('w-' + head, content=[tool_use('w' + head, 'Bash', {'command': command})], ts=self.ts())
 
@@ -1158,6 +1159,50 @@ class HealthCheck(Report):
         simplify = SIMPLIFY_STEP
         self.records([run_record(head='c0ffee01', path='small', schema=2, started=started, steps=[simplify, final])])
         self.assertEqual(self.health(), ['Health: no problems'])
+
+    def test_two_records_sharing_a_started_each_end_at_their_own_write(self):
+        # A plan and its implementation in one session, the second record carrying the first one's "started".
+        started, plan_date, full_date = '2026-11-05T10:00:00Z', '2026-11-05T11:00:00Z', '2026-11-05T12:00:00Z'
+        rows = [self.startup(), self.loaded('brainstorming'), self.loaded('writing-plans'),
+                self.record_write('p1a40001', started=started, date=plan_date),
+                self.loaded('subagent-driven-development'), self.simplify()]
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('fu110001', started=started, date=full_date))
+        self.session(rows, project='proj')
+        plan = plan_record(branch='plan-rec', started=started, date=plan_date)
+        full = run_record(branch='full-run', head='fu110001', schema=2, started=started, date=full_date,
+                          steps=[SIMPLIFY_STEP, FINAL_STEP])
+        self.records([plan, full])
+        self.assertEqual(self.health(), ['Health: no problems'])
+        windows = {r['record']['branch']: r['window'] for r in self.json()['runs']}
+        plan_end = '2026-11-05T10:00:04.000Z'
+        self.assertEqual((windows['plan-rec']['start'], windows['plan-rec']['end']),
+                         ('2026-11-05T10:00:00.000Z', plan_end))
+        # The second run starts where the first one's record was written, so neither holds the other's rows.
+        self.assertEqual((windows['full-run']['start'], windows['full-run']['end']),
+                         (plan_end, '2026-11-05T10:00:09.000Z'))
+
+    def test_a_skill_loaded_before_started_counts_until_an_earlier_log_command(self):
+        # The first turn loads the skill, then the session reads the time it records as "started".
+        rows = [self.startup(), self.loaded('subagent-driven-development')]
+        self.clock = 10
+        rows.append(self.simplify())
+        rows += self.agent('fr', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:05Z'))
+        # A later run in the same session loads nothing: the load before the first record is not its own.
+        self.clock = 30
+        rows.append(self.simplify())
+        rows += self.agent('f2', subagent_type='final-reviewer', description='Final review')
+        rows.append(self.record_write('c0ffee02', base='c0ffee01', started='2026-11-05T10:00:25Z'))
+        self.session(rows, project='proj')
+        steps = [SIMPLIFY_STEP, FINAL_STEP]
+        self.records([run_record(branch='one', head='c0ffee01', schema=2, started='2026-11-05T10:00:05Z', steps=steps),
+                      run_record(branch='two', base='c0ffee01', head='c0ffee02', schema=2,
+                                 started='2026-11-05T10:00:25Z', steps=steps)])
+        self.assertEqual(self.health(),
+                         ['WARN: two (2026-11-05): required skill subagent-driven-development did not run'])
+        missing = {r['record']['branch']: r['missing_skills'] for r in self.json()['runs']}
+        self.assertEqual(missing, {'one': [], 'two': ['subagent-driven-development']})
 
     def test_a_schema_1_run_still_starts_at_the_session_start(self):
         # The same rows without "started": the probe is inside the run, as today.
@@ -1443,6 +1488,15 @@ class HealthCheck(Report):
         self.assertEqual(self.run_report('--health').splitlines(),
                          ['Health: no problems', 'Git evidence unavailable for 2 runs'])
         self.assertEqual(self.run_report('--brief').splitlines()[2], 'Consultations with no note: 0')
+
+    def test_a_session_still_running_is_not_flagged_yet(self):
+        self.session([self.startup()] + self.agent('im', subagent_type='implementer', description='Implement Task 1'),
+                     project='proj')
+        self.records([])
+        flagged = ['WARN: session sess-1.jsonl ran workflow agents but wrote no run record']
+        # Its last row is 10:00:03Z: within the hour it may still reach its record.
+        self.assertEqual(self.health('--now', '2026-11-05T11:00:00Z'), ['Health: no problems'])
+        self.assertEqual(self.health('--now', '2026-11-05T11:00:04Z'), flagged)
 
     def test_session_with_workflow_agents_but_no_record_is_flagged(self):
         rows = [self.startup(), self.simplify()]
@@ -2414,6 +2468,17 @@ class HealthCheck(Report):
         rows = [self.shell('date -u +%FT%TZ; cat ~/.claude/docs/kits.md; echo ----; ls ~/.claude/kits'),
                 self.shell('cd ~/.claude/kits/standin; cat kit.json; echo ----; cat design.md; echo ----; '
                            'cat guidance.md')]
+        self.kit_run(reads=(), implementer=(), rows=rows, kits=kits)
+        self.assertEqual(self.kit_kinds(), [])
+
+    def test_a_for_loop_reads_each_of_its_words(self):
+        home = os.path.expanduser('~')
+        kit = os.path.join(home, '.claude', 'kits', 'standin')
+        kits = [dict(self.KITS[0], files=[os.path.join(kit, name) for name in ('kit.json', 'design.md',
+                                                                                'guidance.md')])]
+        rows = [self.shell('cat ~/.claude/docs/kits.md'),
+                self.shell('cd ~/.claude/kits/standin; for f in kit.json design.md; do echo "== $f"; cat $f; done'),
+                self.shell('for g in ~/.claude/kits/standin/guidance.md; do cat "${g}"; done')]
         self.kit_run(reads=(), implementer=(), rows=rows, kits=kits)
         self.assertEqual(self.kit_kinds(), [])
 
