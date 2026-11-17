@@ -279,7 +279,9 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-16', "The final review's unneeded items recorded as findings", 'claude-workflow#38'),
            ('2026-11-16', "A session's own review fixes take the fix-round commit subject", 'claude-workflow#39'),
            ('2026-11-17', "A ruled severity change keeps the reviewer's severity in the record", 'claude-workflow#49'),
-           ('2026-11-17', 'Final reviewer back on Fable at high; the pair measure ends', 'claude-workflow#49'))
+           ('2026-11-17', 'Final reviewer back on Fable at high; the pair measure ends', 'claude-workflow#49'),
+           ('2026-11-17', "The dispatch hook refuses a pair's second half again", 'claude-workflow#50'),
+           ('2026-11-17', 'Sessions offer to archive themselves once their work is done', 'claude-workflow#50'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
@@ -1293,10 +1295,9 @@ def launches_final_review(kind, value, launched):
 def pair_halves(events, launched):
     """The call ids of the launched final reviews in events, in order, that are a pair's second half: a final-reviewer
     asked for a Fable model, launched when exactly one final review had launched since the last simplify (or the start
-    of events) and that one was not asked for a Fable model. Judged from the dispatch inputs only. The rule is
-    hooks/guard-agent-dispatch.py's ordering_reason with pair, which allows these dispatches: keep them the same. The
-    start of events counts as a simplify here, where the hook needs one, a case reachable only when the hook did not
-    run."""
+    of events) and that one was not asked for a Fable model. Judged from the dispatch inputs only. The dispatch
+    hook allowed these dispatches while the pair measure ran and refuses them since claude-workflow#50; the transcripts
+    that hold pairs stay in the log. The start of events counts as a simplify here."""
     def on_fable(inp):
         return on_model(inp.get('model') or '', 'fable')
 
