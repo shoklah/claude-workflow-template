@@ -29,6 +29,7 @@ PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement',
 PAIRS_FROM = '2026-11-11'
 # CAP_OFFER_FROM in scripts/workflow-report.py, the day the context cap hook was installed: keep them the same.
 CAP_OFFER_FROM = '2026-11-12'
+STAGES_BY_PACE_FROM = '2026-11-17'  # CHANGE_DAYS['claude-workflow#57'] in scripts/workflow-report.py: keep them the same.
 
 
 # Copied from scripts/workflow-report.py's unit_key, since tests can't import the script: keep them the same.
@@ -1670,14 +1671,15 @@ class HealthCheck(Report):
         self.session(rows, project='proj')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
-    def pins(self, skills=False, final='opus'):
+    def pins(self, skills=False, final='opus', plan=False):
         """A fixture agents folder: final-reviewer pinned final/high, fix-checker sonnet/medium and implementer
-        opus/medium, listing their skills only when skills is true."""
+        opus/medium, and plan-reviewer fable/high when plan is true, listing their skills only when skills is true."""
         folder = os.path.join(self.root, 'agents')
         os.makedirs(folder, exist_ok=True)
-        for name, model, effort, listed in (('final-reviewer', final, 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
-                                            ('fix-checker', 'sonnet', 'medium', []),
-                                            ('implementer', 'opus', 'medium', [])):
+        agents = (('final-reviewer', final, 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
+                  ('fix-checker', 'sonnet', 'medium', []),
+                  ('implementer', 'opus', 'medium', []))
+        for name, model, effort, listed in agents + ((('plan-reviewer', 'fable', 'high', []),) if plan else ()):
             lines = ['---', f'name: {name}', 'description: d', f'model: {model}', f'effort: {effort}']
             if skills and listed:
                 lines += ['skills:'] + [f'  - {skill}' for skill in listed]
@@ -1685,11 +1687,12 @@ class HealthCheck(Report):
                 f.write('\n'.join(lines + ['---', 'Body.']) + '\n')
         return folder
 
-    def schema2_run(self, steps, dispatch_rows, loads=('subagent-driven-development',), schema=2, **over):
+    def schema2_run(self, steps, dispatch_rows, loads=('subagent-driven-development',), schema=2,
+                    started='2026-11-05T10:00:00Z', **over):
         rows = [self.startup()] + [self.loaded(name) for name in loads] + [self.simplify()] + dispatch_rows
-        rows.append(self.record_write('c0ffee01', started='2026-11-05T10:00:00Z'))
+        rows.append(self.record_write('c0ffee01', started=started))
         self.session(rows, project='proj')
-        self.records([run_record(head='c0ffee01', schema=schema, started='2026-11-05T10:00:00Z', steps=steps, **over)])
+        self.records([run_record(head='c0ffee01', schema=schema, started=started, steps=steps, **over)])
 
     def test_a_pairs_fable_half_is_no_step_and_keeps_the_checks_quiet(self):
         self.day = PAIRS_FROM
@@ -2069,6 +2072,70 @@ class HealthCheck(Report):
                 args = ('--agents', self.pins(), '--now', '2026-11-11T12:00:00Z')
                 self.assertEqual(self.health(*args), expected)
                 self.assertEqual(self.kinds(*args), ['agent_off_pin'] if expected[0].startswith('WARN') else [])
+
+    def test_agent_off_pin_follows_the_stage_by_the_day_it_was_read(self):
+        # The stage's meaning is the started day's; every dispatch runs on 2026-11-20, past final-reviewer's PAST_PINS row.
+        cases = (
+            # (started day, record fields, agent, dispatch input, subagent model and effort, expected kinds)
+            ('2026-11-20', {'stage': '2'}, 'final-reviewer', {'model': 'opus'}, ('claude-opus-5-5', 'high'), []),
+            ('2026-11-20', {'stage': '2'}, 'final-reviewer', {}, ('claude-fable-5-2', 'high'),
+             ['agent_off_pin']),  # forgotten override
+            ('2026-11-20', {'stage': '2', 'risk_area': True}, 'final-reviewer', {'model': 'fable', 'effort': 'xhigh'},
+             ('claude-fable-5-2', 'xhigh'), []),
+            ('2026-11-20', {'stage': '3', 'risk_area': True}, 'final-reviewer', {'model': 'fable', 'effort': 'xhigh'},
+             ('claude-fable-5-2', 'xhigh'), ['agent_off_pin']),
+            ('2026-11-20', {'stage': '3'}, 'final-reviewer', {'model': 'opus', 'effort': 'xhigh'},
+             ('claude-opus-5-5', 'xhigh'), []),
+            ('2026-11-20', {'stage': '1'}, 'final-reviewer', {}, ('claude-fable-5-2', 'high'), []),
+            ('2026-11-16', {'stage': '2'}, 'final-reviewer', {}, ('claude-fable-5-2', 'high'),
+             []),  # old meaning: Fable on its pin passes
+            ('2026-11-16', {'stage': '2'}, 'final-reviewer', {'model': 'opus'}, ('claude-opus-5-5', 'high'),
+             ['agent_off_pin']),  # old: no override in 2
+            ('2026-11-17', {'stage': '2'}, 'final-reviewer', {'model': 'opus'}, ('claude-opus-5-5', 'high'),
+             []),  # install day: new reading passes
+            ('2026-11-17', {'stage': '2'}, 'final-reviewer', {}, ('claude-fable-5-2', 'high'),
+             []),  # install day: old reading passes
+            ('2026-11-20', {'stage': '2'}, 'plan-reviewer', {}, ('claude-fable-5-2', 'high'), ['agent_off_pin']),
+        )
+        # A Fable seat pinned by a full model ID is caught as well: the forgotten override, with the pin as an ID.
+        cases += (('2026-11-20', {'stage': '2'}, 'final-reviewer', {}, ('claude-fable-5-2', 'high'),
+                   ['agent_off_pin'], 'claude-fable-5-2'),)
+        for started, over, agent, inp, (model, effort), expected, *pin in cases:
+            with self.subTest(started=started, over=over, agent=agent, inp=inp, pin=pin):
+                self.tearDown()
+                self.setUp()
+                self.day = '2026-11-20'
+                rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', sub_model=model,
+                                     sub_effort=effort, subagent_type=agent, description='Review', **inp)
+                self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, started=started + 'T10:00:00Z',
+                                 date='2026-11-20T12:00:00Z', **over)
+                args = ('--agents', self.pins(final=(pin or ['fable'])[0], plan=True), '--now', '2026-11-21T12:00:00Z')
+                self.assertEqual([k for k in self.kinds(*args) if k == 'agent_off_pin'], expected)
+
+    def test_a_dateless_records_stage_reads_as_either_table(self):
+        # No started and no date: the stage may mean the old 2 or the new one, so a Fable seat on its pin passes.
+        self.day = '2026-11-20'
+        rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', sub_model='claude-fable-5-2',
+                             sub_effort='high', subagent_type='final-reviewer', description='Review')
+        self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, started=None, stage='2')
+        rec = run_record(head='c0ffee01', schema=2, stage='2', steps=[SIMPLIFY_STEP, FINAL_STEP])
+        del rec['date']
+        self.records([rec])
+        args = ('--agents', self.pins(final='fable'), '--now', '2026-11-21T12:00:00Z')
+        data = self.json(*args)
+        self.assertIsNotNone(data['runs'][0]['window'])
+        self.assertEqual([k for k in self.kinds(data=data) if k == 'agent_off_pin'], [])
+
+    def test_a_forgotten_override_names_the_stage_that_moves_the_seat(self):
+        self.day = '2026-11-20'
+        rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', sub_model='claude-fable-5-2',
+                             sub_effort='high', subagent_type='final-reviewer', description='Review')
+        self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, started='2026-11-20T10:00:00Z',
+                         date='2026-11-20T12:00:00Z', stage='2')
+        args = ('--agents', self.pins(final='fable'), '--now', '2026-11-21T12:00:00Z')
+        self.assertEqual([w for w in self.health(*args) if 'final-reviewer ran on' in w],
+                         ['WARN: b (2026-11-20): final-reviewer ran on claude-fable-5-2/high, pinned fable/high, but '
+                          'stage 2 moves it to opus: Review'])
 
     def test_a_moved_seats_old_pin_passes_for_dispatches_up_to_its_day(self):
         # PAST_PINS: the implementer was opus/high up to and on 2026-11-11, final-reviewer fable/high up to 2026-11-10.
@@ -2815,6 +2882,90 @@ class HealthCheck(Report):
             'title': None, 'key': key(file)}])
         self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
 
+    def test_a_model_without_a_price_is_warned_once_under_its_stripped_id(self):
+        self.session([self.startup(), asst('f', model='claude-fable-5-2', ts=self.ts()),
+                      asst('h', model='claude-haiku-4-5-20251001', ts=self.ts()),
+                      asst('z', model='claude-zeta-9', ts=self.ts()),
+                      asst('zd', model='claude-zeta-9-20260101', ts=self.ts()),
+                      asst('s', model='<synthetic>', u=usage(None, 0, 0), ts=self.ts()),
+                      asst('a', iterations=[executor(), dict(ADVISOR, model='claude-omega-1')], ts=self.ts()),
+                      asst('e', model='', ts=self.ts())])
+        self.assertEqual([w for w in self.health() if 'has no price' in w],
+                         ['WARN: claude-omega-1 has no price in PRICES; its cost shows as null',
+                          'WARN: claude-zeta-9 has no price in PRICES; its cost shows as null'])
+        self.assertEqual(self.kinds().count('unpriced_model'), 2)
+        self.assertEqual([(w['run'], w['session']) for w in self.json()['totals']['health']['warnings']
+                          if w['kind'] == 'unpriced_model'], [(None, None)] * 2)
+        self.assertIn('has no price in PRICES', self.run_report('--brief').splitlines()[-1])
+
+    def test_the_stages_by_pace_day_is_its_changes_row(self):
+        rows = [r for r in self.json()['changes'] if r['ref'] == 'claude-workflow#57']
+        self.assertEqual([r['date'] for r in rows], [STAGES_BY_PACE_FROM])
+
+    def staged_run(self, started, path, stage, model, branch='b'):
+        """A run record of path and stage started at started (YYYY-MM-DDTHH:MM:SSZ) and dated the day after, whose
+        main session runs on model in its window."""
+        self.day = started[:10]
+        self.clock = 0
+        date = (datetime.date.fromisoformat(self.day) + datetime.timedelta(days=1)).isoformat() + 'T12:00:00Z'
+        head = f'{branch}{stage}'.encode().hex()[:8]
+        self.session([self.startup(), asst('m-' + head, model=model, ts=self.ts()),
+                      self.record_write(head, started=started, date=date)], project='proj', sid=branch)
+        fields = dict(stage=stage, started=started, date=date, branch=branch, head=head)
+        rec = plan_record(**fields) if path == 'plan' else run_record(path=path, **fields)
+        return rec, date
+
+    def test_a_main_session_on_fable_where_its_stage_calls_for_opus_is_warned(self):
+        # (started, path, stage, main model, expected kinds)
+        cases = (
+            ('2026-11-20T10:00:00Z', 'plan', '2', 'claude-fable-5-2', ['stage_model_differs']),
+            ('2026-11-20T10:00:00Z', 'plan', '1', 'claude-fable-5-2', []),
+            ('2026-11-20T10:00:00Z', 'full', '1', 'claude-fable-5-2', []),    # stage 1 never warns
+            ('2026-11-20T10:00:00Z', 'small', '1', 'claude-fable-5-2', []),   # owner's choice
+            ('2026-11-20T10:00:00Z', 'small', '3', 'claude-fable-5-2', ['stage_model_differs']),
+            ('2026-11-20T10:00:00Z', 'plan', '2', 'claude-opus-5-5', []),
+            ('2026-11-20T10:00:00Z', 'plan', None, 'claude-fable-5-2', []),   # no stage: no cell
+            ('2026-11-17T10:00:00Z', 'plan', '2', 'claude-fable-5-2', []),    # install day: the old table allowed it
+            ('2026-11-17T10:00:00Z', 'small', '2', 'claude-fable-5-2', ['stage_model_differs']),  # both say opus
+            ('2026-11-16T10:00:00Z', 'small', '2', 'claude-fable-5-2', []),   # read before the change
+            ('2026-11-20T10:00:00Z', 'full', '2', 'claude-fable-5-2', ['stage_model_differs']),
+        )
+        for started, path, stage, model, expected in cases:
+            with self.subTest(started=started, path=path, stage=stage, model=model):
+                self.tearDown()
+                self.setUp()
+                rec, date = self.staged_run(started, path, stage, model)
+                self.records([rec])
+                now = ('--now', '2026-11-22T00:00:00Z')
+                self.assertEqual([k for k in self.kinds(*now) if k == 'stage_model_differs'], expected)
+                text = (f'WARN: b ({date[:10]}): main session ran on claude-fable-5-2 in stage {stage}, which calls '
+                        f'for opus on the {path} path')
+                self.assertEqual([w for w in self.health(*now) if 'main session ran on' in w],
+                                 [text] if expected else [])
+
+    def test_a_qualifying_run_with_no_main_row_in_its_window_is_not_warned(self):
+        self.day = '2026-11-20'
+        date = '2026-11-21T12:00:00Z'
+        self.session([self.startup(), self.record_write('abcd0001', started='2026-11-20T10:00:00Z', date=date)],
+                     project='proj')
+        self.records([plan_record(stage='2', started='2026-11-20T10:00:00Z', date=date, head='abcd0001')])
+        data = self.json('--now', '2026-11-22T00:00:00Z')
+        self.assertIsNotNone(data['runs'][0]['window'])
+        self.assertNotIn('stage_model_differs', self.kinds(data=data))
+
+    def test_a_main_session_differs_only_from_every_table_its_day_reads(self):
+        # (started, main model, what it adds to plan's differs)
+        cases = (('2026-11-16T10:00:00Z', 'claude-fable-5-2', 0), ('2026-11-20T10:00:00Z', 'claude-fable-5-2', 1),
+                 ('2026-11-17T10:00:00Z', 'claude-opus-5-5', 0))  # on the install day it differs from one table only
+        for started, model, differs in cases:
+            with self.subTest(started=started, model=model):
+                self.tearDown()
+                self.setUp()
+                rec, _ = self.staged_run(started, 'plan', '2', model)
+                self.records([rec])
+                data = self.json('--now', '2026-11-22T00:00:00Z')
+                self.assertEqual(data['totals']['models']['main']['plan']['differs'], differs)
+
     def test_json_phase_costs_split_by_kind_and_cache_lifetime(self):
         u = {'input_tokens': 1000000, 'output_tokens': 1000000, 'cache_read_input_tokens': 1000000,
              'cache_creation_input_tokens': 2000000,
@@ -3371,6 +3522,18 @@ class HealthCheck(Report):
         data = self.json()
         self.assertEqual(data['runs'][0]['refusals'], {'no_simplify': 1})
         self.assertEqual(data['totals']['models']['main']['full']['actual'], {'claude-opus-5-5/-': 1})
+
+    def test_a_schema_2_records_malformed_stage_reads_as_absent(self):
+        for stage in (['2'], {'2': 1}):
+            with self.subTest(stage=stage):
+                self.tearDown()
+                self.setUp()
+                rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
+                                     subagent_type='final-reviewer', description='Final review')
+                self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, stage=stage)
+                args = ('--agents', self.pins())
+                self.assertEqual(len(self.json(*args)['runs']), 1)
+                self.assertEqual(self.health(*args), ['Health: no problems'])
 
     def test_json_runs_are_oldest_first(self):
         undated = run_record(branch='undated')

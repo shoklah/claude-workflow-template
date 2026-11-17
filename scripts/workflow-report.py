@@ -16,22 +16,25 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
   --since     ignore transcript rows and run records before this date (UTC); --health and --brief default it to
               7 days before --now, --json and --html read everything
   --brief     at most 3 lines: this week's advisor share of Fable use, the trial's progress, then this
-              week's first WARN line with a count of the rest, or else the consultations with no note, then any
-              commits on main since the last template export; the trial counts every run record
+              week's first WARN line (the unpriced_model ones come last) with a count of the rest, or else the
+              consultations with no note, then any commits on main since the last template export; the trial counts
+              every run record
   --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
               this week's sessions with no run record and no row in the last hour, for this week's plan reviews
-              with no plan-simplifier
-              since the previous plan review, for this week's typed triggers whose skill never loaded, for this
-              week's sessions outside every run with no startup guidelines, and for this week's main transcripts
-              whose turns ended past the context cap with no handoff offer, or "Health: no problems"; for
+              with no plan-simplifier since the previous plan review, for this week's typed triggers whose skill
+              never loaded, for this week's sessions outside every run with no startup guidelines, and for this
+              week's main transcripts whose turns ended past the context cap with no handoff offer, then one for
+              each model the transcripts used that PRICES lacks (unpriced_model), or "Health: no problems"; for
               schema 2 runs it also checks the steps against the launched agents, their count lines, the agents'
               pinned model, effort and skills, and the skills the run's path requires, for schema 3 plan runs a
               required offer with no entry, and for schema 4 records each step's agent id against the launched
               dispatches, and for schema 5 records each finding's category and validity, each review step's
-              strengths and their number against its report's count line; then information lines: the "fixed,
-              not proportionate" counts, archives missing or with another Started: time, the runs whose git
-              evidence is unavailable, and over this week's main transcripts the inline sweeps and those that went
-              50 or more calls past the context cap with no handoff
+              strengths and their number against its report's count line, and for a run whose stage was read on or
+              after the stages by pace day it warns on a main session on Fable where its stage calls for Opus
+              (stage_model_differs); then information lines: the "fixed, not proportionate" counts, archives
+              missing or with another Started: time, the runs whose git evidence is unavailable, and over this
+              week's main transcripts the inline sweeps and those that went 50 or more calls past the context cap
+              with no handoff
   --schema    print the run record schema, with the finding category list under "category_list", and exit
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
               bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
@@ -234,6 +237,7 @@ SCHEMA = {
 # List prices, dollars per million tokens: input, output, cache read, 5-minute cache write, 1-hour cache write.
 # From https://platform.claude.com/docs/en/about-claude/pricing, read on 2026-11-08.
 PRICES = {
+    'claude-fable-5-2': (8.0, 40.0, 0.2, 10.0, 16.0),
     'claude-fable-5-1': (10.0, 50.0, 0.25, 12.5, 20.0),
     'claude-fable-5': (10.0, 50.0, 1.0, 12.5, 20.0),
     'claude-opus-5-5': (4.0, 20.0, 0.2, 5.0, 8.0),
@@ -281,7 +285,8 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-17', "A ruled severity change keeps the reviewer's severity in the record", 'claude-workflow#49'),
            ('2026-11-17', 'Final reviewer back on Fable at high; the pair measure ends', 'claude-workflow#49'),
            ('2026-11-17', "The dispatch hook refuses a pair's second half again", 'claude-workflow#50'),
-           ('2026-11-17', 'Sessions offer to archive themselves once their work is done', 'claude-workflow#50'))
+           ('2026-11-17', 'Sessions offer to archive themselves once their work is done', 'claude-workflow#50'),
+           ('2026-11-17', 'Fable stages by pace; the all-model limit gets the same pace rule', 'claude-workflow#57'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
@@ -291,6 +296,8 @@ PAST_PINS = {'final-reviewer': [(CHANGE_DAYS['claude-workflow#22'], 'fable', 'hi
 # CAP_OFFER_FROM, the day the context cap hook was installed, is copied in tests/test_report.py, whose
 # test_json_exports_the_dated_workflow_changes ties the copy to the row it reads here: keep them the same.
 CAP_OFFER_FROM = CHANGE_DAYS['claude-workflow#34']
+# STAGES_BY_PACE_FROM, the day the stages by pace were installed, is copied in tests/test_report.py: keep them the same.
+STAGES_BY_PACE_FROM = CHANGE_DAYS['claude-workflow#57']
 FIX_WINDOW_DAYS = 14
 NEVER_CONSULT = ('task-reviewer', 'final-reviewer', 'plan-reviewer', 'plan-simplifier', 'fix-checker', 'sweeper',
                  'kit-reviewer')
@@ -447,9 +454,13 @@ REQUIRED_SKILLS = (('plan', 'brainstorming'), ('plan', 'writing-plans'), ('full'
 SKILL_OUTCOMES = {'brainstorming': 'spec', 'writing-plans': 'plan', 'simplify': 'simplify',
                   'test-driven-development': 'failing_test', 'subagent-driven-development': 'record'}
 # The stage table's model and effort for a run's main session, by the record's path and stage; None is the owner's
-# choice. A difference is shown, never warned.
+# choice. PAST_RECOMMENDED is the table before STAGES_BY_PACE_FROM, and stage_tables says which a run's day reads. A
+# difference is counted; from the install day, a main session on Fable where its stage calls for Opus is warned.
+PAST_RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
+                    'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
+                    'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
-               'plan': {'1': 'fable', '2': 'fable', '3': 'opus', 'out': 'opus'},
+               'plan': {'1': 'fable', '2': 'opus', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
 CACHE_VERSION = 10
@@ -573,6 +584,7 @@ class Transcripts:
         self.tokens = {label: 0 for label, _ in TOKENS}
         self.advisor_cost = 0.0
         self.models = {}
+        self.unpriced = shared.unpriced if shared else set()  # the models, DATE_SUFFIX stripped, used with no price
         self.efforts = {}
         self.by_role = {}
         self.failed_ids = shared.failed_ids if shared else set()
@@ -721,7 +733,11 @@ class Transcripts:
             entry[0] += 1
             for token, name in TOKENS:
                 self.tokens[token] += num(i.get(name))
-            spent = cost(i, field(i, 'model', str, '') or ADVISOR_MODEL) or 0.0
+            advisor_model = field(i, 'model', str, '') or ADVISOR_MODEL
+            spent = cost(i, advisor_model)
+            if spent is None:
+                self.note_unpriced(advisor_model, [i])
+                spent = 0.0
             self.advisor_cost += spent
             if phase is not None:
                 phase_advisor = self.phase(phase)['advisor']
@@ -749,6 +765,7 @@ class Transcripts:
                 for e in entries:
                     e[token] += n
         if entry['cost'] is None:
+            self.note_unpriced(model, own)
             return
         spent = 0.0
         for i in own:
@@ -761,6 +778,11 @@ class Transcripts:
             e['cost'] += spent
         if week is not None and model.startswith('claude-fable'):
             self.week_fable[week] = self.week_fable.get(week, 0.0) + spent
+
+    def note_unpriced(self, model, own):
+        """Note model, which PRICES lacks, as used when any of the usages own has a token."""
+        if model and any(num(i.get(name)) for i in own for _, name in TOKENS):
+            self.unpriced.add(DATE_SUFFIX.sub('', model))
 
     def phase(self, name):
         """The models and advisor counted in phase name so far."""
@@ -1965,6 +1987,36 @@ def off_request(model, effort, want_model, want_effort):
                 or effort and want_effort and effort != want_effort)
 
 
+def stage_cell(table, path, stage):
+    """The model and effort a stage table asks of path's main session in stage, each '' when it names none."""
+    return (table.get(path, {}).get(stage) or '').partition('/')[::2]
+
+
+def stage_day(run):
+    """The ISO day a run's stage was read: its started day, else its record's date's, else None."""
+    t = run['_started'] or run['_time']
+    return t.date().isoformat() if t is not None else None
+
+
+def stage_tables(day):
+    """The stage tables a run read on day, an ISO day or None: the old one before STAGES_BY_PACE_FROM, either on
+    that day or for None, and today's after it."""
+    if day is None or day == STAGES_BY_PACE_FROM:
+        return (PAST_RECOMMENDED, RECOMMENDED)
+    return (PAST_RECOMMENDED,) if day < STAGES_BY_PACE_FROM else (RECOMMENDED,)
+
+
+def main_ran_on(path, start, end):
+    """The model and effort the main transcripts of path's chain ran on in the window (start, end], each read up to
+    its own end."""
+    tr = Transcripts(None, None)
+    for main, main_end in chain_windows(path, end):
+        tr.keep = lambda timestamp, main_end=main_end: isinstance(timestamp, str) and in_window(timestamp, start,
+                                                                                                 main_end)
+        tr.read_file(main, None, {'skipped': 0})
+    return ran_on(tr)
+
+
 def missing_required(run, events):
     """The skills REQUIRED_SKILLS asks of the run's path that no event loaded."""
     loaded = {value for _, kind, value in events if kind == 'skill'}
@@ -2124,7 +2176,13 @@ def check_steps(run, dispatches, events, pins):
     missing = missing_skills(run, events, dispatches, pins)
     problems += [problem('required_skill_missing', f'required skill {skill} did not run', skill=skill)
                  for skill, d in missing if d is None]
-    stage = run.get('stage')
+    # The stages by pace moved the meanings: the stage a run recorded after STAGES_BY_PACE_FROM is checked as the old
+    # stage that means the same (its 2 as the old 3, its 3 as Out), on that day as either, and before it as recorded.
+    raw = field(run, 'stage', str, None)
+    tables = stage_tables(stage_day(run))
+    after = tables == (RECOMMENDED,)
+    mapped = {'2': '3', '3': 'out'}.get(raw, raw)
+    stages = tuple(raw if table is PAST_RECOMMENDED else mapped for table in tables)
     run_day = run['_time'].date().isoformat() if run['_time'] is not None else None
     for d, step in zip(dispatches, dispatch_steps(run, dispatches)):
         inp, sub = d['inp'], d['sub']
@@ -2133,25 +2191,31 @@ def check_steps(run, dispatches, events, pins):
         if pin is None or sub is None:
             continue
         model, effort = ran_on(sub_usage(sub))
-        # The overrides the stage allows: an explicit model in stage 3 or Out, final-reviewer's seats (Opus at xhigh
+        # The overrides the stage allows, in the old stage names: an explicit model in stage 3 or Out, final-reviewer's seats (Opus at xhigh
         # in Out, Fable outside Out at xhigh passed in a risk area, and Fable at high as a pair's second half) and,
         # for a dispatch on or before the day a seat moved, the agent's old pin from PAST_PINS. A model or effort the
         # transcript doesn't show passes.
         final = agent == 'final-reviewer'
         fable = on_model(model or '', 'fable')
         day = d['time'][:10] if d['time'] else run_day
-        model_ok = (not model or not pin['model'] or on_model(model, pin['model'])
-                    or stage in ('3', 'out') and bool(inp.get('model')))
         effort_ok = not effort or not pin['effort'] or effort == pin['effort']
-        seat_ok = final and (stage == 'out' and effort == 'xhigh' and (not model or on_model(model, 'opus'))
-                             or fable and stage != 'out' and run.get('risk_area') is True
-                             and inp.get('effort') == effort == 'xhigh'
-                             or fable and d['pair'] and effort == 'high')
+        model_ok = (not model or not pin['model'] or on_model(model, pin['model'])
+                    or bool(inp.get('model')) and any(stage in ('3', 'out') for stage in stages))
+        seat_ok = final and any(stage == 'out' and effort == 'xhigh' and (not model or on_model(model, 'opus'))
+                                or fable and stage != 'out' and run.get('risk_area') is True
+                                and inp.get('effort') == effort == 'xhigh'
+                                or fable and d['pair'] and effort == 'high' for stage in stages)
+        fits = model_ok and effort_ok or seat_ok
+        # From stage 2 on, a Fable-pinned agent is moved off Fable, so one that ran on Fable passes only on a seat.
+        moved = after and raw in ('2', '3', 'out') and on_model(pin['model'] or '', 'fable') and fable
+        if moved:
+            fits = seat_ok
         old_ok = any(day is not None and day <= last and not off_request(model, effort, old_model, old_effort)
                      for last, old_model, old_effort in PAST_PINS.get(agent, ()))
-        if not (model_ok and effort_ok or seat_ok or old_ok):
+        if not (fits or old_ok):
+            why = f', but stage {raw} moves it to opus' if moved else ''
             problems.append(problem('agent_off_pin', f"{agent} ran on {model}/{effort}, pinned "
-                                    f"{pin['model']}/{pin['effort']}: {inp.get('description')}",
+                                    f"{pin['model']}/{pin['effort']}{why}: {inp.get('description')}",
                                     step=step, agent=agent))
         problems += [problem('agent_skill_missing', f"{agent} ran without its skill {skill}: {inp.get('description')}",
                              step=step, skill=skill, agent=agent)
@@ -2299,6 +2363,14 @@ def check_run(path, start, end, run, pins):
         problems += check_steps(run, dispatches, lead_in_skills(path, start) + events, pins)
     if run['schema'] >= 6 and field(run, 'path', str, None) != 'plan':
         problems += check_kits(run, path, end, dispatches)
+    day, stage, run_path = stage_day(run), field(run, 'stage', str, None), field(run, 'path', str, None)
+    # Stage 1 never warns, though its Full path cell is Opus: the implementation session is Opus in every stage.
+    if (day is not None and day >= STAGES_BY_PACE_FROM and stage != '1'
+            and all(stage_cell(table, run_path, stage)[0] == 'opus' for table in stage_tables(day))):
+        model = main_ran_on(path, start, end)[0]
+        if model and on_model(model, 'fable'):
+            problems.append(problem('stage_model_differs', f'main session ran on {model} in stage {stage}, which '
+                                                           f'calls for opus on the {run_path} path'))
     return problems
 
 
@@ -2490,6 +2562,12 @@ def archive_line(run):
     return None if parse_time(started[0] if started else None) == run['_started'] else 'archive Started: differs'
 
 
+def unpriced_warnings(unpriced):
+    """One warning per model of unpriced, a Transcripts' unpriced, in sorted order."""
+    return [warning(problem('unpriced_model', f'{model} has no price in PRICES; its cost shows as null'))
+            for model in sorted(unpriced)]
+
+
 def health(projects_root, runs, now, records, pins, spans):
     """Warnings for the problems the transcripts and git show in each run, for this week's sessions with no run
     record and for this week's plan reviews with no plan simplify, then the information lines, then each run's own
@@ -2668,7 +2746,7 @@ def template_drift(stamp_path):
 
 def brief_report(tr, runs, now, records, projects_root, pins, spans, stamp_path):
     week = week_start(now)
-    warns = warnings(projects_root, runs, now, records, pins, spans)
+    warns = warnings(projects_root, runs, now, records, pins, spans) + texts(unpriced_warnings(tr.unpriced))
     if warns:
         last = warns[0] + (f' (+{len(warns) - 1} more, run --health)' if len(warns) > 1 else '')
     else:
@@ -3045,15 +3123,17 @@ def model_totals(runs, entries):
         model, effort = entry['main']['model'], entry['main']['effort']
         actual = f"{model or '-'}/{effort or '-'}"
         row['actual'][actual] = row['actual'].get(actual, 0) + 1
-        want_model, _, want_effort = (row['recommended'].get(field(r, 'stage', str, None)) or '').partition('/')
-        row['differs'] += off_request(model, effort, want_model, want_effort)
+        stage, path = field(r, 'stage', str, None), field(r, 'path', str, None)
+        row['differs'] += all(off_request(model, effort, *stage_cell(table, path, stage))
+                              for table in stage_tables(stage_day(r)))
     return {'agents': agents, 'main': main}
 
 
 def report_data(projects_root, records, runs, spans, pins, now, since):
     """The report's facts and totals, as the dict --json prints; records is the whole run log and spans its
     run_spans. Each transcript row belongs to one unit, the run whose window ends first among those holding it, else
-    its transcript's session, and each total is a sum over the units."""
+    its transcript's session, and each total is a sum over the units. The models with no price are known once the
+    units are read, so their warnings join the health warnings last."""
     warns, info, per_run, per_session = run_warnings(projects_root, runs, now, records, pins, spans)
     # Oldest first, a record with no time last; sorted keeps log order among equals.
     order = sorted(range(len(runs)), key=lambda i: (runs[i]['_time'] is None, runs[i]['_time'] or now))
@@ -3144,6 +3224,7 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
                          'startup': transcript_events(path)[2], 'warns': texts(own), 'warnings': own,
                          'title': transcript_title(path), 'key': unit_key(path)})
     units = entries + sessions
+    warns = warns + unpriced_warnings(seen.unpriced)
     advisor = advisor_facts(sum_advisor(u['advisor'] for u in units if u['advisor'] is not None),
                             {k: sum(u['notes'][k] for u in units if u['notes'] is not None)
                              for k in ('notes', 'changed', 'missing')}, runs, now)
@@ -3441,7 +3522,9 @@ def main():
     pins = read_pins(args.agents)
     spans = run_spans(args.projects, records, now)
     if args.health:
+        tr = read_transcripts(args.projects, since, now, stats)
         warns, info, _, _ = run_warnings(args.projects, runs, now, records, pins, spans)
+        warns += unpriced_warnings(tr.unpriced)
         print('\n'.join((texts(warns) or ['Health: no problems']) + info))
         return 0
     if args.json or args.html:

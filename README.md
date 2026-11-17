@@ -84,7 +84,7 @@ flowchart LR
     R3 -- "still open, reviewer may be wrong" --> W["Written ruling<br/>run continues,<br/>final review sees both sides"]
 ```
 
-Tiers go `implementer-copy` → `implementer` → `implementer-escalated`. In Fable stage 3 an Opus implementer stays on a fresh `implementer`. Loops run only on mechanical signals, such as failing tests, and always under a cap: a reviewer can always find something.
+Tiers go `implementer-copy` → `implementer` → `implementer-escalated`. In Fable stages 2, 3 and Out an Opus implementer stays on a fresh `implementer`. Loops run only on mechanical signals, such as failing tests, and always under a cap: a reviewer can always find something.
 
 ### Test-driven development and the failing-test check
 
@@ -142,22 +142,24 @@ A kit specializes the workflow for one topic, only on the tasks it fits: it adds
 
 ### Fable stages
 
-At task start Claude reads `get_usage`, works out the share of the week gone (`100 * (168 - hours_to_reset) / 168`) and compares the weekly Fable % with it.
+At task start Claude reads `get_usage`, works out the hours gone (`168 - hours_to_reset`) and projects the weekly Fable % to the reset (`% * 168 / hours gone`), counting all 168 hours of the week evenly, weekends included. The stage is read once per task, with no buffer between stages.
 
-| Stage | Trigger | Other main sessions | Design and plan | Plan review | Final review |
-|---|---|---|---|---|---|
-| 1 | Up to 15 points ahead of the week | Owner's choice, Fable allowed | Fable | Fable | Fable; `xhigh` in risk areas |
-| 2 | More than 15 points ahead | Opus 5.5 with Fable advisor | Fable | Fable | Fable; `xhigh` in risk areas |
-| 3 | 90% used or more | Opus 5.5, advisor off | Opus 5.5 | Opus 5.5 | Opus 5.5; Fable at `xhigh` in risk areas |
-| Out | Fable unavailable | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5 at `xhigh` |
+| Stage | Trigger | Other main sessions | Design and plan | Plan review | Final review | Advisor |
+|---|---|---|---|---|---|---|
+| 1 | None of the below | Owner's choice, Fable allowed | Fable | Fable | Fable; `xhigh` in risk areas | On |
+| 2 | Projected Fable ≥ 100%, and either 24 hours gone or Fable ≥ 25% | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5; Fable at `xhigh` in risk areas | Off |
+| 3 | Fable ≥ 90% | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5 at `xhigh` | Off |
+| Out | Fable unavailable | Opus 5.5 | Opus 5.5 | Opus 5.5 | Opus 5.5 at `xhigh` | Off |
 
-The all-model limit is watched too: Claude warns when it is more than 15 points ahead of the week, and at 90% no new Full path run starts without the owner's OK. Nothing silently drops to Sonnet. A stage 3 or Out override is an explicit `model` at dispatch on the named agent, and so is `final-reviewer` in a risk area: `model: fable` with `effort: xhigh`. `plan-simplifier` isn't in the table: it is pinned to Opus 5.5 at `high` in every stage.
+Claude matches its own session's model and effort to the cell for its path, in both directions, with `set_session_model` and `set_session_effort`. Stage 1 Small path work is the owner's choice and gets no switch, and an override the owner gives in words holds for the task. The session running implementation stays on Opus 5.5 at `medium` in every stage.
+
+The all-model limit is watched too, on the same pace: at a projected all-model % of 100 or more (once 24 hours are gone or it is at 25% or more) Claude warns and no new Full path run starts without the owner's OK, and at 90% none starts without it either, while Small and Direct work carries on. Nothing drops to Sonnet on its own: Claude may suggest cuts, and the owner decides. A stage 2, 3 or Out override is an explicit `model: opus` at dispatch on `plan-reviewer`, `final-reviewer` and `implementer-escalated`, with `effort: xhigh` on `final-reviewer` in stage 3 and Out, and `final-reviewer` in a risk area in stages 1 and 2 gets `model: fable` with `effort: xhigh`. `plan-simplifier` isn't in the table: it is pinned to Opus 5.5 at `high` in every stage.
 
 **The pair measure, ended:** from 2026-11-11 to 2026-11-17 non-risk runs got a second, blind final review on Fable beside the Opus one. Across 15 pairs Fable found 12 Important problems Opus missed and no Critical one, so the owner moved the seat back to Fable. The reporter still reads a pair's second half, since the transcripts that hold pairs stay in the log; the dispatch hook refuses one again, like any second final review.
 
 ### The Fable advisor (trial)
 
-The advisor is on in stages 1 and 2 and off from stage 3. Only the owner can switch it (`/advisor fable`, `/advisor off`), so Claude reminds them when the stage changes.
+The advisor is on in stage 1 and off from stage 2. Only the owner can switch it (`/advisor fable`, `/advisor off`), so Claude reminds them when the stage changes.
 
 | Role | Consults the advisor |
 |---|---|
@@ -194,10 +196,10 @@ flowchart LR
 | `CLAUDE.md` section | `claude-md/agentic-workflow.md` | The rules above in 29 lines, installed between `<!-- agentic-workflow:start -->` and `<!-- agentic-workflow:end -->`. |
 | Failing-test check | `scripts/failing-test-check.py` | See above. |
 | Wave script | `scripts/wave.py` | `start` makes a worktree per task from the wave's base and keeps the linked folders out of git, `merge` merges the task branches in plan order and stops at the first conflict, `finish` removes the worktrees and branches once all are merged and clean, refusing otherwise. |
-| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, sessions that wrote no run record and have been quiet for an hour and, for schema 2 records, each step, count line, finding total, agent pin and required skill, a risk area on the Small path and a wave with no wave check, and for schema 3 plan records a required offer with no entry, and for schema 4 records each step's agent id against the launched dispatches (missing, unknown, mismatched or shared ids), and for schema 5 records each finding's category and validity, each review step's strengths, and their number against its report's count line. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one, a typed trigger whose skill never loaded, and turn ends past the context cap with no handoff offer (`cap_no_offer`). Each problem becomes a `WARN` line in `--brief`. It also prints two information lines over this week's main transcripts, like the session checks: inline sweeps, and transcripts over the cap without a handoff. The runs `--health` and `--brief` list default to the last 7 days. |
+| Health check | `scripts/workflow-report.py --health` | Report-only. Checks each recorded run against transcripts and git rather than the run record: `simplify` before each final review, named agents, the dispatch hook, the startup guidelines, `Findings:` lines, conventions added, `fix_growth`, sessions that wrote no run record and have been quiet for an hour and, for schema 2 records, each step, count line, finding total, agent pin and required skill, a risk area on the Small path and a wave with no wave check, and for schema 3 plan records a required offer with no entry, and for schema 4 records each step's agent id against the launched dispatches (missing, unknown, mismatched or shared ids), and for schema 5 records each finding's category and validity, each review step's strengths, and their number against its report's count line. For a run whose stage was read on or after the stages by pace, it flags a main session on Fable where its stage calls for Opus (`stage_model_differs`), and `agent_off_pin` reads the stage the run recorded by its day, and flags a Fable-pinned agent (`plan-reviewer`, `final-reviewer`, `implementer-escalated`) that ran on Fable in stage 2, 3 or Out, unless it is the stage 2 risk-area final review at `xhigh`. Over the transcripts read, it flags each model with no price (`unpriced_model`), whose cost shows as null. Per main session this week, it also flags a launched plan review with no launched plan simplify since the previous one, a typed trigger whose skill never loaded, and turn ends past the context cap with no handoff offer (`cap_no_offer`). Each problem becomes a `WARN` line in `--brief`. It also prints two information lines over this week's main transcripts, like the session checks: inline sweeps, and transcripts over the cap without a handoff. The runs `--health` and `--brief` list default to the last 7 days. |
 | Report | `scripts/workflow-report.py` | Read-only. Reads transcripts and the run log; reports advisor calls, tokens and estimated cost by role, missing advisor notes, findings and fix rounds per run, and failing-test check results. `--json` prints the same data as one JSON object; `--html` writes it as one self-contained page. |
 
-Still unenforced, by design: choosing the path, reading the stage, the main session's model, the fix-round cap, and whether the guidelines are followed once loaded. Naming the path and stage out loud is what lets the owner catch a wrong call.
+Still unenforced, by design: choosing the path, reading the stage, the fix-round cap, and whether the guidelines are followed once loaded. Naming the path and stage out loud is what lets the owner catch a wrong call.
 
 ## Tracking outcomes
 
