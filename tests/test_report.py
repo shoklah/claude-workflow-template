@@ -502,8 +502,8 @@ class Report(unittest.TestCase):
         schema = json.loads(self.run_report('--schema'))
         self.assertLessEqual(set(run_record()), set(schema))
         self.assertEqual(sorted(set(schema) - set(run_record())),
-                         ['archive', 'categories', 'category_list', 'kit_checks', 'kits', 'offers', 'plan', 'schema', 'started',
-                          'steps', 'waves'])
+                         ['archive', 'categories', 'category_list', 'goal', 'headline', 'kit_checks', 'kits', 'offers',
+                          'plan', 'schema', 'spec', 'started', 'steps', 'waves'])
 
     def test_schema_lists_the_schema_2_fields_and_outcomes(self):
         schema = json.loads(self.run_report('--schema'))
@@ -535,9 +535,33 @@ class Report(unittest.TestCase):
     def test_schema_4_steps_carry_the_agent_id(self):
         out = self.run_report('--schema')
         schema = json.loads(out)
-        self.assertEqual(schema['schema'], 'int, record format: 7; a record without it is 1')
+        self.assertEqual(schema['schema'], 'int, record format: 8; a record without it is 1')
         self.assertIn('"agent_id"', schema['steps'])
         self.assertIn('every kind but simplify', schema['steps'])
+
+    def test_json_exports_a_records_headline_spec_and_goal(self):
+        spec = {'project': '/p', 'path': 'docs/superpowers/specs/s.md'}
+        self.records([run_record(schema=8, headline='Runs get titles', spec=spec, goal='UI slice'),
+                      run_record(branch='old')])
+        new, old = self.json()['runs']  # same date: log order
+        self.assertEqual((new['headline'], new['spec'], new['goal']), ('Runs get titles', spec, 'UI slice'))
+        self.assertEqual((old['headline'], old['spec'], old['goal']), (None, None, None))
+
+    def test_a_records_malformed_facts_read_as_absent(self):
+        self.records([run_record(schema=8, headline='', spec={'project': '/p'}, goal='None'),
+                      run_record(schema=8, headline=5, spec='docs/s.md', goal=['x']),
+                      run_record(schema=8, headline='  ', spec={'project': '/p', 'path': ''}, goal='  ')])
+        for run in self.json()['runs']:
+            self.assertEqual((run['headline'], run['spec'], run['goal']), (None, None, None))
+
+    def test_health_warns_on_a_schema_8_record_missing_its_facts(self):
+        full = run_record(schema=8, branch='f')  # no headline, goal or spec
+        small = run_record(schema=8, branch='s', path='small', headline='h', goal=None)  # complete: goal stated null
+        old = run_record(schema=7, branch='o')
+        self.records([full, small, old])
+        warns = [w for w in self.json()['totals']['health']['warnings'] if w['kind'] == 'record_fact_missing']
+        self.assertEqual([w['run'] for w in warns], [{'date': '2026-11-05T12:00:00Z', 'project': '/p', 'branch': 'f'}])
+        self.assertIn('headline, spec, goal', warns[0]['text'])
 
     def test_a_step_agent_id_is_read_as_a_string_or_null(self):
         steps = [{'step': 'final_review', 'agent_id': 'abc123', 'counts': {}, 'findings': []},
@@ -933,13 +957,17 @@ class HealthCheck(Report):
         return [asst('m-' + tid, content=[tool_use(tid, 'Agent', dict(inp, prompt='p'))], ts=self.ts()),
                 user([result], ts=self.ts(), **extra)]
 
-    def handoff(self, prompt='Handoff 1: go'):
-        """A start_session call whose brief is prompt, and its result naming the session it started. The app's session
-        id never names the new session's transcript; the brief in its first user row, as briefed writes it, does."""
+    def handoff(self, prompt='Handoff 1: go', result='(session_id: local_9999, name: n)', sid=None):
+        """A start_session call whose brief is prompt, and its result, by default naming the session it started, its
+        rows carrying sid as their sessionId when given. The app's session id never names the new session's
+        transcript; the brief in its first user row, as briefed writes it, does."""
         tid = f'h{self.clock}'
-        return [asst('a-' + tid, [tool_use(tid, 'mcp__ccd_session__start_session', {'prompt': prompt})], ts=self.ts()),
-                user([{'type': 'tool_result', 'tool_use_id': tid, 'content': '(session_id: local_9999, name: n)'}],
-                     ts=self.ts())]
+        rows = [asst('a-' + tid, [tool_use(tid, 'mcp__ccd_session__start_session', {'prompt': prompt})], ts=self.ts()),
+                user([{'type': 'tool_result', 'tool_use_id': tid, 'content': result}], ts=self.ts())]
+        if sid is not None:
+            for row in rows:
+                row['sessionId'] = sid
+        return rows
 
     def briefed(self, prompt='Handoff 1: go'):
         """The first user row of a session that start_session started with the brief prompt."""
@@ -2873,13 +2901,13 @@ class HealthCheck(Report):
                         'by_role': {}, 'failed': {}, 'weeks': []},
             'notes': {'notes': 0, 'changed': 0, 'missing': 0}, 'refusals': {},
             'context': {'calls': 2, 'tokens': 1000010, 'median_tokens': 500005.0, 'max_tokens': 1000000,
-                        'over_cap': True, 'calls_over_cap': 1, 'handoff': None},
+                        'over_cap': True, 'calls_over_cap': 1, 'handoff': None, 'handoff_to': None},
             'tool_results': {'read': 0, 'edit': 0, 'run': 0, 'bash_other': 0, 'agent': 0, 'mcp': 0, 'other': 0},
             'sweeps': {'inline': 0, 'delegated': 0},
             'warns': ['WARN: session sess-1.jsonl: startup guidelines missing'],
             'warnings': [{'text': 'WARN: session sess-1.jsonl: startup guidelines missing', 'kind': 'startup_missing',
                           'run': None, 'session': file, 'step': None, 'skill': None, 'agent': None}],
-            'title': None, 'key': key(file)}])
+            'title': None, 'key': key(file), 'started_by': None, 'goal': None, 'spec': None}])
         self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
 
     def test_a_model_without_a_price_is_warned_once_under_its_stripped_id(self):
@@ -3122,7 +3150,7 @@ class HealthCheck(Report):
         [session] = self.json()['sessions']
         self.assertEqual(session['context'], {'calls': 2, 'tokens': 200_050, 'median_tokens': 100_025.0,
                                               'max_tokens': 200_000, 'over_cap': False, 'calls_over_cap': 0,
-                                              'handoff': None})
+                                              'handoff': None, 'handoff_to': None})
 
     def test_json_context_counts_calls_past_the_cap_until_a_handoff_or_compaction(self):
         rows = [asst('m1', u=OVER_CAP, ts='2026-11-05T10:00:01.000Z'), asst('m2', u=OVER_CAP, ts='2026-11-05T10:00:02.000Z'),
@@ -3153,6 +3181,195 @@ class HealthCheck(Report):
         [session] = self.json()['sessions']
         self.assertEqual((session['context']['calls_over_cap'], session['context']['handoff']),
                          (0, '2026-11-05T10:00:02.000Z'))
+
+    def test_json_a_started_session_names_its_starter(self):
+        # the call's result is a proposal card with no session id: the brief alone ties it ("whatever its result")
+        self.session(self.handoff('Build the thing, in full detail', result='Proposed task_id: t1'),
+                     project='proj', sid='aaaa')
+        self.session([self.briefed('Build the thing, in full detail'), asst('b1', ts=self.ts())],
+                     project='proj', sid='bbbb')
+        by = self.by_file('started_by')
+        self.assertEqual(by, {'aaaa.jsonl': None,
+                              'bbbb.jsonl': {'key': key(os.path.join(self.projects, 'proj', 'aaaa.jsonl')),
+                                             'how': 'started'}})
+
+    def test_json_a_handoff_successor_is_started_by_handoff(self):
+        self.session(self.handoff(), project='proj', sid='aaaa')
+        self.session([self.briefed(), asst('b1', ts=self.ts())], project='proj', sid='bbbb')
+        by = self.by_file('started_by')
+        self.assertEqual(by['bbbb.jsonl'], {'key': key(os.path.join(self.projects, 'proj', 'aaaa.jsonl')),
+                                            'how': 'handoff'})
+
+    def test_json_a_forks_copied_start_call_starts_nothing(self):
+        # the fork 0000 sorts before its parent zzzz, so "first found by path" alone would pick the fork's copied call
+        parent = self.handoff('Build the thing, in full detail', sid='zzzz')
+        self.session(parent, project='proj', sid='zzzz')
+        own = user('Fork here', ts=self.ts(), sessionId='0000')
+        self.session(parent + [own, asst('f1', ts=self.ts())], project='proj', sid='0000')
+        self.session([self.briefed('Build the thing, in full detail'), asst('b1', ts=self.ts())],
+                     project='proj', sid='bbbb')
+        by = self.by_file('started_by')
+        self.assertEqual(by['bbbb.jsonl'], {'key': key(os.path.join(self.projects, 'proj', 'zzzz.jsonl')),
+                                            'how': 'started'})
+
+    def test_json_a_forks_copied_handoff_call_hands_off_nothing(self):
+        # the fork 0000 sorts before its parent zzzz and holds zzzz's over-cap handoff call, copied with zzzz's id
+        parent = [asst('m1', [tool_use('h1', 'mcp__ccd_session__start_session', {'prompt': 'Handoff 1: go'})],
+                       u=OVER_CAP, ts='2026-11-05T10:00:01.000Z'),
+                  user([{'type': 'tool_result', 'tool_use_id': 'h1', 'content': '(session_id: local_cccc, name: n)'}],
+                       ts='2026-11-05T10:00:02.000Z')]
+        for row in parent:
+            row['sessionId'] = 'zzzz'
+        self.session(parent, project='proj', sid='zzzz')
+        own = asst('f1', u=OVER_CAP, ts='2026-11-05T10:00:03.000Z')
+        own['sessionId'] = '0000'
+        self.session(parent + [own], project='proj', sid='0000')
+        self.session([self.briefed(), asst('b1', ts=self.ts())], project='proj', sid='bbbb')
+        by = {os.path.basename(s['file']): s for s in self.json()['sessions']}
+        # the copied call still counts for the fork's cap, but ties no successor through the fork
+        self.assertEqual(by['0000.jsonl']['context']['handoff'], '2026-11-05T10:00:01.000Z')
+        self.assertIsNone(by['0000.jsonl']['context']['handoff_to'])
+        self.assertEqual(by['bbbb.jsonl']['started_by'],
+                         {'key': key(os.path.join(self.projects, 'proj', 'zzzz.jsonl')), 'how': 'handoff'})
+
+    def test_json_a_session_started_as_a_fork_names_its_starter(self):
+        parent = [user('Start here', ts=self.ts(), sessionId='aaaa')] + self.handoff('Fork off and do it', sid='aaaa')
+        self.session(parent, project='proj', sid='aaaa')
+        own = dict(self.briefed('Fork off and do it'), sessionId='dddd')
+        self.session(parent + [own, asst('d1', ts=self.ts())], project='proj', sid='dddd')
+        by = self.by_file('started_by')
+        self.assertEqual(by['dddd.jsonl'], {'key': key(os.path.join(self.projects, 'proj', 'aaaa.jsonl')),
+                                            'how': 'started'})
+
+    def test_json_context_names_the_session_handed_off_to(self):
+        self.session([asst('m1', ts='2026-11-05T10:00:01.000Z'),
+                      asst('m2', [tool_use('h1', 'mcp__ccd_session__start_session',
+                                           {'prompt': 'Handoff 1: go', 'background': 'x' * 80})],
+                           u=OVER_CAP, ts='2026-11-05T10:00:02.000Z'),
+                      user([{'type': 'tool_result', 'tool_use_id': 'h1',
+                             'content': '(session_id: local_cccc, name: n)'}], ts='2026-11-05T10:00:03.000Z'),
+                      asst('m3', u=OVER_CAP, ts='2026-11-05T10:00:04.000Z')], sid='aaaa')
+        self.session([user('Task (from the session that started this one):\nHandoff 1: go',
+                           ts='2026-11-05T10:00:05.000Z'),
+                      asst('s1', ts='2026-11-05T10:00:06.000Z')], sid='bbbb')
+        by = self.by_file('context')
+        self.assertEqual(by['aaaa.jsonl']['handoff_to'],
+                         key(os.path.join(self.projects, '-Users-me-Work-proj', 'bbbb.jsonl')))
+        self.assertIsNone(by['bbbb.jsonl']['handoff_to'])
+
+    def says(self, text):
+        """An assistant row whose text is text."""
+        return asst(f'says-{self.clock}', [{'type': 'text', 'text': text}], ts=self.ts())
+
+    def writes(self, path):
+        """An assistant row whose Write call writes path."""
+        return asst(f'writes-{self.clock}', [tool_use(f'wr{self.clock}', 'Write', {'file_path': path, 'content': 'x'})],
+                    ts=self.ts())
+
+    def by_file(self, name):
+        """The --json sessions' name field, by transcript file name."""
+        return {os.path.basename(s['file']): s[name] for s in self.json()['sessions']}
+
+    def test_json_a_sessions_goal_is_its_last_goal_line(self):
+        self.session([self.says('Path: Full\nGoal: UI slice'), self.says('Now:\nGoal: Brand'),
+                      self.says('The rule says to state Goal: <name>\nGoal: <name>')], project='proj')
+        self.assertEqual(self.by_file('goal'), {'sess-1.jsonl': 'Brand'})
+
+    def test_json_a_briefs_goal_line_is_the_started_sessions_goal(self):
+        self.session(self.handoff('Build the thing.\nGoal: UI slice', result='Proposed task_id: t1'),
+                     project='proj', sid='aaaa')
+        self.session([self.briefed('Build the thing.\nGoal: UI slice'), self.says('On it.')],
+                     project='proj', sid='bbbb')
+        self.assertEqual(self.by_file('goal'), {'aaaa.jsonl': None, 'bbbb.jsonl': 'UI slice'})
+
+    def test_json_an_unstarted_sessions_first_user_rows_goal_line_is_no_goal(self):
+        self.session([user('Task:\nBuild the thing.\nGoal: UI slice', ts=self.ts()), self.says('On it.')],
+                     project='proj')
+        self.assertEqual(self.by_file('goal'), {'sess-1.jsonl': None})
+
+    def test_json_a_later_user_rows_goal_line_is_no_goal(self):
+        skill = 'Base directory for this skill: /x/skills/writing-plans\n\n**Goal:** one line\nGoal: x'
+        self.session([user('build it', ts=self.ts()), self.says('ok'),
+                      user([{'type': 'text', 'text': skill}], ts=self.ts(), isMeta=True)], project='proj')
+        self.assertEqual(self.by_file('goal'), {'sess-1.jsonl': None})
+
+    def test_a_forks_copied_goal_lines_are_not_its_own(self):
+        parent = self.says('Goal: A')
+        parent['sessionId'] = 'par'
+        self.session([parent], project='proj', sid='par')
+        own = user('Task:\nDo B now.\nGoal: B', ts=self.ts(), sessionId='frk')
+        self.session([parent, own, self.says('ok')], project='proj', sid='frk')
+        # no start_session call started frk, so its first own user row's goal line is no goal either
+        self.assertEqual(self.by_file('goal'), {'par.jsonl': 'A', 'frk.jsonl': None})
+        self.assertEqual(self.run_report('--goals').splitlines(), [f'A\tlast {self.day}\t1 sessions\t0 records'])
+
+    def test_json_a_bold_plan_header_goal_is_no_goal(self):
+        self.session([self.says('Goal: UI slice'), self.says('# Plan\n\n**Goal:** Records carry facts')],
+                     project='proj')
+        self.assertEqual(self.by_file('goal'), {'sess-1.jsonl': 'UI slice'})
+
+    def test_json_goal_none_is_stated_and_takes_no_record_goal(self):
+        self.session([self.says('Path: Small\nGoal: none'), self.record_write('c0ffee01')], project='proj')
+        self.records([run_record(head='c0ffee01', schema=8, goal='UI slice')])
+        data = self.json()
+        self.assertEqual(data['runs'][0]['goal'], 'UI slice')
+        self.assertIsNone(data['sessions'][0]['goal'])
+
+    def test_json_a_session_without_a_goal_line_takes_its_newest_held_records_goal(self):
+        self.session([self.says('ok'), self.record_write('aaaa1111'), self.record_write('bbbb2222', base='aaaa1111')],
+                     project='proj', sid='s1')
+        self.session([self.says('ok'), self.record_write('cccc3333'), self.record_write('dddd4444', base='cccc3333')],
+                     project='proj', sid='s2')
+        self.records([run_record(head='aaaa1111', schema=8, goal='A', date='2026-11-05T11:00:00Z'),
+                      run_record(head='bbbb2222', schema=8, goal='B', date='2026-11-05T12:00:00Z'),
+                      run_record(head='cccc3333', schema=8, goal='A', date='2026-11-05T11:00:00Z'),
+                      run_record(head='dddd4444', schema=8, goal=None, date='2026-11-05T12:00:00Z')])
+        self.assertEqual(self.by_file('goal'), {'s1.jsonl': 'B', 's2.jsonl': None})
+
+    SPEC = {'project': '/p', 'path': 'docs/superpowers/specs/s.md'}
+
+    def test_json_a_session_takes_the_spec_of_the_newest_record_it_holds(self):
+        self.session([self.says('ok')] + self.handoff(), project='proj', sid='aaaa')
+        self.session([self.briefed(), self.record_write('aaaa1111'), self.record_write('bbbb2222', base='aaaa1111')],
+                     project='proj', sid='bbbb')
+        self.session([self.says('unrelated')], project='proj', sid='cccc')
+        other = {'project': '/p', 'path': 'docs/superpowers/specs/old.md'}
+        self.records([run_record(head='aaaa1111', schema=8, spec=other, date='2026-11-05T11:00:00Z'),
+                      run_record(head='bbbb2222', schema=8, spec=self.SPEC, date='2026-11-05T12:00:00Z')])
+        self.assertEqual(self.by_file('spec'), {'aaaa.jsonl': self.SPEC, 'bbbb.jsonl': self.SPEC, 'cccc.jsonl': None})
+
+    def test_json_a_session_that_wrote_a_spec_in_a_worktree_takes_it(self):
+        self.session([self.writes('/p/.claude/worktrees/w/docs/superpowers/specs/s.md'),
+                      self.writes('/p/.claude/worktrees/w/docs/superpowers/plans/pl.md'),
+                      self.writes('/p/.claude/worktrees/w/docs/superpowers/specs/other.md')], project='proj', sid='ww')
+        self.session([self.says('ok'), self.record_write('c0ffee01')], project='proj', sid='rr')
+        self.records([run_record(head='c0ffee01', schema=8, spec=self.SPEC)])
+        self.assertEqual(self.by_file('spec'), {'ww.jsonl': self.SPEC, 'rr.jsonl': self.SPEC})
+
+    def test_json_a_started_session_takes_its_starters_spec(self):
+        self.session(self.handoff('Build B, in full', result='Proposed task_id: t1') + [self.record_write('c0ffee01')],
+                     project='proj', sid='aaaa')
+        self.session([self.briefed('Build B, in full')] + self.handoff('Build C, in full', result='Proposed'),
+                     project='proj', sid='bbbb')
+        self.session([self.briefed('Build C, in full'), self.says('ok')], project='proj', sid='cccc')
+        # xxxx and yyyy each started the other
+        self.session([self.briefed('Cycle to xxxx')] + self.handoff('Cycle to yyyy', result='Proposed'),
+                     project='proj', sid='xxxx')
+        self.session([self.briefed('Cycle to yyyy')] + self.handoff('Cycle to xxxx', result='Proposed'),
+                     project='proj', sid='yyyy')
+        self.records([run_record(head='c0ffee01', schema=8, spec=self.SPEC)])
+        self.assertEqual(self.by_file('spec'), {'aaaa.jsonl': self.SPEC, 'bbbb.jsonl': self.SPEC,
+                                                'cccc.jsonl': self.SPEC, 'xxxx.jsonl': None, 'yyyy.jsonl': None})
+
+    def test_goals_lists_known_goals_newest_first(self):
+        self.assertEqual(self.run_report('--goals'), 'Goals: none\n')
+        self.session([self.says('Goal: none'), asst('a', [{'type': 'text', 'text': 'Goal: A'}],
+                                                     ts='2026-11-06T10:00:00.000Z')], project='proj')
+        self.records([run_record(schema=8, goal='A', date='2026-11-04T12:00:00Z'),
+                      run_record(schema=8, goal='B', date='2026-11-05T12:00:00Z'),
+                      run_record(schema=8, goal=None, date='2026-11-06T12:00:00Z')])
+        self.assertEqual(self.run_report('--goals').splitlines(),
+                         ['A\tlast 2026-11-06\t1 sessions\t1 records', 'B\tlast 2026-11-05\t0 sessions\t1 records'])
 
     def test_json_context_ignores_a_subagents_compaction(self):
         sub = [asst('sub', ts='2026-11-05T09:30:03.000Z'),
@@ -3363,6 +3580,14 @@ class HealthCheck(Report):
         started = self.handoff()
         started[0]['message']['usage'] = usage(None, 310_000, 0)
         self.session(started + [self.turn_end()])
+        self.assertEqual(self.cap_warns(), [])
+
+    def test_a_forks_copied_handoff_raises_its_threshold(self):
+        self.day = CAP_OFFER_FROM
+        parent = self.handoff(sid='zzzz') + [dict(self.turn_end(), sessionId='zzzz')]
+        parent[0]['message']['usage'] = usage(None, 310_000, 0)
+        self.session(parent, sid='zzzz')
+        self.session(parent + [user('Fork here', ts=self.ts(), sessionId='0000')], sid='0000')
         self.assertEqual(self.cap_warns(), [])
 
     def test_a_compaction_resets_the_threshold(self):
@@ -3588,13 +3813,16 @@ class HealthCheck(Report):
         self.assertEqual(self.json()['totals']['skills']['simplify']['outcomes'], {'none': 1})
 
     def cache_fixture(self):
-        """A covered kit run with a reviewed final review, and a second session with an advisor iteration, a hook
-        decision and a typed trigger."""
+        """A covered kit run, its record of schema 8 with a headline, spec and goal, with a reviewed final review, a
+        goal line and a start_session call, the session it started, and a second session with an advisor iteration, a
+        hook decision and a typed trigger."""
         rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
                              sub_model='claude-fable-5-1', sub_effort='high', subagent_type='final-reviewer',
                              description='Final review')
+        rows += [self.says('Path: Full\nGoal: UI slice')] + self.handoff('Build the next slice, in full')
         self.kit_run(steps=[dict(self.KIT_STEP, agent_id='kr'), {'step': 'final_review', 'counts': {}, 'findings': []}],
-                     rows=rows)
+                     rows=rows, schema=8, headline='Kits get checked', spec=self.SPEC, goal='UI slice')
+        self.session([self.briefed('Build the next slice, in full'), self.says('ok')], project='proj', sid='sess-3')
         self.session([asst('adv', iterations=[executor(), ADVISOR], ts=self.ts()),
                       hook_row('guard-main-commit.py', decision('ask', 'commit on main'), ts=self.ts()),
                       user('grill me', ts=self.ts())], project='proj', sid='sess-2')
@@ -3602,7 +3830,8 @@ class HealthCheck(Report):
     def outputs(self, *cache):
         data = self.json(*cache)
         data.pop('generated')
-        return data, self.run_report('--health', *cache), self.run_report('--brief', *cache)
+        return (data, self.run_report('--health', *cache), self.run_report('--brief', *cache),
+                self.run_report('--goals', *cache))
 
     def test_the_cache_never_changes_the_report(self):
         self.cache_fixture()

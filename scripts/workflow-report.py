@@ -2,7 +2,8 @@
 """Read-only report over Claude Code transcripts and the workflow run log.
 
 Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--agents DIR] [--export-stamp FILE]
-                          [--cache DIR] [--no-cache] [--brief | --health | --schema | --json | --html [FILE]]
+                          [--cache DIR] [--no-cache]
+                          [--brief | --health | --schema | --json | --goals | --html [FILE]]
                           [--changed-since CURSOR] [--now ISO]
 
   --projects  transcript tree (default ~/.claude/projects)
@@ -29,25 +30,30 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               pinned model, effort and skills, and the skills the run's path requires, for schema 3 plan runs a
               required offer with no entry, and for schema 4 records each step's agent id against the launched
               dispatches, and for schema 5 records each finding's category and validity, each review step's
-              strengths and their number against its report's count line, and for a run whose stage was read on or
-              after the stages by pace day it warns on a main session on Fable where its stage calls for Opus
-              (stage_model_differs); then information lines: the "fixed, not proportionate" counts, archives
-              missing or with another Started: time, the runs whose git evidence is unavailable, and over this
-              week's main transcripts the inline sweeps and those that went 50 or more calls past the context cap
-              with no handoff
+              strengths and their number against its report's count line, for schema 8 records a missing
+              headline, goal or (plan and Full) spec, and for a run whose stage was read on or after the stages by
+              pace day it warns on a main session on Fable where its stage calls for Opus (stage_model_differs);
+              then information lines: the "fixed, not proportionate" counts, archives missing or with another
+              Started: time, the runs whose git evidence is unavailable, and over this week's main transcripts the
+              inline sweeps and those that went 50 or more calls past the context cap with no handoff
   --schema    print the run record schema, with the finding category list under "category_list", and exit
   --json      print one JSON object, and nothing else: "version" (1; adding keys keeps it, renaming or removing one
               bumps it), "generated", "since", "now", "categories" (the finding category list, with its version,
               tie-break rule, validity definitions and areas), "stage_table" (the main session's recommended model and
               effort, by path and stage), "changes" (the workflow's major changes, each with the day it was installed,
-              its title and its PR), "runs" (each record in range as written, its window and what the window,
+              its title and its PR), "runs" (each record in range as written, its headline, spec and goal, its
+              window and what the window,
               over a handed-off run's whole chain of transcripts, shows: dispatches, skills, refusals, models, tokens
-              and cost, advisor, its spend by phase, its main calls' context, tool-result characters by call class and
+              and cost, advisor, its spend by phase, its main calls' context (with context.handoff_to, the key of the
+              session handed off to), tool-result characters by call class and
               inline and delegated sweeps, its WARN and information lines, later fix commits), "sessions" (each main
               transcript's rows in range outside its run windows, with their models, advisor, spend by phase, main
               calls' context, tool-result characters and sweeps, and its start, end and project over the whole
               transcript, and its slash commands, never split by run windows, by name and time, never their
-              arguments) and
+              arguments, and who started it (started_by: the starter's key and started or handoff), its goal (its
+              last plain "Goal:" line, else its brief's, else its newest held record's; null for none) and spec (its
+              newest held record's, else the record-named spec it last wrote, else its starter's), its context
+              also carrying context.handoff_to) and
               "totals" (scoreboard, weeks, context (the units' context, tool-result characters and sweeps by week),
               run_time, skills, models, advisor, offers, health); each WARN also as an
               object with its kind, run or session, step, skill and agent, each session's title, each step's agent
@@ -55,6 +61,9 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               pair's second half, and each finding's category and validity and each review step's strengths. Every
               transcript row belongs to one run or to its transcript's session, so every total is a sum over the
               runs and sessions exported. It holds personal data: print it, never write it into a repo
+  --goals     one line per known goal, newest first: the goal, the last day it was used and how many sessions and
+              records name it, from every record in the log and every goal line in every main transcript, all time,
+              or "Goals: none"
   --changed-since CURSOR  with --json: print only the runs and sessions whose entry changed since the export that
               gave CURSOR, the keys removed since, and a new cursor; 0 or an unknown cursor exports everything; refused
               with --since or --no-cache
@@ -171,7 +180,7 @@ def category_list():
             'areas': [{'area': area, 'steps': list(kinds), 'list': CATEGORIES[key]} for area, kinds, key in AREAS]}
 
 SCHEMA = {
-    'schema': 'int, record format: 7; a record without it is 1',
+    'schema': 'int, record format: 8; a record without it is 1',
     'date': 'ISO 8601 time the run finished',
     'started': 'ISO 8601 time the session named the run\'s path and stage, in its first message',
     'project': 'absolute path of the project',
@@ -181,6 +190,10 @@ SCHEMA = {
     'path': '"small", "full" or "plan"; a plan record leaves out tasks, fix_rounds, failing_test, fix_growth and '
             'simplify, and base and head are optional on it',
     'plan': 'path of the plan file, on plan records and on runs that build from a plan',
+    'headline': 'one line saying what the run achieved, written by the finishing session from its ledger (schema 8)',
+    'spec': '{"project": absolute path of the spec\'s own project, its main checkout, "path": the spec\'s path under '
+            'that project\'s root}, on plan records and Full runs; absent on a Small run with no spec (schema 8)',
+    'goal': 'the goal\'s name, or null for none; never left out (schema 8)',
     'archive': 'path of the run\'s ledger in the archive, or absent',
     'risk_area': 'bool',
     'stage': 'Fable stage: "1", "2", "3" or "out"',
@@ -286,7 +299,8 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-17', 'Final reviewer back on Fable at high; the pair measure ends', 'claude-workflow#49'),
            ('2026-11-17', "The dispatch hook refuses a pair's second half again", 'claude-workflow#50'),
            ('2026-11-17', 'Sessions offer to archive themselves once their work is done', 'claude-workflow#50'),
-           ('2026-11-17', 'Fable stages by pace; the all-model limit gets the same pace rule', 'claude-workflow#57'))
+           ('2026-11-17', 'Fable stages by pace; the all-model limit gets the same pace rule', 'claude-workflow#57'),
+           ('2026-11-17', 'Goals and one change per session', 'claude-workflow#58'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
@@ -398,15 +412,17 @@ SUPERPOWERS_TAG = b'<using-superpowers-session-start>'
 RUN_LOG = 'workflow-log.jsonl'
 # Only lines matching this can hold a dispatch, a simplify call, a record write, the startup block, an error, a skill
 # load (the hook's using-superpowers block included, which it prints alone when the karpathy file is unreadable), a
-# typed trigger, a spec or plan write, a session title, a handoff, a compaction, a handoff offer, a turn end or the
-# Stop hook's blocking error before it. A typed command shows as <command-name>/name</command-name>.
+# typed trigger, a spec or plan write, a session title, a handoff, a compaction, a handoff offer, a turn end, the
+# Stop hook's blocking error before it or a goal line. A typed command shows as <command-name>/name</command-name>.
 HEALTH_NEEDLES = (b'"Agent"', b'simplify', b'workflow-log.jsonl', b'karpathy-guidelines-session-start',
                   b'using-superpowers-session-start',
                   b'"is_error":true', b'"is_error": true', b'Base directory for this skill', b'rill me',
                   b'command-name', b'docs/superpowers/', b'"custom-title"', b'start_session',
-                  b'isCompactSummary', b'wrap_up', b'AskUserQuestion', b'stop_hook_summary', b'hook_blocking_error')
+                  b'isCompactSummary', b'wrap_up', b'AskUserQuestion', b'stop_hook_summary', b'hook_blocking_error',
+                  b'"Goal:', b'\\nGoal:')
 SKILL_LOADED = 'Base directory for this skill: '
 SPECS_AND_PLANS = {'spec': 'docs/superpowers/specs/', 'plan': 'docs/superpowers/plans/'}
+GOAL_LINE = re.compile(r'^Goal: *(.+?) *$', re.M)  # plain only, so a plan header's **Goal:** line is never a goal
 
 
 def command_re(name):
@@ -463,7 +479,7 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'opus', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 10
+CACHE_VERSION = 13
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
 
@@ -1199,6 +1215,18 @@ def read_offers(rec):
             if isinstance(o, dict) and isinstance(o.get('skill'), str) and o.get('outcome') in OFFER_OUTCOMES]
 
 
+def goal_name(value):
+    """A goal's name: a string stripped, non-empty and not "none" (any case), else None."""
+    name = value.strip() if isinstance(value, str) else ''
+    return name if name and name.lower() != 'none' else None
+
+
+def goal_lines(text):
+    """The goal_name of each GOAL_LINE in text, in order, leaving out a value starting with '<' (a placeholder quoted
+    from the rules, such as Goal: <name>)."""
+    return [goal_name(value) for value in GOAL_LINE.findall(text) if not value.startswith('<')]
+
+
 def read_runs(log, stats):
     runs = []
     for rec in read_jsonl(log, stats):
@@ -1225,6 +1253,12 @@ def read_runs(log, stats):
         rec['simplify'] = {'ran': simplify.get('ran') if simplify.get('ran') in SIMPLIFY_RAN else None,
                            'applied': num(simplify.get('applied')), 'skipped': num(simplify.get('skipped'))}
         rec['fix_growth'] = field(rec, 'fix_growth', dict, None)
+        headline = field(rec, 'headline', str, '').strip()
+        rec['headline'] = headline or None
+        rec['goal'] = goal_name(rec.get('goal'))
+        spec = field(rec, 'spec', dict, {})
+        rec['spec'] = ({'project': spec['project'], 'path': spec['path']}
+                       if all(isinstance(spec.get(k), str) and spec[k] for k in ('project', 'path')) else None)
         runs.append(rec)
     return runs
 
@@ -1417,11 +1451,13 @@ def scan_events(path):
     start, clear or compaction),
     ('typed', skill) for a typed row matching a TYPED_TRIGGERS pattern, ('command', name) for a typed row's slash
     command, its first text that COMMAND matches, ('wrote', path) for a Write or Edit of a spec or plan, ('title',
-    text) for a custom-title row, ('handoff', brief) at the time of a START_SESSION call whose brief starts with
-    HANDOFF_MARKER, added when its result names a session, ('compact', None) for a compaction's summary row,
-    ('offer', None) for a WRAP_UP call with an action label, or an ASK_USER call with an option label, that OFFER_LABEL
-    matches, and ('turn_end', held) for a stop_hook_summary row, held when the line just before it is a Stop hook's
-    hook_blocking_error attachment (a failed hook fills hookErrors too, after a hook_non_blocking_error one).
+    text) for a custom-title row, ('start', prompt) for an own_row START_SESSION call with a prompt, whatever its
+    result, ('handoff', brief) at the time of any START_SESSION call whose brief starts with HANDOFF_MARKER, a fork's
+    copied one included, added when its result names a session, ('compact', None) for a compaction's summary row,
+    ('goal', name or None) for each goal_lines line of an own_row assistant text block, ('offer', None) for a WRAP_UP
+    call with an action label, or an ASK_USER call with an option label, that OFFER_LABEL matches, and ('turn_end',
+    held) for a stop_hook_summary row, held when the line just before it is a Stop hook's hook_blocking_error attachment
+    (a failed hook fills hookErrors too, after a hook_non_blocking_error one).
     A row with no timestamp takes the previous row's.
     Only lines holding one of HEALTH_NEEDLES are parsed, plus the result lines of calls still waiting for one.
     """
@@ -1475,7 +1511,10 @@ def scan_events(path):
                     if command is not None:
                         events.append((timestamp, 'command', command))
                 if kind == 'assistant':
+                    own = own_row(row, path)
                     for block in content or []:
+                        if block.get('type') == 'text' and isinstance(block.get('text'), str) and own:
+                            events.extend((timestamp, 'goal', goal) for goal in goal_lines(block['text']))
                         inp = block.get('input')
                         if block.get('type') != 'tool_use' or not isinstance(inp, dict):
                             continue
@@ -1484,10 +1523,13 @@ def scan_events(path):
                             kept = {k: field(inp, k, str, None) for k in ('subagent_type', 'model', 'effort',
                                                                            'description')}
                             events.append((timestamp, 'agent', (block['id'], kept)))
-                        elif (block.get('name') == START_SESSION and isinstance(block.get('id'), str)
-                              and HANDOFF_MARKER.match(field(inp, 'prompt', str, ''))):
-                            pending[block['id']] = block['id'].encode()
-                            handoffs[block['id']] = (timestamp, inp['prompt'])
+                        elif block.get('name') == START_SESSION:
+                            prompt = field(inp, 'prompt', str, '')
+                            if prompt and own:
+                                events.append((timestamp, 'start', prompt))
+                            if isinstance(block.get('id'), str) and HANDOFF_MARKER.match(prompt):
+                                pending[block['id']] = block['id'].encode()
+                                handoffs[block['id']] = (timestamp, prompt)
                         elif block.get('name') == 'Bash' and RUN_LOG in str(inp.get('command')):
                             events.append((timestamp, 'write', inp['command']))
                         elif (block.get('name') in ('Write', 'Edit') and isinstance(inp.get('file_path'), str)
@@ -1594,32 +1636,68 @@ def main_transcripts(projects_root):
     return sorted(glob.glob(os.path.join(glob.escape(projects_root), '*', '*.jsonl')))
 
 
+def own_row(row, path):
+    """Whether row is the transcript's own: its sessionId is missing or the file's name, so not a fork's copy."""
+    sid = row.get('sessionId')
+    return sid is None or sid == os.path.basename(path)[:-len('.jsonl')]
+
+
 @functools.lru_cache(maxsize=None)
 def first_user_text(path):
-    """The texts of the transcript's first user row whose content is a string or holds text blocks, joined by newlines,
-    reading no further; '' when it has none."""
+    """The texts of the transcript's first own_row user row whose content is a string or holds text blocks, joined by
+    newlines, reading no further; '' when it has none."""
     for row in read_jsonl(path, {'skipped': 0}):
         msg = row.get('message')
-        texts = result_texts(msg.get('content')) if row.get('type') == 'user' and isinstance(msg, dict) else []
+        texts = (result_texts(msg.get('content')) if row.get('type') == 'user' and isinstance(msg, dict)
+                 and own_row(row, path) else [])
         if texts:
             return '\n'.join(texts)
     return ''
 
 
 @functools.lru_cache(maxsize=None)
-def handoff_map(projects_root):
-    """{successor path: (predecessor path, timestamp)} for each handoff in the main transcripts: a main transcript
-    whose first user row holds a handoff's brief is that handoff's successor, its predecessor the transcript that made
-    the call, at the call's time; the first handoff found for a successor wins."""
+def briefed_map(projects_root, kind):
+    """{successor path: (path, timestamp, brief)} for each event of kind ('handoff' or 'start') in the main
+    transcripts: another main transcript whose first user row holds the event's brief is its successor, path the
+    transcript that made the call, at the call's time; the first found by path wins. A handoff counts only with an
+    own start event of the same time and brief, so a fork's copied handoff call ties no successor."""
     mains = main_transcripts(projects_root)
     found = {}
     for path in mains:
-        for timestamp, kind, brief in transcript_events(path)[0]:
-            if kind == 'handoff':
+        events = transcript_events(path)[0]
+        starts = {(timestamp, brief) for timestamp, k, brief in events if k == 'start'}
+        for timestamp, k, brief in events:
+            if k == kind and (k == 'start' or (timestamp, brief) in starts):
                 for successor in mains:
-                    if brief in first_user_text(successor):
-                        found.setdefault(successor, (path, timestamp))
+                    if successor != path and brief in first_user_text(successor):
+                        found.setdefault(successor, (path, timestamp, brief))
     return found
+
+
+@functools.lru_cache(maxsize=None)
+def handoff_map(projects_root):
+    """{successor path: (predecessor path, timestamp)} for each handoff in the main transcripts, by briefed_map."""
+    return {successor: (path, timestamp)
+            for successor, (path, timestamp, _) in briefed_map(projects_root, 'handoff').items()}
+
+
+@functools.lru_cache(maxsize=None)
+def starter_map(projects_root):
+    """{started path: (starter path, 'handoff' or 'started')} for each start_session call in the main transcripts, by
+    briefed_map: 'handoff' when its brief starts with HANDOFF_MARKER."""
+    return {successor: (path, 'handoff' if HANDOFF_MARKER.match(brief) else 'started')
+            for successor, (path, _, brief) in briefed_map(projects_root, 'start').items()}
+
+
+def handoff_to(paths, context):
+    """context with handoff_to, the unit_key of the session its handoff went to from one of paths, the unit's main
+    transcripts, else None; None when context is None."""
+    if context is None:
+        return None
+    projects_root = os.path.dirname(os.path.dirname(paths[0]))
+    calls = {(p, context['handoff']) for p in paths}
+    to = next((successor for successor, made in handoff_map(projects_root).items() if made in calls), None)
+    return dict(context, handoff_to=None if to is None else unit_key(to))
 
 
 def chain_paths(path):
@@ -2568,6 +2646,18 @@ def unpriced_warnings(unpriced):
             for model in sorted(unpriced)]
 
 
+def missing_facts(run):
+    """A schema 8 record's warning naming the facts it leaves out: headline, spec (on plan and Full records) and the
+    goal key."""
+    if run['schema'] < 8:
+        return []
+    names = [name for name, missing in (
+        ('headline', run['headline'] is None),
+        ('spec', run['spec'] is None and field(run, 'path', str, None) in ('plan', 'full')),
+        ('goal', 'goal' not in run['_raw'])) if missing]
+    return [problem('record_fact_missing', 'record lacks ' + ', '.join(names))] if names else []
+
+
 def health(projects_root, runs, now, records, pins, spans):
     """Warnings for the problems the transcripts and git show in each run, for this week's sessions with no run
     record and for this week's plan reviews with no plan simplify, then the information lines, then each run's own
@@ -2579,6 +2669,7 @@ def health(projects_root, runs, now, records, pins, spans):
         label = f"{r.get('branch')} ({run_date(r)})"
         span = span_of.get(id(r))
         problems = check_run(*span, r, pins) if span else [problem('no_transcript', 'no session transcript found')]
+        problems += missing_facts(r)
         finals = [d['report'] for d in span_dispatches(*span)
                   if d['report'] is not None and d['kind'] == 'final_review' and not d['pair']] if span else []
         git_problems, usable = check_git(r, finals[-1] if finals else '')
@@ -2857,6 +2948,7 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
              'final_findings': r['final_findings'],
              'simplify': r['simplify'], 'waves': r['waves'], 'kits': r['kits'],
              'kit_checks': r['kit_checks'], 'offers': r['offers'], 'categories': r['categories'],
+             'headline': r['headline'], 'spec': r['spec'], 'goal': r['goal'],
              'fable_points': run_points(r, 'fable_start', 'fable_end'),
              'all_points': run_points(r, 'all_start', 'all_end'),
              'minutes': (r['_time'] - r['_started']).total_seconds() / 60 if known else None,
@@ -2920,7 +3012,7 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
                  missing_skills=missing, refusals=refusal_counts(events), models=tr.models, phases=tr.phase_list(),
                  efforts=tr.efforts, advisor=unit_advisor(tr), notes=unit_notes(tr),
                  main={'model': model, 'effort': effort}, title=transcript_title(path),
-                 context=context_facts(tr.contexts, own_events), tool_results=tr.tool_results,
+                 context=handoff_to(mains, context_facts(tr.contexts, own_events)), tool_results=tr.tool_results,
                  sweeps=sweep_counts(tr.calls, own_events, span_events(*span)[1]))
     return entry
 
@@ -3198,6 +3290,37 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         run_typed = [t for p, _ in chain_paths(path) for t in unit_typed(p, i)] if path else []
         entries.append(run_entry(r, spans.get(i), own_warns, own_info, pins, seen, lambda p: owned_by(p, i),
                                  run_events.get(i, []), run_typed, git_evidence))
+    # A session holds the records whose span transcript is it or has it earlier in its handoff chain, newest first.
+    holds = {}
+    for i in sorted(spans, key=lambda i: (records[i]['_time'] is not None, records[i]['_time'] or now, i),
+                    reverse=True):
+        for p, _ in chain_paths(spans[i][0]):
+            holds.setdefault(p, []).append(records[i])
+    named = [r['spec'] for r in records if r['spec'] is not None]
+
+    def session_goal(path):
+        """The transcript's last goal line, else its brief's when a start_session call started it, else the goal of
+        the newest record it holds."""
+        goals = ([value for _, kind, value in transcript_events(path)[0] if kind == 'goal']
+                 or (goal_lines(first_user_text(path)) if path in starter_map(projects_root) else []))
+        return goals[-1] if goals else holds[path][0]['goal'] if path in holds else None
+
+    def session_spec(path):
+        """The newest held record's spec, else the record-named spec the transcript last wrote, else its starter's,
+        followed up the starters until one is already seen."""
+        visited = set()
+        while path is not None and path not in visited:
+            visited.add(path)
+            spec = holds[path][0]['spec'] if path in holds else None
+            if spec is None:
+                spec = next((s for _, kind, value in reversed(transcript_events(path)[0]) if kind == 'wrote'
+                             for s in named if value.startswith(s['project'] + '/')
+                             and value.endswith('/' + s['path'])), None)
+            if spec is not None:
+                return spec
+            path = starter_map(projects_root).get(path, (None,))[0]
+        return None
+
     sessions = []
     for path, main_events in events.items():
         keep = owned_by(path, None)
@@ -3210,6 +3333,7 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
         rest = unit_events((path, start, end), None)
         own_events = [e for e in main_events if keep(e[0])]
         whole = file_usage(path)
+        starter = starter_map(projects_root).get(path)
         sessions.append({'file': path, 'start': whole['first'], 'end': whole['last'], 'project': whole['cwd'],
                          'commands': [{'name': v, 'time': t} for t, k, v in main_events
                                       if k == 'command' and held(path, (t, k, v))],
@@ -3218,11 +3342,13 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
                          'models': tr_session.models, 'phases': tr_session.phase_list(), 'efforts': tr_session.efforts,
                          'advisor': unit_advisor(tr_session), 'notes': unit_notes(tr_session),
                          'refusals': refusal_counts(rest),
-                         'context': context_facts(tr_session.contexts, own_events),
+                         'context': handoff_to([path], context_facts(tr_session.contexts, own_events)),
                          'tool_results': tr_session.tool_results,
                          'sweeps': sweep_counts(tr_session.calls, own_events, transcript_events(path)[1]),
                          'startup': transcript_events(path)[2], 'warns': texts(own), 'warnings': own,
-                         'title': transcript_title(path), 'key': unit_key(path)})
+                         'title': transcript_title(path), 'key': unit_key(path),
+                         'started_by': None if starter is None else {'key': unit_key(starter[0]), 'how': starter[1]},
+                         'goal': session_goal(path), 'spec': session_spec(path)})
     units = entries + sessions
     warns = warns + unpriced_warnings(seen.unpriced)
     advisor = advisor_facts(sum_advisor(u['advisor'] for u in units if u['advisor'] is not None),
@@ -3245,6 +3371,28 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
                    'models': model_totals(runs, entries), 'advisor': advisor, 'offers': offer_totals(runs),
                    'health': {'warns': texts(warns), 'warnings': warns, 'info': info}},
     }
+
+
+def known_goals(projects_root, records, now):
+    """[(goal, the last day it was used or None, how many main transcripts name it, how many records)] for every
+    goal of a record in records or of a goal line in a main transcript up to now, newest first, then by name."""
+    days, transcripts, recs = {}, {}, {}
+    for r in records:
+        if r['goal'] is not None:
+            days.setdefault(r['goal'], []).append(r['_time'])
+            recs[r['goal']] = recs.get(r['goal'], 0) + 1
+    for path in main_transcripts(projects_root):
+        named = set()
+        for timestamp, kind, goal in transcript_events(path)[0]:
+            if kind == 'goal' and goal is not None and in_range(timestamp, None, now):
+                days.setdefault(goal, []).append(parse_time(timestamp))
+                named.add(goal)
+        for goal in named:
+            transcripts[goal] = transcripts.get(goal, 0) + 1
+    last = {goal: max((t.date().isoformat() for t in times if t is not None), default=None)
+            for goal, times in days.items()}
+    return [(goal, last[goal], transcripts.get(goal, 0), recs.get(goal, 0))
+            for goal in sorted(sorted(days), key=lambda g: last[g] or '', reverse=True)]
 
 
 def unit_key(text):
@@ -3494,6 +3642,7 @@ def main():
     mode.add_argument('--health', action='store_true')
     mode.add_argument('--schema', action='store_true')
     mode.add_argument('--json', action='store_true')
+    mode.add_argument('--goals', action='store_true')
     mode.add_argument('--html', nargs='?', metavar='FILE',
                       const=os.path.expanduser('~/.claude/workflow-dashboard.html'))
     args = ap.parse_args()
@@ -3519,6 +3668,11 @@ def main():
     stats = {'skipped': 0}
     records = [r for r in read_runs(args.log, stats) if r['_time'] is None or r['_time'] <= now]
     runs = [r for r in records if since is None or r['_time'] is None or r['_time'] >= since]
+    if args.goals:
+        goals = known_goals(args.projects, records, now)
+        print('\n'.join(f'{goal}\tlast {day or "unknown"}\t{n} sessions\t{m} records' for goal, day, n, m in goals)
+              or 'Goals: none')
+        return 0
     pins = read_pins(args.agents)
     spans = run_spans(args.projects, records, now)
     if args.health:
