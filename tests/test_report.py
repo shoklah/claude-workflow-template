@@ -1880,18 +1880,22 @@ class HealthCheck(Report):
                       'category or summary', self.health())
 
     def test_schema_5_label_and_strength_gaps_are_warned(self):
-        unlabelled = [{'id': 'F1', 'severity': 'minor', 'summary': 's', 'outcome': 'deferred', 'category': 'nope',
-                       'validity': 'valid'}]
+        finding = {'severity': 'minor', 'summary': 's', 'outcome': 'deferred', 'validity': 'valid'}
+        # F1 has no category, F2 one that is off its step's list, F3 an off-list one and no validity, F4 an empty one.
+        unlabelled = [dict(finding, id='F1'), dict(finding, id='F2', category='nope'),
+                      dict(finding, id='F3', category='efficiency', validity=None), dict(finding, id='F4', category='')]
         self.labelled_run([{'category': 'tests', 'summary': 's'}] * 4, 'Findings: critical=0 important=0 minor=1 strengths=2',
                           None, 'Findings: critical=0 important=0 minor=0 unneeded=0 strengths=0', findings=unlabelled)
         prefix = 'WARN: b (2026-11-05): '
         self.assertEqual(sorted(l for l in self.health() if 'strength' in l or 'categor' in l), sorted([
-            prefix + 'task_review step 1 findings F1 have no category or validity',
+            prefix + 'task_review step 1 findings F1, F3, F4 have no category or validity',
+            prefix + 'task_review step 1 findings F2 (nope), F3 (efficiency) have a category off the list',
             prefix + 'task_review step 1 strengths are missing, more than three, or lack a category or summary',
             prefix + "task_review step 1 has 4 strengths, its report's count line says 2",
             prefix + 'final_review step 1 strengths are missing, more than three, or lack a category or summary']))
         kinds = {w['kind']: w for w in self.json()['runs'][0]['warnings']}
         self.assertEqual(kinds['findings_unlabelled']['step'], {'step': 'task_review', 'task': None, 'round': 0, 'wave': 'A'})
+        self.assertEqual(kinds['category_off_list']['step'], kinds['findings_unlabelled']['step'])
         self.assertIn('strengths_unrecorded', kinds)
 
     def mismatched_run(self, loads=('subagent-driven-development',)):

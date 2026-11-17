@@ -1094,6 +1094,12 @@ def read_category(obj, ids):
     return value if value in ids else None
 
 
+def off_list_category(obj, ids):
+    """obj's category when it is a non-empty string not among ids, else None."""
+    value = field(obj, 'category', str, None)
+    return value if value and value not in ids else None
+
+
 def read_steps(rec):
     """The record's steps, cleaned: a step that isn't a dict of a known kind is dropped, other bad values read as
     absent."""
@@ -1107,7 +1113,7 @@ def read_steps(rec):
             strengths = [{'category': read_category(s, ids), 'summary': field(s, 'summary', str, None)}
                          for s in strengths if isinstance(s, dict)]
         findings = [{'id': field(f, 'id', str, None), 'severity': field(f, 'severity', str, None),
-                     'category': read_category(f, ids),
+                     'category': read_category(f, ids), 'off_list': off_list_category(f, ids),
                      'validity': f.get('validity') if f.get('validity') in VALIDITY else None,
                      'label': field(f, 'label', str, None),
                      'kind': field(f, 'kind', str, None), 'summary': field(f, 'summary', str, None),
@@ -2091,10 +2097,16 @@ def check_steps(run, dispatches, events, pins):
     if run['schema'] >= 5:
         for i, step in enumerate(run['steps']):
             kind = step['step']
-            unlabelled = [f['id'] or '?' for f in step['findings'] if f['category'] is None or f['validity'] is None]
+            # A category off the step's list reads as absent; it is named in its own warning, not counted as missing.
+            unlabelled = [f['id'] or '?' for f in step['findings']
+                          if (f['category'] is None and f['off_list'] is None) or f['validity'] is None]
             if unlabelled:
                 problems.append(problem('findings_unlabelled', f"{kind} step {nth[i]} findings {', '.join(unlabelled)} "
                                         f"have no category or validity", step=step))
+            off_list = [f"{f['id'] or '?'} ({f['off_list']})" for f in step['findings'] if f['off_list'] is not None]
+            if off_list:
+                problems.append(problem('category_off_list', f"{kind} step {nth[i]} findings {', '.join(off_list)} "
+                                        f"have a category off the list", step=step))
             strengths = step['strengths']
             if kind in STRENGTH_STEPS and (strengths is None or len(strengths) > 3 or any(
                     s['category'] is None or s['summary'] is None for s in strengths)):
