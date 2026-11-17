@@ -1,4 +1,4 @@
-# claude-workflow
+# roland
 
 An agentic workflow for Claude Code. It sets how a task is routed, which model does each role, how work is reviewed and when a run stops for the owner, meaning you. This repo holds the parts that enforce it: hooks, custom agents, a `CLAUDE.md` section and three scripts. It also has an installer that puts them into `~/.claude`.
 
@@ -263,11 +263,11 @@ install.py       the installer
 Clone the repo and run the suite first (see [Tests](#tests)):
 
 ```bash
-git clone https://github.com/<your-github-user>/claude-workflow.git
+git clone https://github.com/<your-github-user>/roland.git
 ```
 
 ```bash
-cd claude-workflow
+cd roland
 ```
 
 The installer works one step at a time, so you can check each step before the next. Every write goes through a temp file and a rename. Invalid input stops with exit 2 before anything is written.
