@@ -25,7 +25,7 @@ OVER_CAP = {'input_tokens': 300_001, 'output_tokens': 1}  # the usage of one cal
 # The spec's phase order, as PHASES in scripts/workflow-report.py: keep them the same.
 PHASES = ('design', 'plan_writing', 'plan_simplify', 'plan_review', 'implement', 'task_review', 'kit_review',
           'fix_check', 'simplify', 'final_review', 'final_fix_check', 'coordination', 'unattributed')
-# PAIRS_FROM in scripts/workflow-report.py, the day the pair measure was installed: keep them the same.
+# The day the pair measure was installed, the day of its row in CHANGES in scripts/workflow-report.py.
 PAIRS_FROM = '2026-11-11'
 # CAP_OFFER_FROM in scripts/workflow-report.py, the day the context cap hook was installed: keep them the same.
 CAP_OFFER_FROM = '2026-11-12'
@@ -534,7 +534,7 @@ class Report(unittest.TestCase):
     def test_schema_4_steps_carry_the_agent_id(self):
         out = self.run_report('--schema')
         schema = json.loads(out)
-        self.assertEqual(schema['schema'], 'int, record format: 6; a record without it is 1')
+        self.assertEqual(schema['schema'], 'int, record format: 7; a record without it is 1')
         self.assertIn('"agent_id"', schema['steps'])
         self.assertIn('every kind but simplify', schema['steps'])
 
@@ -992,25 +992,12 @@ class HealthCheck(Report):
         rows = [self.startup(), self.simplify()] + self.pair(sid=sid)
         self.session([dict(row, timestamp=day + row['timestamp'][10:]) for row in rows], project='proj', sid=sid)
 
-    def test_brief_counts_pairs_from_the_measure_start_whatever_since_says(self):
-        start = datetime.date.fromisoformat(PAIRS_FROM)
-        later = (start + datetime.timedelta(days=2)).isoformat()
-        now = ('--now', later + 'T12:00:00Z')
-        self.pair_session('before', day=(start - datetime.timedelta(days=1)).isoformat())
-        self.assertNotIn('pairs:', self.run_report('--brief', *now))
+    def test_brief_no_longer_counts_pairs_now_the_measure_is_ruled(self):
+        later = (datetime.date.fromisoformat(PAIRS_FROM) + datetime.timedelta(days=2)).isoformat()
         self.pair_session('one')
-        self.pair_session('two')
-        brief = self.run_report('--brief', *now).splitlines()
-        self.assertEqual(len(brief), 4)
-        self.assertEqual(brief[2], 'pairs: 2 of 10')
-        self.assertEqual(self.run_report('--brief', *now, '--since', later).splitlines()[2], 'pairs: 2 of 10')
-        # a forked session copies the rows, timestamps and ids included: the pair counts once
-        folder = os.path.join(self.projects, 'proj')
-        shutil.copy(os.path.join(folder, 'two.jsonl'), os.path.join(folder, 'two-fork.jsonl'))
-        self.assertEqual(self.run_report('--brief', *now).splitlines()[2], 'pairs: 2 of 10')
-        for n in range(8):
-            self.pair_session(f'p{n}')
-        self.assertEqual(self.run_report('--brief', *now).splitlines()[2], 'pairs: 10 of 10 CHECKPOINT')
+        brief = self.run_report('--brief', '--now', later + 'T12:00:00Z')
+        self.assertNotIn('pairs:', brief)
+        self.assertEqual(len(brief.splitlines()), 3)
 
     def handed_off(self, calls):
         """An old session aaaa that dispatches an implementer, then makes calls, (prompt, result) pairs of
@@ -1683,12 +1670,12 @@ class HealthCheck(Report):
         self.session(rows, project='proj')
         self.assertEqual(self.health(), ['WARN: session sess-1.jsonl: plan review without plan-simplifier: Plan review'])
 
-    def pins(self, skills=False):
-        """A fixture agents folder: final-reviewer pinned opus/high, fix-checker sonnet/medium and implementer
+    def pins(self, skills=False, final='opus'):
+        """A fixture agents folder: final-reviewer pinned final/high, fix-checker sonnet/medium and implementer
         opus/medium, listing their skills only when skills is true."""
         folder = os.path.join(self.root, 'agents')
         os.makedirs(folder, exist_ok=True)
-        for name, model, effort, listed in (('final-reviewer', 'opus', 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
+        for name, model, effort, listed in (('final-reviewer', final, 'high', ['andrej-karpathy-skills:karpathy-guidelines']),
                                             ('fix-checker', 'sonnet', 'medium', []),
                                             ('implementer', 'opus', 'medium', [])):
             lines = ['---', f'name: {name}', 'description: d', f'model: {model}', f'effort: {effort}']
@@ -2023,6 +2010,31 @@ class HealthCheck(Report):
         )])
         self.assertEqual(self.kinds(), ['findings_dont_add_up'] * 4 + ['verdicts_dont_add_up'])
 
+    def test_a_ruled_severity_adds_up_under_the_reviewers(self):
+        def task(n, **extra):
+            return {'step': 'task_review', 'task': n, 'round': 0, 'counts': {'critical': 0, 'important': 0, 'minor': 1},
+                    'findings': [dict({'id': f'F{n}', 'severity': 'important', 'summary': 's', 'outcome': 'ruled',
+                                       'reason': 'r'}, **extra)]}
+        rows = []
+        for n in (1, 2, 3):
+            rows += self.reviewed(f'tr{n}', 'Findings: critical=0 important=0 minor=1', subagent_type='task-reviewer',
+                                  description=f'Review Task {n}')
+        # the reviewer said Minor and a ruling raised it; an unknown reported severity reads as absent
+        self.schema2_run([task(1, reported_severity='minor'), task(2, reported_severity='nope'), task(3)], rows)
+        self.assertEqual([line for line in self.health() if 'add up' in line],
+                         [f"WARN: b (2026-11-05): task_review step {n} findings don't add up to its counts"
+                          for n in (2, 3)])
+        self.assertEqual([[(f['severity'], f['reported_severity']) for f in s['findings']]
+                          for s in self.json()['runs'][0]['steps']],
+                         [[('important', 'minor')], [('important', None)], [('important', None)]])
+
+    def test_a_reported_severity_off_its_steps_count_line_reads_as_absent(self):
+        findings = [{'id': 'F1', 'severity': 'important', 'reported_severity': r} for r in ('minor', 'unneeded')]
+        self.records([run_record(schema=7, steps=[{'step': kind, 'counts': {}, 'findings': findings}
+                                                  for kind in ('final_review', 'kit_review')])])
+        self.assertEqual([[f['reported_severity'] for f in s['findings']] for s in self.json()['runs'][0]['steps']],
+                         [['minor', 'unneeded'], ['minor', None]])
+
     def test_an_agent_off_its_pin_is_warned_unless_the_stage_allows_it(self):
         prefix = 'WARN: b (2026-11-05): '
         cases = (
@@ -2086,6 +2098,26 @@ class HealthCheck(Report):
                                          sub_effort=effort, subagent_type=agent, description='Final review')
                 self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, date='2026-11-12T12:00:00Z')
                 args = ('--agents', self.pins(), '--now', '2026-11-13T12:00:00Z')
+                self.assertEqual(self.health(*args), expected)
+
+    def test_the_final_reviewers_opus_seat_passes_up_to_the_day_it_went_back_to_fable(self):
+        # PAST_PINS: final-reviewer was opus/high up to and on 2026-11-17, the day the pair measure's ruling was installed.
+        prefix = 'WARN: b (2026-11-19): '
+        cases = (
+            ('2026-11-17', 'claude-opus-5-5', ['Health: no problems']),
+            ('2026-11-18', 'claude-opus-5-5',
+             [prefix + 'final-reviewer ran on claude-opus-5-5/high, pinned fable/high: Final review']),
+            ('2026-11-18', 'claude-fable-5-2', ['Health: no problems']),
+        )
+        for day, model, expected in cases:
+            with self.subTest(day=day, model=model):
+                self.tearDown()
+                self.setUp()
+                self.day = day
+                rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0', sub_model=model,
+                                     sub_effort='high', subagent_type='final-reviewer', description='Final review')
+                self.schema2_run([SIMPLIFY_STEP, FINAL_STEP], rows, date='2026-11-19T12:00:00Z')
+                args = ('--agents', self.pins(final='fable'), '--now', '2026-11-20T12:00:00Z')
                 self.assertEqual(self.health(*args), expected)
                 self.assertEqual(self.kinds(*args), ['agent_off_pin'] if expected[0].startswith('WARN') else [])
 
@@ -2620,12 +2652,12 @@ class HealthCheck(Report):
         self.assertEqual([s['kit'] for s in run['steps']], [None])
         self.assertIsNone(run['steps'][0]['findings'][0]['label'])
 
-    def test_schema_prints_format_6_and_the_kit_fields(self):
+    def test_schema_prints_the_kit_fields_and_the_reported_severity(self):
         schema = json.loads(self.run_report('--schema'))
-        self.assertIn('record format: 6', schema['schema'])
         self.assertIn('kits', schema)
         self.assertIn('kit_checks', schema)
-        for name in ('"kit_review"', '"kit"', '"label"', 'kit_review critical, important, minor'):
+        for name in ('"kit_review"', '"kit"', '"label"', 'kit_review critical, important, minor',
+                     '"reported_severity"', '(schema 7)'):
             self.assertIn(name, schema['steps'])
 
     def test_a_runs_cleaned_waves_reach_json_and_the_page(self):

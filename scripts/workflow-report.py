@@ -15,8 +15,7 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
   --no-cache  read and write no cache; the output is the same
   --since     ignore transcript rows and run records before this date (UTC); --health and --brief default it to
               7 days before --now, --json and --html read everything
-  --brief     at most 4 lines: this week's advisor share of Fable use, the trial's progress, "pairs: N of 10" when the
-              final review pairs since PAIRS_FROM, whatever --since says, are N > 0 (CHECKPOINT at ten), then this
+  --brief     at most 3 lines: this week's advisor share of Fable use, the trial's progress, then this
               week's first WARN line with a count of the rest, or else the consultations with no note, then any
               commits on main since the last template export; the trial counts every run record
   --health    every WARN line for the runs since --since, from the run log, the runs' transcripts and git, for
@@ -169,7 +168,7 @@ def category_list():
             'areas': [{'area': area, 'steps': list(kinds), 'list': CATEGORIES[key]} for area, kinds, key in AREAS]}
 
 SCHEMA = {
-    'schema': 'int, record format: 6; a record without it is 1',
+    'schema': 'int, record format: 7; a record without it is 1',
     'date': 'ISO 8601 time the run finished',
     'started': 'ISO 8601 time the session named the run\'s path and stage, in its first message',
     'project': 'absolute path of the project',
@@ -206,7 +205,9 @@ SCHEMA = {
              'plan_simplify cuts, flags; plan_review findings; fix-checks fixed, not_proportionate, open; simplify '
              'applied, skipped; kit_review critical, important, minor}, "findings" (every step but fix-checks): [{"id": "F7", '
              '"severity": "critical"|"important"|"minor", or "unneeded" for an item of the final review\'s list of '
-             'what the spec doesn\'t require (or "kind": "cut"|"flag" for plan_simplify), "summary", '
+             'what the spec doesn\'t require (or "kind": "cut"|"flag" for plan_simplify), "reported_severity": the '
+             'severity the reviewer gave, only when a ruling changed it: "severity" is then the ruled one, while '
+             '"counts" and "final_findings" stay the report\'s count line (schema 7), "summary", '
              '"outcome": ' + '|'.join(f'"{o}"' for o in OUTCOMES)
              + ', "reason" (required for declined and ruled), "closed_round": N, "category": an id from its step\'s '
              'area list in "category_list", the reviewer\'s, "validity": "valid"|"invalid"|"unclear", the '
@@ -276,17 +277,15 @@ CHANGES = (('2026-11-09', 'Parallel waves', 'claude-workflow#3'),
            ('2026-11-12', 'Context cap hook and the no-offer warning', 'claude-workflow#34'),
            ('2026-11-12', 'Kits: topic packs with a design step, checks and review', 'claude-workflow#35'),
            ('2026-11-16', "The final review's unneeded items recorded as findings", 'claude-workflow#38'),
-           ('2026-11-16', "A session's own review fixes take the fix-round commit subject", 'claude-workflow#39'))
+           ('2026-11-16', "A session's own review fixes take the fix-round commit subject", 'claude-workflow#39'),
+           ('2026-11-17', "A ruled severity change keeps the reviewer's severity in the record", 'claude-workflow#49'),
+           ('2026-11-17', 'Final reviewer back on Fable at high; the pair measure ends', 'claude-workflow#49'))
 CHANGE_DAYS = {ref: day for day, _, ref in CHANGES}
 # Seats that moved, by agent: (the last UTC day of the old pin, its model, its effort). A dispatch on or before that
 # day passes on the old pin too, since the check reads today's pins. A row is never removed.
-PAST_PINS = {'final-reviewer': [(CHANGE_DAYS['claude-workflow#22'], 'fable', 'high')],
+PAST_PINS = {'final-reviewer': [(CHANGE_DAYS['claude-workflow#22'], 'fable', 'high'),
+                                (CHANGE_DAYS['claude-workflow#49'], 'opus', 'high')],
              'implementer': [(CHANGE_DAYS['claude-workflow#28'], 'opus', 'high')]}
-# PAIRS is the ten pairs of claude-md/agentic-workflow.md's **Measure (pairs)** bullet, and PAIRS_FROM, the day the
-# pair measure was installed, is copied in tests/test_report.py, whose test_json_exports_the_dated_workflow_changes
-# ties the copy to the row it reads here: keep them the same.
-PAIRS = 10
-PAIRS_FROM = CHANGE_DAYS['claude-workflow#29']
 # CAP_OFFER_FROM, the day the context cap hook was installed, is copied in tests/test_report.py, whose
 # test_json_exports_the_dated_workflow_changes ties the copy to the row it reads here: keep them the same.
 CAP_OFFER_FROM = CHANGE_DAYS['claude-workflow#34']
@@ -302,14 +301,22 @@ COUNT_LINES = {'plan_simplify': ('plan simplify', 'Findings', ('cuts', 'flags'))
                'task_review': ('review', 'Findings', FINDINGS), 'fix_check': ('fix-check', 'Verdicts', VERDICTS),
                'final_review': ('review', 'Findings', FINDINGS), 'final_fix_check': ('fix-check', 'Verdicts', VERDICTS),
                'kit_review': ('kit review', 'Findings', KIT_FINDINGS)}
+
+
+def reported(f):
+    """The severity the reviewer gave finding f: a review's counts are its report's, so a finding a ruling moved
+    counts under this one."""
+    return f['reported_severity'] or f['severity']
+
+
 # What a step's findings add up to: the count each finding adds to, and the counts they make up. Fix-checks carry no
 # findings.
 ADDS_UP = {'plan_simplify': (lambda f: {'cut': 'cuts', 'flag': 'flags'}.get(f['kind']), ('cuts', 'flags')),
            'plan_review': (lambda f: 'findings', ('findings',)),
-           'task_review': (lambda f: f['severity'], FINDINGS),
+           'task_review': (reported, FINDINGS),
            'simplify': (lambda f: 'applied' if f['outcome'] == 'applied' else 'skipped', ('applied', 'skipped')),
-           'final_review': (lambda f: f['severity'], FINDINGS),
-           'kit_review': (lambda f: f['severity'], KIT_FINDINGS)}
+           'final_review': (reported, FINDINGS),
+           'kit_review': (reported, KIT_FINDINGS)}
 TEST_RESULTS = ('passed', 'failed', 'no_tests', 'couldnt_run', 'exempt')
 SIMPLIFY_RAN = ('agents', 'inline', 'no')
 NOTE_RE = re.compile(r'^Advisor: .+ \| changed: (yes|no) \| .*$', re.M)
@@ -1108,11 +1115,14 @@ def read_steps(rec):
         if not isinstance(step, dict) or step.get('step') not in STEP_KINDS:
             continue
         ids = area_ids(step['step'])
+        severities = KIT_FINDINGS if step['step'] == 'kit_review' else FINDINGS
         strengths = field(step, 'strengths', list, None) if step['step'] in STRENGTH_STEPS else None
         if strengths is not None:
             strengths = [{'category': read_category(s, ids), 'summary': field(s, 'summary', str, None)}
                          for s in strengths if isinstance(s, dict)]
         findings = [{'id': field(f, 'id', str, None), 'severity': field(f, 'severity', str, None),
+                     'reported_severity': (f.get('reported_severity') if f.get('reported_severity') in severities
+                                           else None),
                      'category': read_category(f, ids), 'off_list': off_list_category(f, ids),
                      'validity': f.get('validity') if f.get('validity') in VALIDITY else None,
                      'label': field(f, 'label', str, None),
@@ -1627,17 +1637,6 @@ def guard_refusals(projects_root, since, now):
     """How many dispatches the dispatch guard refused in the main transcripts, by GUARD_REASONS key, in since..now."""
     return refusal_counts([e for path in main_transcripts(projects_root) for e in transcript_events(path)[0]
                            if in_range(e[0], since, now)])
-
-
-def pair_count(projects_root, now):
-    """How many pair halves the main transcripts hold from PAIRS_FROM to now, each counted once by event_key."""
-    since, keys = parse_time(PAIRS_FROM), set()
-    for path in main_transcripts(projects_root):
-        events, launched, _ = transcript_events(path)
-        halves = pair_halves(events, launched)
-        keys.update(event_key(e) for e in events
-                    if e[1] == 'agent' and e[2][0] in halves and in_range(e[0], since, now))
-    return len(keys)
 
 
 def run_spans(projects_root, records, now):
@@ -2678,11 +2677,7 @@ def brief_report(tr, runs, now, records, projects_root, pins, spans, stamp_path)
         last += '; ' + drift
     lines = ["Advisor share of this week's Fable use: " + share_text(tr.week_advisor.get(week, 0.0),
                                                                     tr.week_fable.get(week, 0.0)),
-             f'Trial: {trial(records, now)}']
-    pairs = pair_count(projects_root, now)
-    if pairs:
-        lines.append(f'pairs: {pairs} of {PAIRS}' + (' CHECKPOINT' if pairs >= PAIRS else ''))
-    lines.append(last)
+             f'Trial: {trial(records, now)}', last]
     return '\n'.join(lines)
 
 
