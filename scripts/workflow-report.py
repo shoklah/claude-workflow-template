@@ -2,12 +2,15 @@
 """Read-only report over Claude Code transcripts and the workflow run log.
 
 Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--agents DIR] [--export-stamp FILE]
-                          [--cache DIR] [--no-cache]
+                          [--cache DIR] [--no-cache] [--backfill FILE]
                           [--brief | --health | --schema | --json | --goals | --html [FILE]]
                           [--changed-since CURSOR] [--now ISO]
 
   --projects  transcript tree (default ~/.claude/projects)
   --log       run log, one JSON run record per line (default ~/.claude/workflow-log.jsonl)
+  --backfill  approved headline, spec and goal for older records, one JSON object per line keyed by date, project
+              and branch; a later line replaces an earlier one whole, so a correction restates every fact; a record's
+              own fact wins (default ~/.claude/workflow-log-backfill.jsonl)
   --agents    installed agent files, whose model and effort pins --health checks (default ~/.claude/agents)
   --export-stamp  the public template's last export, {"repo", "sha", "date"}, which --brief compares with
               origin/main (default ~/.claude/workflow-export.json)
@@ -1227,7 +1230,20 @@ def goal_lines(text):
     return [goal_name(value) for value in GOAL_LINE.findall(text) if not value.startswith('<')]
 
 
-def read_runs(log, stats):
+def read_backfill(path, stats):
+    """The side file's lines keyed by (date, project, branch), a later line replacing an earlier one; a line whose
+    triple is not three strings is skipped and counted like a malformed line."""
+    lines = {}
+    for row in read_jsonl(path, stats):
+        triple = tuple(run_ref(row).values())
+        if None in triple:
+            stats['skipped'] += 1
+            continue
+        lines[triple] = row
+    return lines
+
+
+def read_runs(log, stats, backfill):
     runs = []
     for rec in read_jsonl(log, stats):
         raw = dict(rec)
@@ -1237,6 +1253,13 @@ def read_runs(log, stats):
         rec['_time'] = t
         rec['_started'] = parse_time(rec.get('started'))
         rec['schema'] = field(rec, 'schema', int, 1)
+        # A record before schema 8 takes each fact it leaves out from its backfill line; its own fact always wins.
+        triple = tuple(run_ref(rec).values())
+        if rec['schema'] < 8:
+            line = backfill.get(triple, {})
+            for key in ('headline', 'spec', 'goal'):
+                if key not in rec and key in line:
+                    rec[key] = line[key]
         rec['steps'] = read_steps(rec)
         rec['waves'] = read_waves(rec)
         rec['kits'] = read_kits(rec)
@@ -3631,6 +3654,7 @@ def main():
     ap.add_argument('--since', help='YYYY-MM-DD')
     ap.add_argument('--projects', default=os.path.expanduser('~/.claude/projects'))
     ap.add_argument('--log', default=os.path.expanduser('~/.claude/workflow-log.jsonl'))
+    ap.add_argument('--backfill', default=os.path.expanduser('~/.claude/workflow-log-backfill.jsonl'))
     ap.add_argument('--now', help='ISO time to use as now (for tests)')
     ap.add_argument('--agents', default=os.path.expanduser('~/.claude/agents'))
     ap.add_argument('--export-stamp', default=os.path.expanduser('~/.claude/workflow-export.json'))
@@ -3666,7 +3690,8 @@ def main():
     if since is None and (args.health or args.brief):
         since = now - datetime.timedelta(days=HEALTH_DAYS)
     stats = {'skipped': 0}
-    records = [r for r in read_runs(args.log, stats) if r['_time'] is None or r['_time'] <= now]
+    backfill = read_backfill(args.backfill, stats)
+    records = [r for r in read_runs(args.log, stats, backfill) if r['_time'] is None or r['_time'] <= now]
     runs = [r for r in records if since is None or r['_time'] is None or r['_time'] >= since]
     if args.goals:
         goals = known_goals(args.projects, records, now)

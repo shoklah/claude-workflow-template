@@ -101,6 +101,12 @@ def run_record(**over):
     return rec
 
 
+def fill(branch, **facts):
+    """A backfill side-file line for run_record's date and project."""
+    rec = run_record()
+    return {'date': rec['date'], 'project': rec['project'], 'branch': branch, **facts}
+
+
 def plan_record(**over):
     """A schema 2 plan record, which leaves out the fields a plan record has no use for."""
     return {k: v for k, v in run_record(path='plan', schema=2, steps=[], **over).items()
@@ -131,6 +137,7 @@ class Report(unittest.TestCase):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix='workflow report test '))
         self.projects = os.path.join(self.root, 'projects dir')
         self.log = os.path.join(self.root, 'log dir', 'workflow-log.jsonl')
+        self.backfill_path = os.path.join(self.root, 'backfill.jsonl')
         os.makedirs(self.projects)
 
     def tearDown(self):
@@ -153,6 +160,9 @@ class Report(unittest.TestCase):
 
     def records(self, recs):
         self.write_lines(self.log, recs)
+
+    def backfill(self, lines):
+        self.write_lines(self.backfill_path, lines)
 
     def repo(self):
         """A temp git repo and change(name, message, date=None, text=None), which appends text (by default the
@@ -181,10 +191,10 @@ class Report(unittest.TestCase):
         return repo, change
 
     def report_args(self, *args):
-        # No test reads the real ~/.claude/agents, export stamp or cache; a test's own option comes later and wins.
+        # No test reads the real ~/.claude/agents, export stamp, cache or backfill; a test's own option comes later and wins.
         return [PYTHON, '-I', SCRIPT, '--projects', self.projects, '--log', self.log, '--now', NOW,
                 '--agents', os.path.join(self.root, 'no agents'), '--export-stamp', os.path.join(self.root, 'no stamp'),
-                '--cache', os.path.join(self.root, 'cache'), *args]
+                '--cache', os.path.join(self.root, 'cache'), '--backfill', self.backfill_path, *args]
 
     def report_process(self, *args, env=CLEAN_ENV):
         return subprocess.run(self.report_args(*args), capture_output=True, text=True, env=env, timeout=60)
@@ -546,6 +556,57 @@ class Report(unittest.TestCase):
         new, old = self.json()['runs']  # same date: log order
         self.assertEqual((new['headline'], new['spec'], new['goal']), ('Runs get titles', spec, 'UI slice'))
         self.assertEqual((old['headline'], old['spec'], old['goal']), (None, None, None))
+
+    def test_json_takes_a_backfilled_headline_spec_and_goal(self):
+        spec = {'project': '/p', 'path': 'docs/superpowers/specs/s.md'}
+        self.records([run_record(branch='old')])
+        self.backfill([fill('old', headline='Runs get titles', spec=spec, goal='ui-slice'),
+                       fill('gone', headline='No such record', goal='x')])
+        run, = self.json()['runs']
+        self.assertEqual((run['headline'], run['spec'], run['goal']), ('Runs get titles', spec, 'ui-slice'))
+        self.assertNotIn('goal', run['record'])
+        self.assertNotIn('headline', run['record'])
+
+    def test_a_records_own_fact_wins_over_the_backfill(self):
+        self.records([run_record(schema=7, branch='own', headline='Own', goal=None)])
+        self.backfill([fill('own', headline='Backfilled', goal='other', spec={'project': '/p', 'path': 's.md'})])
+        run, = self.json()['runs']
+        self.assertEqual((run['headline'], run['goal'], run['spec']), ('Own', None, {'project': '/p', 'path': 's.md'}))
+
+    def test_a_later_backfill_line_replaces_an_earlier_one(self):
+        self.records([run_record(branch='old')])
+        self.backfill([fill('old', headline='First', goal='first'), fill('old', goal='second')])
+        run, = self.json()['runs']
+        self.assertEqual((run['headline'], run['goal']), (None, 'second'))  # whole line, not per fact
+
+    def test_a_malformed_backfill_line_is_skipped(self):
+        self.records([run_record(branch='old')])
+        self.backfill([fill(5, goal='bad'), 'not json',
+                       fill('old', goal='good')])
+        self.assertEqual(self.json()['runs'][0]['goal'], 'good')
+        self.assertIn('Malformed lines: skipped=2', self.run_report())
+
+    def test_a_record_with_a_malformed_triple_is_not_backfilled(self):
+        self.records([run_record(branch=[])])
+        self.backfill([fill('old', goal='g')])
+        self.assertIsNone(self.json()['runs'][0]['goal'])
+
+    def test_a_malformed_backfilled_fact_reads_as_absent(self):
+        self.records([run_record(branch='old')])
+        self.backfill([fill('old', headline='  ', spec={'project': '/p'}, goal='None')])
+        run, = self.json()['runs']
+        self.assertEqual((run['headline'], run['spec'], run['goal']), (None, None, None))
+
+    def test_goals_lists_a_backfilled_goal(self):
+        self.records([run_record(branch='old')])
+        self.backfill([fill('old', goal='ui-slice')])
+        self.assertIn('ui-slice\t', self.run_report('--goals'))
+
+    def test_a_schema_8_record_is_not_backfilled(self):
+        self.records([run_record(schema=8, branch='f', path='small')])  # leaves out headline and goal
+        self.backfill([fill('f', headline='h', goal='g')])
+        run, = self.json()['runs']
+        self.assertEqual((run['headline'], run['goal']), (None, None))
 
     def test_a_records_malformed_facts_read_as_absent(self):
         self.records([run_record(schema=8, headline='', spec={'project': '/p'}, goal='None'),
