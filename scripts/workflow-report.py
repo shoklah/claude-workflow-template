@@ -58,12 +58,17 @@ Usage: workflow-report.py [--since YYYY-MM-DD] [--projects DIR] [--log FILE] [--
               newest held record's, else the record-named spec it last wrote, else its starter's), its context
               also carrying context.handoff_to) and
               "totals" (scoreboard, weeks, context (the units' context, tool-result characters and sweeps by week),
-              run_time, skills, models, advisor, offers, health); each WARN also as an
+              run_time, skills, models, advisor, offers, usage, health); each WARN also as an
               object with its kind, run or session, step, skill and agent, each session's title, each step's agent
               id, time and end with the dispatch and skill load tied to it, each dispatch's "pair", whether it is a
-              pair's second half, and each finding's category and validity and each review step's strengths. Every
-              transcript row belongs to one run or to its transcript's session, so every total is a sum over the
-              runs and sessions exported. It holds personal data: print it, never write it into a repo
+              pair's second half, and each finding's category and validity and each review step's strengths. Each
+              run, session, phase, dispatch and tied step carries fable_pct and all_pct, its estimated share of the
+              week's Fable and all-models limits from list-price cost at the weekly rates totals.usage fits;
+              totals.weeks and the scoreboard rows carry them summed over their known parts, with pct_unknown, how
+              many parts were left out. Every
+              transcript row belongs to one run or to its transcript's session, so every total but totals.usage,
+              the account-wide calibration, is a sum over the runs and sessions exported. It holds personal data:
+              print it, never write it into a repo
   --goals     one line per known goal, newest first: the goal, the last day it was used and how many sessions and
               records name it, from every record in the log and every goal line in every main transcript, all time,
               or "Goals: none"
@@ -349,6 +354,12 @@ NOTE_RE = re.compile(r'^Advisor: .+ \| changed: (yes|no) \| .*$', re.M)
 SCRIPT_RE = re.compile(r'([^/\s"\']+\.(?:py|sh))')
 WRAP_UP = 'mcp__ccd_turn__wrap_up'
 START_SESSION = 'mcp__ccd_session__start_session'
+USAGE_TOOL = 'mcp__ccd_session_mgmt__get_usage'
+# A week's usage rate is usable from MIN_POINTS points, and its all-models fit from MIN_CHUNKS chunks of pairs, each
+# chunk adding pairs until it rises CHUNK_POINTS points.
+MIN_POINTS = 5
+CHUNK_POINTS = 5
+MIN_CHUNKS = 3
 # A start_session brief that starts with this hands its run off to the new session, when its result names a session;
 # the new session's first user row holds the brief.
 HANDOFF_MARKER = re.compile(r'^Handoff \d+:')
@@ -482,9 +493,11 @@ RECOMMENDED = {'full': dict.fromkeys(('1', '2', '3', 'out'), 'opus/medium'),
                'plan': {'1': 'fable', '2': 'opus', '3': 'opus', 'out': 'opus'},
                'small': {'1': None, '2': 'opus', '3': 'opus', 'out': 'opus'}}
 JSON_VERSION = 1
-CACHE_VERSION = 13
+CACHE_VERSION = 14
 STATE_VERSION = 1
 CACHE_DIR = None  # the parse cache's folder; main sets it from --cache, and leaves it None under --no-cache
+RATES = {}  # rates_of(totals.usage), which report_data sets first thing; empty until then, so every estimate is null
+LIMITS = ('fable_pct', 'all_pct')  # the two estimated shares of the weekly limits
 
 
 def parse_time(value):
@@ -587,6 +600,21 @@ def usage_iterations(msg):
     return usage, [i for i in usage.get('iterations') or [] if isinstance(i, dict)]
 
 
+def week_of(timestamp):
+    """The week_start of a transcript timestamp, or None when it does not parse."""
+    t = parse_time(timestamp)
+    return None if t is None else week_start(t)
+
+
+def split_iterations(msg):
+    """A message's executor's own iterations, its usage itself when it has none, and its advisor iterations, each
+    paired with its model, ADVISOR_MODEL when it names none; fallback iterations are in neither."""
+    usage, iterations = usage_iterations(msg)
+    own = [i for i in iterations if i.get('type') == 'message'] if iterations else [usage]
+    return own, [(i, field(i, 'model', str, '') or ADVISOR_MODEL)
+                 for i in iterations if i.get('type') == 'advisor_message']
+
+
 class Transcripts:
     def __init__(self, since, now, keep=None, shared=None, phase_of=None):
         """A row counts when it is in since..now and keep is None or keep(its timestamp) is true. With shared, the
@@ -602,6 +630,7 @@ class Transcripts:
         self.spent_ids = shared.spent_ids if shared else set()
         self.tokens = {label: 0 for label, _ in TOKENS}
         self.advisor_cost = 0.0
+        self.advisor_pct = dict.fromkeys(LIMITS, 0.0)
         self.models = {}
         self.unpriced = shared.unpriced if shared else set()  # the models, DATE_SUFFIX stripped, used with no price
         self.efforts = {}
@@ -688,8 +717,7 @@ class Transcripts:
     def count(self, model, own, phase, main, timestamp):
         """Spend a message's own iterations in phase, in the week of its timestamp, and in a main transcript add its
         context."""
-        t = parse_time(timestamp)
-        self.spend(model, own, week_start(t) if t is not None else None, phase)
+        self.spend(model, own, week_of(timestamp), phase)
         if main:
             self.contexts.append((timestamp, context_tokens(own)))
 
@@ -702,9 +730,8 @@ class Transcripts:
             return
         mid = msg.get('id')
         model = field(msg, 'model', str, '')
-        usage, iterations = usage_iterations(msg)
         # The executor's own sampling; advisor and fallback iterations are counted apart.
-        own = [i for i in iterations if i.get('type') == 'message'] if iterations else [usage]
+        own, _ = split_iterations(msg)
         timestamp = field(row, 'timestamp', str, None)
         if not mid:
             if kept:
@@ -734,34 +761,35 @@ class Transcripts:
                 self.advisor_result(block)
             elif btype == 'tool_use' and main:
                 self.main_tool_use(block)
-        _, iterations = usage_iterations(msg)
+        _, advisor = split_iterations(msg)
         effort = row.get('effort')
         if isinstance(effort, str):
             efforts = self.efforts.setdefault(model, {})
             efforts[effort] = efforts.get(effort, 0) + 1
         if not mid or mid in self.advisor_ids:
             return 0
-        advisor = [i for i in iterations if i.get('type') == 'advisor_message']
         if not advisor:
             return 0
         self.advisor_ids.add(mid)
         label = (role or 'main') + (' on Fable' if on_fable else '')
         flagged = on_fable or role in NEVER_CONSULT
         entry = self.by_role.setdefault(label, [0, flagged])
-        for i in advisor:
+        for i, advisor_model in advisor:
             entry[0] += 1
             for token, name in TOKENS:
                 self.tokens[token] += num(i.get(name))
-            advisor_model = field(i, 'model', str, '') or ADVISOR_MODEL
-            spent = cost(i, advisor_model)
-            if spent is None:
+            dollars = cost(i, advisor_model)
+            if dollars is None:
                 self.note_unpriced(advisor_model, [i])
-                spent = 0.0
-            self.advisor_cost += spent
+            spent = dollars or 0.0
+            advisors = [self.advisor_pct]
             if phase is not None:
                 phase_advisor = self.phase(phase)['advisor']
                 phase_advisor['calls'] += 1
                 phase_advisor['cost'] += spent
+                advisors.append(phase_advisor)
+            self.add_pct(advisors, advisor_model, dollars, week)
+            self.advisor_cost += spent
             if week is not None:
                 self.week_advisor[week] = self.week_advisor.get(week, 0.0) + spent
         return len(advisor)
@@ -770,13 +798,16 @@ class Transcripts:
         """Count the executor's own iterations own on model, in phase when it is not None, and on Fable toward week's
         Fable use."""
         if model not in self.models:
-            self.models[model] = dict({label: 0 for label, _ in TOKENS}, cost=cost({}, model))
+            priced = cost({}, model)
+            self.models[model] = dict({label: 0 for label, _ in TOKENS}, cost=priced, **dict.fromkeys(LIMITS, 0.0))
         entry, part = self.models[model], None
         if phase is not None:
             part = self.phase(phase)['models'].get(model)
             if part is None:
+                start = None if entry['cost'] is None else 0.0
                 part = self.phases[phase]['models'][model] = dict(
-                    {label: 0 for label, _ in TOKENS}, cost=None if entry['cost'] is None else 0.0, cost_by_kind=kind_costs({}, model))
+                    {label: 0 for label, _ in TOKENS}, cost=start, cost_by_kind=kind_costs({}, model),
+                    **dict.fromkeys(LIMITS, 0.0))
         entries = [entry] if part is None else [entry, part]
         for i in own:
             for token, name in TOKENS:
@@ -784,7 +815,9 @@ class Transcripts:
                 for e in entries:
                     e[token] += n
         if entry['cost'] is None:
-            self.note_unpriced(model, own)
+            if self.note_unpriced(model, own):
+                for e in entries:
+                    e.update(dict.fromkeys(LIMITS))
             return
         spent = 0.0
         for i in own:
@@ -795,21 +828,44 @@ class Transcripts:
                     part['cost_by_kind'][kind] += dollars
         for e in entries:
             e['cost'] += spent
+        self.add_pct(entries, model, spent, week)
         if week is not None and model.startswith('claude-fable'):
             self.week_fable[week] = self.week_fable.get(week, 0.0) + spent
 
+    def add_pct(self, entries, model, dollars, week):
+        """Add dollars spent on model in week, None when unpriced, to each entry's fable_pct and all_pct at the week's
+        RATES: a Fable dollar counts toward both limits, any other only toward all models. A limit whose share is
+        unknown becomes None and stays None."""
+        rates = RATES.get(week.date().isoformat()) if week is not None else None
+        fable_rate, all_fable_rate, all_other_rate = rates or (None, None, None)
+
+        def share(rate):
+            return None if dollars is None or rate is None else dollars / rate
+
+        if model.startswith('claude-fable'):
+            shares = {'fable_pct': share(fable_rate), 'all_pct': share(all_fable_rate)}
+        else:
+            shares = {'fable_pct': None if dollars is None else 0.0, 'all_pct': share(all_other_rate)}
+        for limit, value in shares.items():
+            for e in entries:
+                e[limit] = None if e[limit] is None or value is None else e[limit] + value
+
     def note_unpriced(self, model, own):
-        """Note model, which PRICES lacks, as used when any of the usages own has a token."""
-        if model and any(num(i.get(name)) for i in own for _, name in TOKENS):
+        """Note model, which PRICES lacks, as used when any of the usages own has a token, and say whether it was."""
+        used = any(num(i.get(name)) for i in own for _, name in TOKENS)
+        if model and used:
             self.unpriced.add(DATE_SUFFIX.sub('', model))
+        return used
 
     def phase(self, name):
         """The models and advisor counted in phase name so far."""
-        return self.phases.setdefault(name, {'models': {}, 'advisor': {'calls': 0, 'cost': 0.0}})
+        return self.phases.setdefault(name, {'models': {}, 'advisor': {'calls': 0, 'cost': 0.0,
+                                                                       **dict.fromkeys(LIMITS, 0.0)}})
 
     def phase_list(self):
         """The phases value of --json: one entry per phase that counted a message, in PHASES order."""
-        return [dict(name=name, **self.phases[name]) for name in PHASES if name in self.phases]
+        return [dict(name=name, **self.phases[name], **unit_pct(self.phases[name]['models'], self.phases[name]['advisor']))
+                for name in PHASES if name in self.phases]
 
     def advisor_result(self, block):
         tid = block.get('tool_use_id')
@@ -883,11 +939,13 @@ class Transcripts:
 def usage_rows(path):
     """What Transcripts.read_file reads of the transcript at path, in one pass: {'rows', 'has_origin', 'last',
     'first', 'cwd', 'skipped'}. A row keeps only the fields read_file reads, a text block only its notes, a tool_use
-    block also its tool_class and its file, a user row's tool_result blocks their id and characters, and a row it
-    ignores is dropped; has_origin is whether any row has an origin, last the greatest row timestamp, first the least,
-    cwd the cwd of the first row with a non-empty string one, and skipped the lines that are not objects."""
+    block also its tool_class and its file, a user row's tool_result blocks their id and characters, and the reading
+    of one answering an earlier USAGE_TOOL call when it parses, and a row it ignores is dropped; has_origin is
+    whether any row has an origin, last the greatest row timestamp, first the least, cwd the cwd of the first row
+    with a non-empty string one, and skipped the lines that are not objects."""
     stats = {'skipped': 0}
     rows, has_origin, last, first, cwd = [], False, None, None, None
+    usage_calls = set()  # the ids of the USAGE_TOOL calls read so far
     for row in read_jsonl(path, stats):
         has_origin = has_origin or isinstance(row.get('origin'), dict)
         timestamp = row.get('timestamp')
@@ -912,6 +970,8 @@ def usage_rows(path):
                                                 if isinstance(c, dict) and c.get('error_code')]})
                 elif btype == 'tool_use':
                     name, inp = block.get('name'), field(block, 'input', dict, {})
+                    if name == USAGE_TOOL and isinstance(block.get('id'), str):
+                        usage_calls.add(block['id'])
                     ask = inp.get('ask')
                     content.append({'type': btype, 'id': block.get('id'), 'name': name,
                                     'input': {'ask': ask} if name == WRAP_UP and isinstance(ask, str) else {},
@@ -929,14 +989,33 @@ def usage_rows(path):
         elif kind == 'user' and Transcripts.typed_by_owner(row):
             rows.append({'type': kind, 'timestamp': timestamp, 'human': isinstance(row.get('origin'), dict)})
         elif kind == 'user' and isinstance(msg, dict):
-            results = [{'type': 'tool_result', 'tool_use_id': field(block, 'tool_use_id', str, None),
-                        'chars': sum(map(len, result_texts(block.get('content'))))}
-                       for block in field(msg, 'content', list, [])
-                       if isinstance(block, dict) and block.get('type') == 'tool_result']
+            results = []
+            for block in field(msg, 'content', list, []):
+                if isinstance(block, dict) and block.get('type') == 'tool_result':
+                    tid = field(block, 'tool_use_id', str, None)
+                    result = {'type': 'tool_result', 'tool_use_id': tid,
+                              'chars': sum(map(len, result_texts(block.get('content'))))}
+                    found = usage_reading(result_text(block)) if tid in usage_calls else None
+                    if found is not None:
+                        result['reading'] = found
+                    results.append(result)
             if results:
                 rows.append({'type': kind, 'timestamp': timestamp, 'results': results})
     return {'rows': rows, 'has_origin': has_origin, 'last': last, 'first': first, 'cwd': cwd,
             'skipped': stats['skipped']}
+
+
+def usage_reading(text):
+    """{'fable', 'all'}: the int percentUsed of the windows labelled with Fable and with all models in the text of a
+    USAGE_TOOL result, or None when it does not parse, its plan's status is not "ok" or either is missing."""
+    try:
+        plan = json.loads(text)['plan']
+        windows = plan['windows'] if plan['status'] == 'ok' else []
+        found = {key: next((w['percentUsed'] for w in windows if word in w['label']), None)
+                 for key, word in (('fable', 'Fable'), ('all', 'all models'))}
+    except (ValueError, LookupError, TypeError, RecursionError):
+        return None
+    return found if all(type(v) is int for v in found.values()) else None
 
 
 @functools.lru_cache(maxsize=None)
@@ -1043,9 +1122,10 @@ def sweep_counts(calls, events, launched):
 
 
 def unit_advisor(tr):
-    """The advisor facts advisor_facts reads, from one Transcripts: calls, cost, tokens, calls by role, failed calls
-    by error code and the advisor and Fable dollars by week."""
-    return {'calls': sum(n for n, _ in tr.by_role.values()), 'cost': tr.advisor_cost, 'tokens': dict(tr.tokens),
+    """The advisor facts advisor_facts reads, from one Transcripts: calls, cost, its fable_pct and all_pct, tokens,
+    calls by role, failed calls by error code and the advisor and Fable dollars by week."""
+    return {'calls': sum(n for n, _ in tr.by_role.values()), 'cost': tr.advisor_cost, **tr.advisor_pct,
+            'tokens': dict(tr.tokens),
             'by_role': {label: {'calls': calls, 'flagged': flagged}
                         for label, (calls, flagged) in sorted(tr.by_role.items())},
             'failed': dict(sorted(tr.failed.items())),
@@ -2880,6 +2960,22 @@ def spent(models):
             sum(m['cost'] for m in models.values() if m['cost'] is not None))
 
 
+def pct_sum(values):
+    """The sum of the values, or None when any is None."""
+    values = list(values)
+    return None if None in values else sum(values, 0.0)
+
+
+def pct_sums(parts):
+    """fable_pct and all_pct, each the pct_sum of the parts' own."""
+    return {limit: pct_sum(p[limit] for p in parts) for limit in LIMITS}
+
+
+def unit_pct(models, advisor):
+    """A unit's or a phase's fable_pct and all_pct: the pct_sum over its models entries and its advisor."""
+    return pct_sums([*models.values(), advisor])
+
+
 def skill_entries(events, main_events, run):
     """The skill loads in events, each with its outcome from SKILL_OUTCOMES: the path of a later spec or plan write in
     main_events, the record run's simplify counts or failing-test results, or whether events hold a record write; or
@@ -2967,7 +3063,8 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
     the first to end among those holding it; seen is the Transcripts whose message ids every unit shares, events the
     window's events the run owns over its chain, typed the run's typed triggers and git_evidence check_git's usable."""
     known = r['_time'] is not None and r['_started'] is not None
-    entry = {'record': r['_raw'], 'schema': r['schema'], 'steps': [dict(s, time=None, end=None) for s in r['steps']],
+    entry = {'record': r['_raw'], 'schema': r['schema'],
+             'steps': [dict(s, time=None, end=None, **dict.fromkeys(LIMITS)) for s in r['steps']],
              'final_findings': r['final_findings'],
              'simplify': r['simplify'], 'waves': r['waves'], 'kits': r['kits'],
              'kit_checks': r['kit_checks'], 'offers': r['offers'], 'categories': r['categories'],
@@ -2981,7 +3078,7 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
              'typed': typed, 'git_evidence': git_evidence,
              'key': unit_key('|'.join(field(r, k, str, '') for k in ('date', 'project', 'branch')))}
     entry.update(dict.fromkeys(('dispatches', 'skills', 'missing_skills', 'refusals', 'models', 'phases', 'efforts',
-                                'advisor', 'notes', 'main', 'title', 'context', 'tool_results', 'sweeps')))
+                                'advisor', 'notes', 'main', 'title', 'context', 'tool_results', 'sweeps', *LIMITS)))
     if span is None:
         return entry
     path, start, end = span
@@ -3013,9 +3110,10 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
                            'requested_model': inp.get('model'), 'requested_effort': inp.get('effort'),
                            'model': sub_model, 'effort': sub_effort, 'skills': agent_skills(sub) if sub else None,
                            'counts': count_line(report, name) if name and report is not None else None,
-                           'models': sub_tr.models if sub_tr else None, 'pair': d['pair']})
+                           'models': sub_tr.models if sub_tr else None, 'pair': d['pair'],
+                           **(pct_sums(sub_tr.models.values()) if sub_tr else dict.fromkeys(LIMITS))})
     for i, j in tie_steps(r, span_ds).items():
-        entry['steps'][i].update(time=dispatches[j]['time'], end=dispatches[j]['end'])
+        entry['steps'][i].update({k: dispatches[j][k] for k in ('time', 'end', *LIMITS)})
         dispatches[j]['step'] = i
     # The simplify step takes its time from the window's simplify call when each is the only one.
     simplify_steps = [i for i, s in enumerate(r['steps']) if s['step'] == 'simplify']
@@ -3034,6 +3132,7 @@ def run_entry(r, span, warns, info, pins, seen, keep_of, events, typed, git_evid
     entry.update(dispatches=dispatches, skills=skills,
                  missing_skills=missing, refusals=refusal_counts(events), models=tr.models, phases=tr.phase_list(),
                  efforts=tr.efforts, advisor=unit_advisor(tr), notes=unit_notes(tr),
+                 **unit_pct(tr.models, tr.advisor_pct),
                  main={'model': model, 'effort': effort}, title=transcript_title(path),
                  context=handoff_to(mains, context_facts(tr.contexts, own_events)), tool_results=tr.tool_results,
                  sweeps=sweep_counts(tr.calls, own_events, span_events(*span)[1]))
@@ -3046,7 +3145,8 @@ def scoreboard(runs, entries, sessions, advisor):
     board = {kind: {'ran': 0, 'found': 0, 'counts': {}, 'outcomes': {}, 'tokens': {label: 0 for label, _ in TOKENS},
                     'cost': 0.0} for kind in STEP_KINDS}
     # simplify's agents are no step kind, so no dispatch tells its spend.
-    board['simplify'].update(tokens=None, cost=None)
+    board['simplify'].update(tokens=None, cost=None, **dict.fromkeys((*LIMITS, 'pct_unknown')))
+    dispatches = {kind: [] for kind in STEP_KINDS}
 
     def add(kind, counts):
         row = board[kind]
@@ -3067,12 +3167,18 @@ def scoreboard(runs, entries, sessions, advisor):
             if r['simplify']['ran'] in ('agents', 'inline'):
                 add('simplify', {k: r['simplify'][k] for k in ('applied', 'skipped')})
         for dispatch in entry['dispatches'] or []:
-            if dispatch['kind'] in board and dispatch['models'] and not dispatch['pair']:
+            if dispatch['kind'] not in board or dispatch['pair']:
+                continue
+            dispatches[dispatch['kind']].append(dispatch)
+            if dispatch['models']:
                 tokens, dollars = spent(dispatch['models'])
                 row = board[dispatch['kind']]
                 row['cost'] += dollars
                 for label, n in tokens.items():
                     row['tokens'][label] += n
+    for kind in STEP_KINDS:
+        if kind != 'simplify':
+            board[kind].update(pct_total(dispatches[kind]))
     tot = group_totals(runs)
     guard = {}
     for unit in entries + sessions:
@@ -3105,9 +3211,15 @@ def run_points(r, start, end):
 
 
 def points(entries, key):
-    """The summed known points under key of the run entries, or None when none is known."""
+    """The summed known values under key of the entries, or None when none is known."""
     known = [e[key] for e in entries if e[key] is not None]
     return sum(known) if known else None
+
+
+def pct_total(parts):
+    """fable_pct and all_pct, each the summed known values of the parts, and pct_unknown, how many parts lack either."""
+    return {**{limit: points(parts, limit) for limit in LIMITS},
+            'pct_unknown': sum(1 for p in parts if any(p[limit] is None for limit in LIMITS))}
 
 
 def path_counts(records):
@@ -3123,6 +3235,147 @@ def windows_cost(entries):
     """The summed priced cost of the entries' run windows, or None when none has a window."""
     priced = [spent(entry['models'])[1] for entry in entries if entry['models'] is not None]
     return sum(priced) if priced else None
+
+
+def usage_readings(paths, now):
+    """(timestamp, fable, all) of each USAGE_TOOL reading in the transcripts paths at or before now, once per tool use
+    id, sorted by timestamp, the first kept among readings with the same timestamp."""
+    end, seen, by_time = stamp(now), set(), {}
+    for path in paths:
+        for row in file_usage(path)['rows']:
+            timestamp = row['timestamp']
+            if row['type'] != 'user' or not isinstance(timestamp, str) or not in_window(timestamp, None, end):
+                continue
+            for result in row.get('results', []):
+                if 'reading' in result and result['tool_use_id'] not in seen:
+                    seen.add(result['tool_use_id'])
+                    by_time.setdefault(timestamp, (timestamp, result['reading']['fable'], result['reading']['all']))
+    return [by_time[t] for t in sorted(by_time)]
+
+
+def account_spend(paths, now):
+    """(timestamp, fable_dollars, other_dollars) of each message in the transcripts paths, whatever unit owns it, once
+    per message id at its row with the most output tokens, when that row is at or before now; a row with no id counts
+    alone. Its own iterations are priced under its model and its advisor iterations under theirs, Fable spend being a
+    model's starting claude-fable; an unpriced model adds 0. Sorted by timestamp."""
+    best = {}  # a message id, or a row's (path, index) when it has none -> (output, timestamp, priced usages)
+    for path in paths:
+        for n, row in enumerate(file_usage(path)['rows']):
+            if row['type'] != 'assistant':
+                continue
+            msg = row['message']
+            own, advisor = split_iterations(msg)
+            output = sum(num(i.get('output_tokens')) for i in own)
+            key = msg.get('id') or (path, n)
+            if key not in best or output > best[key][0]:
+                model = field(msg, 'model', str, '')
+                priced = [(i, model) for i in own] + advisor
+                best[key] = (output, row['timestamp'], priced)
+    end, spend = stamp(now), []
+    for _, timestamp, priced in best.values():
+        if isinstance(timestamp, str) and in_window(timestamp, None, end):
+            fable = other = 0.0
+            for i, model in priced:
+                dollars = cost(i, model) or 0.0
+                if model.startswith('claude-fable'):
+                    fable += dollars
+                else:
+                    other += dollars
+            spend.append((timestamp, fable, other))
+    return sorted(spend, key=lambda s: s[0])
+
+
+def usage_chunks(pairs, key):
+    """The pairs added in order into chunks, each closed once its points under key reach CHUNK_POINTS; a short tail is
+    dropped."""
+    chunks, chunk = [], None
+    for p in pairs:
+        chunk = p if chunk is None else {k: chunk[k] + p[k] for k in p}
+        if chunk[key] >= CHUNK_POINTS:
+            chunks.append(chunk)
+            chunk = None
+    return chunks
+
+
+def usage_fit(chunks):
+    """(fable_rate, other_rate) of the least-squares fit with no intercept points = fable_cost / fable_rate +
+    other_cost / other_rate over the chunks, or None with under MIN_CHUNKS chunks, a determinant not above 0 or a
+    coefficient not above 0."""
+    if len(chunks) < MIN_CHUNKS:
+        return None
+    xx = sum(c['fable_cost'] ** 2 for c in chunks)
+    yy = sum(c['other_cost'] ** 2 for c in chunks)
+    xy = sum(c['fable_cost'] * c['other_cost'] for c in chunks)
+    xp = sum(c['fable_cost'] * c['all'] for c in chunks)
+    yp = sum(c['other_cost'] * c['all'] for c in chunks)
+    det = xx * yy - xy * xy
+    if det <= 0:
+        return None
+    a, b = (xp * yy - yp * xy) / det, (yp * xx - xp * xy) / det
+    return (1 / a, 1 / b) if a > 0 and b > 0 else None
+
+
+def usage_rates(readings, spend):
+    """The totals.usage rows, oldest week first, one per week from Sunday 07:00 UTC holding a reading or a spend: the
+    pairs of consecutive readings in one week where neither percentage fell, each costing the spend in (t0, t1], and
+    from them the week's Fable rate and its all-models fit, a week without its own usable rate for a limit borrowing
+    the nearest week's, the earlier on a tie."""
+    counts = {}
+    for r in readings:
+        week = week_of(r[0])
+        counts[week] = counts.get(week, 0) + 1
+    for s in spend:
+        counts.setdefault(week_of(s[0]), 0)
+    counts.pop(None, None)
+    times = [s[0] for s in spend]
+    pairs = {}
+    for (t0, f0, a0), (t1, f1, a1) in zip(readings, readings[1:]):
+        week = week_of(t0)
+        if week is None or week != week_of(t1) or f1 < f0 or a1 < a0:
+            continue
+        inside = spend[bisect.bisect_right(times, t0):bisect.bisect_right(times, t1)]
+        pairs.setdefault(week, []).append({'fable': f1 - f0, 'all': a1 - a0, 'fable_cost': sum(s[1] for s in inside),
+                                           'other_cost': sum(s[2] for s in inside)})
+    def fit_error(chunks, predict, key):
+        """The mean absolute difference between each chunk's points under key and predict(chunk)."""
+        return statistics.mean(abs(predict(c) - c[key]) for c in chunks) if chunks else None
+
+    rows = {}
+    for week in sorted(counts):
+        week_pairs = pairs.get(week, [])
+        fable_points = sum(p['fable'] for p in week_pairs)
+        all_points = sum(p['all'] for p in week_pairs)
+        fable_cost = sum((p['fable_cost'] for p in week_pairs), 0.0)
+        other_cost = sum((p['other_cost'] for p in week_pairs), 0.0)
+        rate = fable_cost / fable_points if fable_points >= MIN_POINTS and fable_cost > 0 else None
+        fable_chunks = usage_chunks(week_pairs, 'fable')
+        all_chunks = usage_chunks(week_pairs, 'all')
+        fit = usage_fit(all_chunks)
+        fable_rate, other_rate = fit or (None, None)
+        fable = {'points': fable_points, 'cost': fable_cost, 'rate': rate, 'chunks': len(fable_chunks),
+                 'error': None if rate is None else fit_error(fable_chunks, lambda c: c['fable_cost'] / rate, 'fable'),
+                 'borrowed_from': None}
+        all_ = {'points': all_points, 'fable_cost': fable_cost, 'other_cost': other_cost,
+                'fable_rate': fable_rate, 'other_rate': other_rate, 'chunks': len(all_chunks),
+                'error': None if fit is None else fit_error(
+                    all_chunks, lambda c: c['fable_cost'] / fable_rate + c['other_cost'] / other_rate, 'all'),
+                'borrowed_from': None}
+        rows[week] = {'week': week.date().isoformat(), 'readings': counts[week], 'pairs': len(week_pairs),
+                      'fable': fable, 'all': all_}
+    for limit, names in (('fable', ('rate',)), ('all', ('fable_rate', 'other_rate'))):
+        own = [week for week, row in rows.items() if row[limit][names[0]] is not None]
+        for week, row in rows.items():
+            if week in own or not own:
+                continue
+            source = min(own, key=lambda w: (abs(w - week), w))
+            row[limit].update({name: rows[source][limit][name] for name in names}, chunks=None, error=None,
+                              borrowed_from=source.date().isoformat())
+    return list(rows.values())
+
+
+def rates_of(rows):
+    """Week ISO date -> (fable_rate, all_fable_rate, all_other_rate) of the totals.usage rows, each a float or None."""
+    return {row['week']: (row['fable']['rate'], row['all']['fable_rate'], row['all']['other_rate']) for row in rows}
 
 
 def median_or_none(values):
@@ -3147,7 +3400,8 @@ def week_rows(runs, entries):
                      'all_points': points([entry for _, entry in group], 'all_points'),
                      'cost': windows_cost([entry for _, entry in group]),
                      'minutes_per_run': median_or_none(entry['minutes'] for _, entry in group),
-                     'later_fixes': sum(len(entry['later_fixes']) for _, entry in group)})
+                     'later_fixes': sum(len(entry['later_fixes']) for _, entry in group),
+                     **pct_total([entry for _, entry in group])})
     return rows
 
 
@@ -3248,7 +3502,12 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
     """The report's facts and totals, as the dict --json prints; records is the whole run log and spans its
     run_spans. Each transcript row belongs to one unit, the run whose window ends first among those holding it, else
     its transcript's session, and each total is a sum over the units. The models with no price are known once the
-    units are read, so their warnings join the health warnings last."""
+    units are read, so their warnings join the health warnings last. It sets RATES first, from the account-wide
+    calibration of every transcript, whatever since says."""
+    global RATES
+    paths = [q for p in main_transcripts(projects_root) for q in [p, *subagent_transcripts(p)]]
+    usage = usage_rates(usage_readings(paths, now), account_spend(paths, now))
+    RATES = rates_of(usage)
     warns, info, per_run, per_session = run_warnings(projects_root, runs, now, records, pins, spans)
     # Oldest first, a record with no time last; sorted keeps log order among equals.
     order = sorted(range(len(runs)), key=lambda i: (runs[i]['_time'] is None, runs[i]['_time'] or now))
@@ -3364,6 +3623,7 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
                          'typed': unit_typed(path, None),
                          'models': tr_session.models, 'phases': tr_session.phase_list(), 'efforts': tr_session.efforts,
                          'advisor': unit_advisor(tr_session), 'notes': unit_notes(tr_session),
+                         **unit_pct(tr_session.models, tr_session.advisor_pct),
                          'refusals': refusal_counts(rest),
                          'context': handoff_to([path], context_facts(tr_session.contexts, own_events)),
                          'tool_results': tr_session.tool_results,
@@ -3392,6 +3652,7 @@ def report_data(projects_root, records, runs, spans, pins, now, since):
                    'run_time': run_time(runs, entries),
                    'skills': skill_totals(units),
                    'models': model_totals(runs, entries), 'advisor': advisor, 'offers': offer_totals(runs),
+                   'usage': usage,
                    'health': {'warns': texts(warns), 'warnings': warns, 'info': info}},
     }
 
@@ -3501,6 +3762,16 @@ def usd(value):
     return None if value is None else f'≈${value:.2f}'
 
 
+def pct(value):
+    return None if value is None else f'{value:.2f}%'
+
+
+def estimate(value, unknown, mark=''):
+    """A percentage estimate as page text, with mark and how many parts it left out when any."""
+    text = (pct(value) or '–') + mark
+    return f'{text} ({unknown} unknown)' if unknown else text
+
+
 def whole(value):
     return None if value is None else f'{value:.0f}'
 
@@ -3548,11 +3819,14 @@ def render_html(data):
     totals, board = data['totals'], data['totals']['scoreboard']
     runs = data['runs']
     records = [run['record'] for run in runs]
+    window = pct_total(runs)
     header = (f"<p>Generated {cell(data['generated'])}. Window {cell(data['since'])} to {cell(data['now'])}. "
               f"Runs: {cell(pairs(path_counts(records)))}. "
               f"Points: Fable {cell(points(runs, 'fable_points'))}, "
               f"all models {cell(points(runs, 'all_points'))}. "
               f"Estimated {cell(usd(windows_cost(runs)))}. "
+              f"Estimated Fable {cell(estimate(window['fable_pct'], window['pct_unknown']))}, "
+              f"all models {cell(estimate(window['all_pct'], window['pct_unknown']))}. "
               f"WARN lines: {len(totals['health']['warns'])}.</p>")
 
     rules = []
@@ -3560,13 +3834,14 @@ def render_html(data):
         row, out = board[kind], board[kind]['outcomes']
         rules.append((kind.replace('_', ' '), row['ran'], row['found'], pairs(row['counts']),
                       out.get('fixed', 0) + out.get('applied', 0), out.get('declined', 0), out.get('deferred', 0),
-                      out.get('open', 0) + out.get('to_owner', 0), pairs(row['tokens']), usd(row['cost'])))
-    advisor, rest = board['advisor'], (None,) * 6
+                      out.get('open', 0) + out.get('to_owner', 0), pairs(row['tokens']), usd(row['cost']),
+                      estimate(row['fable_pct'], row['pct_unknown']), estimate(row['all_pct'], row['pct_unknown'])))
+    advisor, rest = board['advisor'], (None,) * 8
     rules += [('failing-test check', sum(board['failing_test'].values()), None, pairs(board['failing_test'])) + rest,
               ('dispatch guard', None, sum(board['dispatch_guard'].values()), pairs(board['dispatch_guard'])) + rest,
               ('advisor', advisor['calls'], None,
                f"notes={advisor['notes']} changed={advisor['changed']} share={whole(advisor['share'])}%")
-              + rest[:5] + (usd(advisor['cost']),),
+              + rest[:5] + (usd(advisor['cost']), None, None),
               ('startup guidelines', board['startup']['with'] + board['startup']['without'], None,
                pairs(board['startup'])) + rest,
               ('fix-round cap', None, None, pairs(board['fix_round_cap'])) + rest,
@@ -3574,9 +3849,21 @@ def render_html(data):
     rules += [('offer ' + skill, counts['offered'], None, pairs(counts)) + rest
               for skill, counts in totals['offers'].items()]
 
+    usage = {u['week']: u for u in totals['usage']}
+
+    def borrowed(week, limit):
+        return '*' if week in usage and usage[week][limit]['borrowed_from'] else ''
+
     weeks = [(w['week'], pairs(w['runs']), w['tasks'], pairs(w['findings']), w['fix_rounds'], w['stops'],
-              w['fable_points'], w['all_points'], usd(w['cost']), whole(w['minutes_per_run']), w['later_fixes'])
+              w['fable_points'], w['all_points'], usd(w['cost']),
+              estimate(w['fable_pct'], w['pct_unknown'], borrowed(w['week'], 'fable')),
+              estimate(w['all_pct'], w['pct_unknown'], borrowed(w['week'], 'all')),
+              whole(w['minutes_per_run']), w['later_fixes'])
              for w in totals['weeks']]
+    calibration = [(u['week'], u['readings'], u['pairs'], u['fable']['points'], usd(u['fable']['rate']),
+                    pct(u['fable']['error']), u['all']['points'], usd(u['all']['fable_rate']),
+                    usd(u['all']['other_rate']), pct(u['all']['error']), u['fable']['borrowed_from'],
+                    u['all']['borrowed_from']) for u in totals['usage']]
     ctx = totals['context']
     context = [('context calls', sum(w['calls'] for w in ctx)), ('context tokens', sum(w['tokens'] for w in ctx)),
                ('context max tokens', max((w['max_tokens'] for w in ctx), default=None)),
@@ -3605,10 +3892,14 @@ def render_html(data):
 
     body = [header, '<h2>Rules and steps</h2>',
             table(('rule or step', 'ran', 'found something', 'counts', 'fixed or applied', 'declined', 'deferred',
-                   'open or to the owner', 'tokens', 'estimated dollars'), rules),
+                   'open or to the owner', 'tokens', 'estimated dollars', 'est. Fable %', 'est. all %'), rules),
             '<h2>Whole workflow</h2>',
             table(('week', 'runs', 'tasks', 'findings', 'fix rounds', 'stops', 'Fable points', 'all points',
-                   'estimated dollars', 'minutes per run', 'later fix commits'), weeks),
+                   'estimated dollars', 'est. Fable %', 'est. all %', 'minutes per run', 'later fix commits'), weeks),
+            '<p>Usage estimates</p>',
+            table(('week', 'readings', 'pairs', 'Fable points', 'Fable rate', 'Fable error', 'all points',
+                   'all Fable rate', 'all other rate', 'all error', 'Fable borrowed from', 'all borrowed from'),
+                  calibration),
             table(('Full runs', 'runs', 'with a run time', 'median minutes'),
                   [(name.replace('_', ' '), t['runs'], t['timed'], whole(t['median_minutes']))
                    for name, t in totals['run_time'].items()]),
@@ -3633,7 +3924,8 @@ def render_html(data):
                  ('fix_rounds', rec.get('fix_rounds')), ('stops', rec.get('stops')), ('minutes', whole(run['minutes'])),
                  ('waves', len(run['waves'])),
                  ('offers', ' '.join(f"{o['skill']}:{o['outcome']}" for o in run['offers']) or None),
-                 ('cost', usd(windows_cost([run]))), ('warns', len(run['warns'])))
+                 ('cost', usd(windows_cost([run]))), ('fable_pct', pct(run['fable_pct'])),
+                 ('all_pct', pct(run['all_pct'])), ('warns', len(run['warns'])))
         line = ' '.join([cell(rec.get(k)) for k in ('date', 'project', 'branch')]
                         + [f'{k}={cell(v)}' for k, v in known])
         body.append(f'<details class="run"><summary>{line}</summary>\n{run_steps(run)}\n</details>')

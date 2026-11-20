@@ -73,6 +73,16 @@ def tool_use(tid, name, inp=None):
     return {'type': 'tool_use', 'id': tid, 'name': name, 'input': inp or {}}
 
 
+def reading(tid, fable, all_, ts, text=None):
+    """The two rows of one get_usage call, which costs nothing, and its result: fable and all_ percent used, or text
+    when given."""
+    text = text or json.dumps({'plan': {'status': 'ok', 'windows': [
+        {'label': 'Weekly · all models', 'percentUsed': all_, 'resetsAt': '2026-11-08T07:00:00.000Z'},
+        {'label': 'Weekly · Fable', 'percentUsed': fable, 'resetsAt': '2026-11-08T07:00:00.000Z'}]}})
+    return [asst(tid + '-call', [tool_use(tid, 'mcp__ccd_session_mgmt__get_usage')], u=usage(None, 0, 0), ts=ts),
+            user([{'type': 'tool_result', 'tool_use_id': tid, 'content': text}], ts=ts)]
+
+
 def hook_row(command, stdout, ts='2026-11-05T10:00:00.000Z'):
     return {'type': 'attachment', 'timestamp': ts,
             'attachment': {'type': 'hook_success', 'hookName': 'PreToolUse:Bash', 'hookEvent': 'PreToolUse',
@@ -230,8 +240,20 @@ class Report(unittest.TestCase):
                 self.assertAlmostEqual(sum(e['cost'] for e in entries), total['cost'], delta=1e-6)
                 for e in entries:
                     self.assertAlmostEqual(sum(e['cost_by_kind'].values()), e['cost'], delta=1e-6)
+            self.check_pct(entries, total)
         self.assertEqual(sum(p['advisor']['calls'] for p in unit['phases']), unit['advisor']['calls'])
         self.assertAlmostEqual(sum(p['advisor']['cost'] for p in unit['phases']), unit['advisor']['cost'], delta=1e-6)
+        self.check_pct([p['advisor'] for p in unit['phases']], unit['advisor'])
+
+    def check_pct(self, parts, total):
+        """Each limit's parts add up to total's, and at least one is null when total's is, as only the part a rateless
+        message lands in is nulled."""
+        for limit in ('fable_pct', 'all_pct'):
+            values = [p[limit] for p in parts]
+            if total[limit] is None:
+                self.assertTrue(not parts or None in values, limit)
+            else:
+                self.assertAlmostEqual(sum(values), total[limit], delta=1e-9)
 
     def kinds(self, *args, data=None):
         """The kinds of the warnings in the JSON of args, or in data when a test already has it."""
@@ -781,7 +803,7 @@ class Report(unittest.TestCase):
                                         'stage_table', 'totals', 'version'])
         self.assertEqual(sorted(data['totals']),
                          ['advisor', 'context', 'health', 'models', 'offers', 'run_time', 'scoreboard', 'skills',
-                          'weeks'])
+                          'usage', 'weeks'])
         self.assertEqual(data['now'], '2026-11-07T12:00:00+00:00')
         self.assertIsNone(data['since'])
 
@@ -975,6 +997,151 @@ class Report(unittest.TestCase):
         self.session([dict(asst('m3'), cwd='')], sid='sess-2')
         projects = {os.path.basename(s['file']): s['project'] for s in self.json()['sessions']}
         self.assertEqual(projects, {'sess-1.jsonl': '/home/dev/demo', 'sess-2.jsonl': None})
+
+    def calibrate(self):
+        """Session calib on 2026-11-02: Fable rate 4.0, all-models Fable rate 8.0 and other rate 2.0, each fitting
+        with error 0.0."""
+        self.session([*reading('r0', 0, 0, '2026-11-02T10:00:00.000Z'),
+                      asst('f1', model='claude-fable-5-2', u=usage(None, 5_000_000, 0), ts='2026-11-02T10:30:00.000Z'),
+                      *reading('r1', 10, 5, '2026-11-02T11:00:00.000Z'),
+                      asst('o1', u=usage(None, 2_500_000, 0), ts='2026-11-02T11:30:00.000Z'),
+                      *reading('r2', 10, 10, '2026-11-02T12:00:00.000Z'),
+                      asst('f2', model='claude-fable-5-2', u=usage(None, 5_000_000, 0), ts='2026-11-02T12:20:00.000Z'),
+                      asst('o2', u=usage(None, 2_500_000, 0), ts='2026-11-02T12:30:00.000Z'),
+                      *reading('r3', 20, 20, '2026-11-02T13:00:00.000Z')], project='proj', sid='calib')
+
+    def test_json_units_estimate_their_share_of_each_limit(self):
+        self.calibrate()  # rates for week 2026-11-01: Fable 4.0, all-models 8.0 (Fable) and 2.0 (other)
+        self.session([asst('f', model='claude-fable-5-2', u=usage(None, 1_000_000, 0), ts='2026-11-05T10:00:00.000Z'),
+                      asst('o', u=usage(None, 1_000_000, 0), ts='2026-11-05T10:01:00.000Z')], project='proj')
+        s = next(s for s in self.json()['sessions'] if s['file'].endswith('sess-1.jsonl'))
+        fable, opus = s['models']['claude-fable-5-2'], s['models']['claude-opus-5-5']
+        for got, want in ((fable['fable_pct'], 2.0), (fable['all_pct'], 1.0),   # $8 / 4, $8 / 8
+                          (opus['fable_pct'], 0.0), (opus['all_pct'], 2.0),     # $4 / 2
+                          (s['fable_pct'], 2.0), (s['all_pct'], 3.0)):
+            self.assertAlmostEqual(got, want)
+
+    def test_an_unpriced_model_is_null_where_rates_exist(self):
+        self.calibrate()
+        self.session([asst('x', model='claude-unknown-1', ts='2026-11-05T10:00:00.000Z'),
+                      asst('y', ts='2026-11-05T10:01:00.000Z')], project='proj')
+        s = next(s for s in self.json()['sessions'] if s['file'].endswith('sess-1.jsonl'))
+        self.assertIsNone(s['models']['claude-unknown-1']['fable_pct'])
+        self.assertIsNotNone(s['models']['claude-opus-5-5']['all_pct'])
+        self.assertEqual((s['fable_pct'], s['all_pct']), (None, None))
+
+    def test_a_zero_token_unpriced_model_keeps_the_estimates_known(self):
+        self.calibrate()
+        self.session([asst('o', u=usage(None, 1_000_000, 0), ts='2026-11-05T10:00:00.000Z'),
+                      asst('s', model='<synthetic>', u=usage(None, 0, 0), ts='2026-11-05T10:01:00.000Z')],
+                     project='proj')
+        s = next(s for s in self.json()['sessions'] if s['file'].endswith('sess-1.jsonl'))
+        self.assertAlmostEqual(s['fable_pct'], 0.0)
+        self.assertAlmostEqual(s['all_pct'], 2.0)  # $4 / 2
+
+    def test_an_advisor_iteration_is_estimated_at_the_advisors_rates(self):
+        self.calibrate()
+        self.session([asst('a', iterations=[executor(), ADVISOR], ts='2026-11-05T10:00:00.000Z')], project='proj')
+        s = next(s for s in self.json()['sessions'] if s['file'].endswith('sess-1.jsonl'))
+        dollars = s['advisor']['cost']
+        self.assertGreater(dollars, 0)
+        self.assertAlmostEqual(s['advisor']['fable_pct'], dollars / 4)
+        self.assertAlmostEqual(s['advisor']['all_pct'], dollars / 8)
+
+    def test_no_rate_anywhere_is_null(self):
+        self.session([asst('y', ts='2026-11-05T10:00:00.000Z')], project='proj')
+        s = self.json()['sessions'][0]
+        self.assertEqual((s['models']['claude-opus-5-5']['all_pct'], s['all_pct']), (None, None))
+
+    def test_a_message_with_no_timestamp_is_null(self):
+        self.calibrate()
+        row = asst('n', ts='2026-11-05T10:00:00.000Z')
+        del row['timestamp']
+        self.session([asst('y', ts='2026-11-05T10:00:00.000Z'), row], project='proj')
+        s = next(s for s in self.json()['sessions'] if s['file'].endswith('sess-1.jsonl'))
+        self.assertIsNone(s['models']['claude-opus-5-5']['all_pct'])
+
+    def test_json_usage_rates_fit_each_week(self):
+        self.calibrate()
+        [row] = self.json()['totals']['usage']
+        self.assertEqual((row['week'], row['readings'], row['pairs']), ('2026-11-01', 4, 3))
+        self.assertEqual(row['fable'], {'points': 20, 'cost': 80.0, 'rate': 4.0, 'chunks': 2, 'error': 0.0,
+                                        'borrowed_from': None})
+        a = row['all']
+        self.assertEqual((a['points'], a['fable_cost'], a['other_cost'], a['chunks'], a['borrowed_from']),
+                         (20, 80.0, 20.0, 3, None))
+        self.assertAlmostEqual(a['fable_rate'], 8.0)
+        self.assertAlmostEqual(a['other_rate'], 2.0)
+        self.assertAlmostEqual(a['error'], 0.0)
+
+    def test_a_reset_skips_its_pair(self):
+        self.calibrate()
+        # A $100 Opus message, then the limit resets to (0, 0) in the same week: that spend counts in no pair.
+        self.session([asst('big', u=usage(None, 25_000_000, 0), ts='2026-11-02T14:00:00.000Z'),
+                      *reading('r9', 0, 0, '2026-11-02T15:00:00.000Z')], project='proj', sid='later')
+        [row] = self.json()['totals']['usage']
+        self.assertEqual((row['readings'], row['pairs'], row['all']['other_cost']), (5, 3, 20.0))
+
+    def test_a_week_without_a_usable_rate_borrows_the_nearest(self):
+        self.calibrate()
+        self.session([asst('old', model='claude-fable-5-2', ts='2026-10-27T10:00:00.000Z')], project='proj', sid='old')
+        old, new = self.json()['totals']['usage']
+        self.assertEqual(old['week'], '2026-10-25')
+        self.assertEqual((old['readings'], old['pairs'], old['fable']['points']), (0, 0, 0))
+        self.assertEqual((old['fable']['rate'], old['fable']['chunks'], old['fable']['error'],
+                          old['fable']['borrowed_from']), (4.0, None, None, '2026-11-01'))
+        self.assertEqual(old['all']['borrowed_from'], '2026-11-01')
+        self.assertAlmostEqual(old['all']['other_rate'], 2.0)
+
+    def test_no_readings_leave_the_rates_null(self):
+        self.session([asst('m', model='claude-fable-5-2', ts='2026-11-05T10:00:00.000Z')], project='proj')
+        [row] = self.json()['totals']['usage']
+        self.assertEqual((row['fable']['rate'], row['fable']['borrowed_from'], row['all']['fable_rate'],
+                          row['all']['other_rate']), (None, None, None, None))
+
+    def test_a_message_copied_into_a_subagent_counts_once_in_calibration(self):
+        self.calibrate()
+        # The second Fable message, copied with more output tokens into a subagent transcript of calib.
+        self.subagent('implementer', [asst('f2', model='claude-fable-5-2', u=usage(None, 5_000_000, 1),
+                                           ts='2026-11-02T12:40:00.000Z')], project='proj', sid='calib')
+        [row] = self.json()['totals']['usage']
+        self.assertAlmostEqual(row['fable']['cost'], 80.00004)  # 1 output token at $40/M replaces the copy, not added
+
+    def test_an_unparsable_or_failed_usage_result_is_no_reading(self):
+        failed = json.dumps({'plan': {'status': 'error', 'windows': [
+            {'label': 'Weekly · all models', 'percentUsed': 1}, {'label': 'Weekly · Fable', 'percentUsed': 1}]}})
+        self.session([*reading('u1', 0, 0, '2026-11-02T10:00:00.000Z', text='oops'),
+                      *reading('u2', 0, 0, '2026-11-02T11:00:00.000Z', text=failed),
+                      asst('m', ts='2026-11-02T12:00:00.000Z')], project='proj')
+        self.assertEqual(self.json()['totals']['usage'][0]['readings'], 0)
+
+    def test_a_thin_or_fable_free_week_borrows(self):
+        self.calibrate()
+        # Week 2026-11-08 (after --now is moved to 2026-11-14): 3 Fable points only, and Opus spend only.
+        self.session([*reading('t0', 0, 0, '2026-11-09T10:00:00.000Z'),
+                      asst('t1', model='claude-fable-5-2', u=usage(None, 1_500_000, 0), ts='2026-11-09T10:30:00.000Z'),
+                      *reading('t2', 3, 1, '2026-11-09T11:00:00.000Z'),
+                      asst('t3', u=usage(None, 5_000_000, 0), ts='2026-11-09T11:30:00.000Z'),
+                      *reading('t4', 3, 9, '2026-11-09T12:00:00.000Z')], project='proj', sid='thin')
+        data = json.loads(self.run_report('--json', '--now', '2026-11-14T12:00:00Z'))
+        thin = next(w for w in data['totals']['usage'] if w['week'] == '2026-11-08')
+        self.assertEqual((thin['fable']['points'], thin['fable']['borrowed_from'], thin['fable']['rate']),
+                         (3, '2026-11-01', 4.0))
+        self.assertEqual((thin['all']['borrowed_from'], thin['all']['chunks'], thin['all']['error']),
+                         ('2026-11-01', None, None))
+
+    def test_a_fable_free_week_borrows_the_all_models_fit(self):
+        self.calibrate()
+        # Week 2026-11-08: three Opus-only chunks, so the fit's determinant is 0.
+        rows = [*reading('z0', 0, 0, '2026-11-09T10:00:00.000Z')]
+        for n in range(1, 4):
+            rows += [asst(f'z{n}-opus', u=usage(None, 2_500_000, 0), ts=f'2026-11-09T1{n}:30:00.000Z'),
+                     *reading(f'z{n}', 0, 5 * n, f'2026-11-09T1{n}:59:00.000Z')]
+        self.session(rows, project='proj', sid='opus')
+        data = json.loads(self.run_report('--json', '--now', '2026-11-14T12:00:00Z'))
+        week = next(w for w in data['totals']['usage'] if w['week'] == '2026-11-08')
+        self.assertEqual((week['all']['borrowed_from'], week['all']['chunks'], week['all']['error']),
+                         ('2026-11-01', None, None))
 
 
 STARTUP = '<karpathy-guidelines-session-start>guidelines</karpathy-guidelines-session-start>'
@@ -1880,6 +2047,60 @@ class HealthCheck(Report):
         self.assertEqual([s['end'] for s in run['steps']][:3], [by_id['tr2']['end'], by_id['tr1']['end'], by_id['fc']['end']])
         self.assertEqual([s['step'] for s in run['skills'] if s['name'] == 'simplify'], [4])
         self.assertTrue(all(s['step'] is None for s in run['skills'] if s['name'] != 'simplify'))
+
+    def calibrated_review_run(self):
+        """calibrate, then a schema 4 run whose task_review step ties to its one dispatch by agent id."""
+        self.calibrate()
+        rows = self.reviewed('tr1', 'Findings: critical=0 important=0 minor=0', subagent_type='task-reviewer',
+                             description='Review Task 1')
+        step = {'step': 'task_review', 'agent_id': 'tr1', 'task': 1, 'round': 0, 'counts': {}, 'findings': []}
+        self.schema2_run([step, SIMPLIFY_STEP], rows, schema=4)
+
+    def test_json_dispatches_and_tied_steps_carry_the_estimates(self):
+        self.calibrated_review_run()
+        run = self.json()['runs'][0]
+        [d] = [d for d in run['dispatches'] if d['kind'] == 'task_review']
+        self.assertIsNotNone(d['all_pct'])
+        self.assertEqual((run['steps'][d['step']]['fable_pct'], run['steps'][d['step']]['all_pct']),
+                         (d['fable_pct'], d['all_pct']))
+        self.assertEqual((run['steps'][1]['fable_pct'], run['steps'][1]['all_pct']), (None, None))
+        self.assertIsNotNone(run['all_pct'])
+
+    def test_json_week_and_scoreboard_totals_count_the_unknown(self):
+        self.calibrated_review_run()
+        # A second run in the same week, with no window, so its estimates are unknown.
+        self.records([run_record(head='nowhere', branch='lost', date='2026-11-06T12:00:00Z')])
+        data = self.json()
+        priced = next(r for r in data['runs'] if r['record']['head'] == 'c0ffee01')
+        week = next(w for w in data['totals']['weeks'] if w['week'] == '2026-11-01')
+        self.assertEqual(week['pct_unknown'], 1)
+        self.assertAlmostEqual(week['all_pct'], priced['all_pct'])
+        board = data['totals']['scoreboard']
+        self.assertEqual((board['simplify']['fable_pct'], board['simplify']['all_pct'],
+                          board['simplify']['pct_unknown']), (None, None, None))
+        [d] = [d for d in priced['dispatches'] if d['kind'] == 'task_review']
+        self.assertEqual(board['task_review']['pct_unknown'], 0)
+        self.assertAlmostEqual(board['task_review']['all_pct'], d['all_pct'])
+        self.assertEqual((board['final_review']['all_pct'], board['final_review']['pct_unknown']), (None, 0))
+
+    def test_html_shows_the_usage_estimates(self):
+        self.calibrate()
+        page = self.html()
+        self.assertIn('<h2>Whole workflow</h2>', page)
+        self.assertIn('Usage estimates', page)
+        self.assertIn('<td>≈$4.00</td>', page)  # the week's Fable rate, through usd
+        self.assertIn('Estimated Fable', page)
+
+    def test_html_marks_a_borrowed_week_and_the_runs_estimates(self):
+        self.calibrate()
+        self.session([asst('old', model='claude-fable-5-2', ts='2026-10-27T10:00:00.000Z')], project='proj', sid='old')
+        self.records([run_record(date='2026-10-27T12:00:00Z', started='2026-10-27T11:00:00Z')])
+        page = self.html()
+        self.assertIn('<td>–* (1 unknown)</td>', page)  # week 2026-10-25: its one run has no window, its rate borrowed
+        self.assertRegex(page, r'Estimated Fable [^,]* \(1 unknown\), all models')
+        summary = next(line for line in page.splitlines() if line.startswith('<details class="run">'))
+        self.assertIn('fable_pct=–', summary)
+        self.assertIn('all_pct=–', summary)
 
     def test_a_schema_2_run_ties_its_single_final_review_but_not_two_task_reviews(self):
         final = FINAL_STEP
@@ -2917,7 +3138,8 @@ class HealthCheck(Report):
         self.assertEqual(final_row, {'ran': 2, 'found': 2,
                                      'counts': {'critical': 0, 'important': 1, 'minor': 2, 'unneeded': 0},
                                      'outcomes': {'fixed': 1},
-                                     'tokens': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0}})
+                                     'tokens': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0},
+                                     'fable_pct': None, 'all_pct': None, 'pct_unknown': 1})
         self.assertEqual({k: board['simplify'][k] for k in ('ran', 'found', 'counts', 'outcomes')},
                          {'ran': 2, 'found': 1, 'counts': {'applied': 3, 'skipped': 1}, 'outcomes': {}})
         self.assertEqual(board['plan_review']['ran'], 0)
@@ -2947,18 +3169,20 @@ class HealthCheck(Report):
             'file': file, 'start': '2026-11-05T10:00:01.000Z', 'end': '2026-11-05T10:00:02.000Z', 'project': None,
             'commands': [], 'skills': [], 'typed': [],
             'models': {'claude-haiku-4-5-20251001': {'input': 1000000, 'output': 0, 'cache_read': 0, 'cache_write': 0,
-                                                     'cost': 1.0},
+                                                     'cost': 1.0, 'fable_pct': 0.0, 'all_pct': None},
                        'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0,
-                                            'cost': None}},
-            'phases': [{'name': 'unattributed', 'advisor': {'calls': 0, 'cost': 0.0}, 'models': {
+                                            'cost': None, 'fable_pct': None, 'all_pct': None}},
+            'phases': [{'name': 'unattributed',
+                        'advisor': {'calls': 0, 'cost': 0.0, 'fable_pct': 0.0, 'all_pct': 0.0}, 'models': {
                 'claude-haiku-4-5-20251001': {'input': 1000000, 'output': 0, 'cache_read': 0, 'cache_write': 0,
                                               'cost': 1.0,
                                               'cost_by_kind': {'input': 1.0, 'output': 0.0, 'cache_read': 0.0,
-                                                               'cache_write': 0.0}},
+                                                               'cache_write': 0.0}, 'fable_pct': 0.0, 'all_pct': None},
                 'claude-unknown-1': {'input': 10, 'output': 10, 'cache_read': 0, 'cache_write': 0, 'cost': None,
-                                     'cost_by_kind': None}}}],
+                                     'cost_by_kind': None, 'fable_pct': None, 'all_pct': None}},
+                        'fable_pct': None, 'all_pct': None}],
             'efforts': {}, 'startup': False,
-            'advisor': {'calls': 0, 'cost': 0.0, 'tokens': {'input': 0, 'output': 0, 'cache_read': 0, 'cache_write': 0},
+            'advisor': {'calls': 0, 'cost': 0.0, 'fable_pct': 0.0, 'all_pct': 0.0, 'tokens': {'input': 0, 'output': 0, 'cache_read': 0, 'cache_write': 0},
                         'by_role': {}, 'failed': {}, 'weeks': []},
             'notes': {'notes': 0, 'changed': 0, 'missing': 0}, 'refusals': {},
             'context': {'calls': 2, 'tokens': 1000010, 'median_tokens': 500005.0, 'max_tokens': 1000000,
@@ -2968,7 +3192,8 @@ class HealthCheck(Report):
             'warns': ['WARN: session sess-1.jsonl: startup guidelines missing'],
             'warnings': [{'text': 'WARN: session sess-1.jsonl: startup guidelines missing', 'kind': 'startup_missing',
                           'run': None, 'session': file, 'step': None, 'skill': None, 'agent': None}],
-            'title': None, 'key': key(file), 'started_by': None, 'goal': None, 'spec': None}])
+            'title': None, 'key': key(file), 'started_by': None, 'goal': None, 'spec': None, 'fable_pct': None,
+            'all_pct': None}])
         self.assertEqual(data['totals']['scoreboard']['startup'], {'with': 0, 'without': 1})
 
     def test_a_model_without_a_price_is_warned_once_under_its_stripped_id(self):
@@ -3166,7 +3391,8 @@ class HealthCheck(Report):
         writing = next(p for p in session['phases'] if p['name'] == 'plan_writing')
         self.assertEqual(writing['models']['claude-unknown-1'], {'input': 9000, 'output': 0, 'cache_read': 0,
                                                                  'cache_write': 0, 'cost': None,
-                                                                 'cost_by_kind': None})
+                                                                 'cost_by_kind': None, 'fable_pct': None,
+                                                                 'all_pct': None})
 
     def test_json_phases_start_at_the_window_and_simplify_runs_to_its_end(self):
         rows = [self.startup(), self.loaded('writing-plans'), self.said(1000)]  # before the run's start
@@ -3756,10 +3982,12 @@ class HealthCheck(Report):
         self.assertEqual(weeks, [
             {'week': '2026-10-25', 'runs': {'full': 1}, 'tasks': 2,
              'findings': {'critical': 1, 'important': 0, 'minor': 0, 'unneeded': 0}, 'fix_rounds': 1, 'stops': 1,
-             'fable_points': None, 'all_points': None, 'cost': None, 'minutes_per_run': 60.0, 'later_fixes': 0},
+             'fable_points': None, 'all_points': None, 'cost': None, 'minutes_per_run': 60.0, 'later_fixes': 0,
+             'fable_pct': None, 'all_pct': None, 'pct_unknown': 1},
             {'week': '2026-11-01', 'runs': {'full': 1, 'small': 2}, 'tasks': 5,
              'findings': {'critical': 0, 'important': 0, 'minor': 2, 'unneeded': 0}, 'fix_rounds': 0, 'stops': 0,
-             'fable_points': 20, 'all_points': 12, 'minutes_per_run': 75.0, 'later_fixes': 0},
+             'fable_points': 20, 'all_points': 12, 'minutes_per_run': 75.0, 'later_fixes': 0,
+             'fable_pct': 0.0, 'all_pct': None, 'pct_unknown': 3},
         ])
         # a schema 1 run's window has no required-skill check, so its missing skills are unknown
         self.assertIsNotNone(data['runs'][1]['window'])
@@ -3876,7 +4104,8 @@ class HealthCheck(Report):
     def cache_fixture(self):
         """A covered kit run, its record of schema 8 with a headline, spec and goal, with a reviewed final review, a
         goal line and a start_session call, the session it started, and a second session with an advisor iteration, a
-        hook decision and a typed trigger."""
+        hook decision and a typed trigger, with usage readings for the estimates."""
+        self.calibrate()
         rows = self.reviewed('fr', 'Findings: critical=0 important=0 minor=0 unneeded=0',
                              sub_model='claude-fable-5-1', sub_effort='high', subagent_type='final-reviewer',
                              description='Final review')
